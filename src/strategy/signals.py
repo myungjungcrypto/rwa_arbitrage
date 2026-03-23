@@ -13,7 +13,7 @@ from enum import Enum
 from collections import deque
 from typing import Optional
 
-import numpy as np
+import math
 
 logger = logging.getLogger("arbitrage.signals")
 
@@ -130,8 +130,10 @@ class SignalGenerator:
                 reason="Insufficient data",
             )
 
-        mean = np.mean(history)
-        std = np.std(history)
+        n = len(history)
+        mean = sum(history) / n
+        variance = sum((x - mean) ** 2 for x in history) / n
+        std = math.sqrt(variance)
         pos = self.get_position(product)
 
         if pos.is_open:
