@@ -1,3 +1,4 @@
+from __future__ import annotations
 """페이퍼 트레이딩 엔진.
 
 시그널 생성기 + 리스크 매니저를 실시간 데이터 수집기에 연결하여

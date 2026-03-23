@@ -1,3 +1,4 @@
+from __future__ import annotations
 """리스크 관리 모듈.
 
 포지션 사이즈, 마진 사용률, 일일 손실, 롤오버 리스크 등을 관리.

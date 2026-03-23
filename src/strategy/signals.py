@@ -1,3 +1,4 @@
+from __future__ import annotations
 """진입/청산 시그널 생성 모듈.
 
 베이시스 통계(이동평균, 표준편차)를 기반으로

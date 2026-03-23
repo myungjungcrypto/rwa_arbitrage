@@ -1,3 +1,4 @@
+from __future__ import annotations
 """페이퍼 트레이딩 엔진 테스트 (unittest 기반)."""
 
 import os

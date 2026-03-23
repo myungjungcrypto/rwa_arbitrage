@@ -1,3 +1,4 @@
+from __future__ import annotations
 """SQLite 데이터 저장소.
 
 베이시스, 시세, 펀딩레이트, 주문, PnL 등을 시계열로 저장.

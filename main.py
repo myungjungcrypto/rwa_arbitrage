@@ -1,3 +1,4 @@
+from __future__ import annotations
 """RWA Arbitrage Bot — 메인 엔트리포인트.
 
 실행 모드:

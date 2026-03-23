@@ -1,3 +1,4 @@
+from __future__ import annotations
 """베이시스 차익거래 백테스트 엔진.
 
 수집된 베이시스 데이터로 전략 시뮬레이션 및 PnL 계산.

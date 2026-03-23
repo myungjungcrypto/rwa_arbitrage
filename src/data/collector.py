@@ -1,3 +1,4 @@
+from __future__ import annotations
 """실시간 데이터 수집기.
 
 Hyperliquid WebSocket + 키움 시세를 통합하여

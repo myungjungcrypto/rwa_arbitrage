@@ -1,3 +1,4 @@
+from __future__ import annotations
 """trade.xyz (HIP-3) perp DEX에서 사용 가능한 전체 티커 목록 출력.
 
 Usage:

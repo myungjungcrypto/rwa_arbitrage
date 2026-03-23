@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Hyperliquid (trade.xyz) API 래퍼.
 
 trade.xyz 퍼페추얼 선물 시세 조회, 주문, WebSocket 실시간 데이터를 위한 래퍼.

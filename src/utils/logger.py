@@ -1,3 +1,4 @@
+from __future__ import annotations
 """구조화 로깅 모듈."""
 
 import logging

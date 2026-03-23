@@ -1,3 +1,4 @@
+from __future__ import annotations
 """키움증권 OpenAPI-W 래퍼 (Stub).
 
 실제 구현은 Windows + OCX 환경에서 koapy 또는 pykiwoom을 사용.

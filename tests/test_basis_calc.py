@@ -1,3 +1,4 @@
+from __future__ import annotations
 """베이시스 계산 및 데이터 저장 테스트."""
 
 import time

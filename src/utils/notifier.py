@@ -1,3 +1,4 @@
+from __future__ import annotations
 """알림 모듈 (Telegram).
 
 비동기 + 동기 양쪽 모두 지원.
