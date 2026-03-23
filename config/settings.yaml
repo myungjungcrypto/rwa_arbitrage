@@ -1,0 +1,79 @@
+# RWA Arbitrage Bot Configuration
+
+mode: "PAPER"  # PAPER or LIVE
+
+# 대상 상품
+# NOTE: perp_ticker는 Hyperliquid API universe의 실제 name 필드값 사용
+#       (dex:"xyz" 조회 시 "xyz:" 프리픽스 포함)
+products:
+  wti:
+    perp_ticker: "xyz:CL"       # trade.xyz WTI 퍼프 (API name)
+    futures_symbol: "CL"        # CME 월물 심볼
+    contract_size: 1.0           # 배럴/계약
+    min_order_size: 1
+  brent:
+    perp_ticker: "xyz:BRENTOIL" # trade.xyz Brent 퍼프 (API name)
+    futures_symbol: "BZ"        # CME 월물 심볼
+    contract_size: 1.0
+    min_order_size: 1
+
+# Hyperliquid 설정
+hyperliquid:
+  use_testnet: false             # trade.xyz HIP-3 퍼프는 메인넷에만 존재
+  perp_dex: "xyz"                # trade.xyz의 HIP-3 perp DEX 이름
+  ws_reconnect_delay: 5         # 초
+  ws_ping_interval: 30          # 초
+
+# 키움증권 설정
+kiwoom:
+  use_mock: true                # 모의투자 모드
+  server_type: "mock"           # mock 또는 real
+
+# 전략 파라미터
+strategy:
+  # 베이시스 계산
+  basis_window_hours: 24        # 이동평균 기간
+  basis_std_multiplier: 2.0     # σ 배수 (진입 임계값)
+
+  # 진입/청산
+  entry_threshold_bps: 50       # 최소 진입 베이시스 (bp)
+  exit_threshold_bps: 10        # 청산 임계값 (bp)
+  target_profit_bps: 30         # 목표 수익 (bp)
+  max_hold_hours: 48            # 최대 보유 시간
+
+  # 펀딩레이트
+  funding_rate_weight: 1.0      # 펀딩 수익 반영 비율
+  min_funding_advantage_bps: 5  # 최소 펀딩 유리 조건
+
+# 리스크 관리
+risk:
+  max_position_usd: 50000       # 최대 포지션 (USD)
+  max_position_contracts: 10    # 최대 계약 수
+  max_margin_usage_pct: 50      # 최대 마진 사용률 (%)
+  max_slippage_bps: 20          # 최대 슬리피지 (bp)
+  max_daily_loss_usd: 2000      # 일일 최대 손실
+  emergency_close_threshold: 100 # 긴급 청산 베이시스 (bp)
+
+  # 롤오버
+  rollover_start_day: 5         # 롤오버 시작 영업일
+  rollover_end_day: 10          # 롤오버 종료 영업일
+  rollover_position_reduce_pct: 50  # 롤 기간 포지션 축소율 (%)
+
+# 데이터 저장
+database:
+  type: "sqlite"
+  path: "data/arbitrage.db"
+
+# 알림
+notification:
+  telegram:
+    enabled: false
+    bot_token: ""               # secrets.yaml에서 로드
+    chat_id: ""
+
+# 로깅
+logging:
+  level: "INFO"
+  file: "logs/arbitrage.log"
+  max_size_mb: 100
+  backup_count: 5

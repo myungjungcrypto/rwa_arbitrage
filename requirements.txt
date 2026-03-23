@@ -1,0 +1,4 @@
+# Core
+aiohttp>=3.9
+websockets>=12.0
+pyyaml>=6.0

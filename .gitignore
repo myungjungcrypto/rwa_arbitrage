@@ -1,0 +1,25 @@
+# Secrets
+config/secrets.yaml
+.env
+
+# Data (로컬 생성)
+data/*.db
+data/historical/*.csv
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
