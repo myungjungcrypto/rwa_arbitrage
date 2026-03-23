@@ -5,7 +5,6 @@ from __future__ import annotations
 Paper Trading Engine (sync 콜백) 및 DataCollector (async) 모두에서 사용 가능.
 """
 
-from __future__ import annotations
 
 import asyncio
 import logging

@@ -7,7 +7,6 @@ from __future__ import annotations
     python main.py --mode live      # 실거래 (Phase 3)
 """
 
-from __future__ import annotations
 
 import asyncio
 import argparse

@@ -1,6 +1,6 @@
+from __future__ import annotations
 """설정 관리 모듈."""
 
-from __future__ import annotations
 
 import yaml
 from pathlib import Path

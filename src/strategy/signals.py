@@ -5,7 +5,6 @@ from __future__ import annotations
 차익거래 진입/청산 시그널을 생성.
 """
 
-from __future__ import annotations
 
 import time
 import logging

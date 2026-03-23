@@ -4,7 +4,6 @@ from __future__ import annotations
 포지션 사이즈, 마진 사용률, 일일 손실, 롤오버 리스크 등을 관리.
 """
 
-from __future__ import annotations
 
 import time
 import logging

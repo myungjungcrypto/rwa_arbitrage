@@ -11,7 +11,6 @@ API 차이점:
   또는 개별 조회: l2Book, allMids 등에서 coin="WTIOIL" 직접 사용 가능
 """
 
-from __future__ import annotations
 
 import asyncio
 import json

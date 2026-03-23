@@ -12,7 +12,6 @@ from __future__ import annotations
 5. 포지션 + PnL 추적 (DB + in-memory)
 """
 
-from __future__ import annotations
 
 import time
 import logging

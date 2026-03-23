@@ -5,7 +5,6 @@ Hyperliquid WebSocket + 키움 시세를 통합하여
 베이시스 계산, DB 저장, 콜백 처리를 담당.
 """
 
-from __future__ import annotations
 
 import asyncio
 import time

@@ -8,7 +8,6 @@ Usage:
     python scripts/run_backtest.py --optimize          # 파라미터 최적화
 """
 
-from __future__ import annotations
 
 import argparse
 import sys

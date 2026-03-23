@@ -9,7 +9,6 @@ NOTE: 키움 OpenAPI-W는 Windows OCX 기반이므로,
       실제 Windows 환경에서 koapy/pykiwoom으로 교체.
 """
 
-from __future__ import annotations
 
 import time
 import logging

@@ -4,7 +4,6 @@ from __future__ import annotations
 수집된 베이시스 데이터로 전략 시뮬레이션 및 PnL 계산.
 """
 
-from __future__ import annotations
 
 import logging
 import time
