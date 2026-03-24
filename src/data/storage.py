@@ -345,8 +345,11 @@ class Storage:
         self.conn.execute(
             """UPDATE positions
                SET status = 'closed', realized_pnl = ?, funding_pnl = ?, closed_at = ?
-               WHERE product = ? AND status = 'open'
-               ORDER BY id DESC LIMIT 1""",
+               WHERE id = (
+                   SELECT id FROM positions
+                   WHERE product = ? AND status = 'open'
+                   ORDER BY id DESC LIMIT 1
+               )""",
             (realized_pnl, funding_pnl, ts, product),
         )
         self.conn.commit()

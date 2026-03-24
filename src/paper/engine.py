@@ -91,9 +91,9 @@ class PaperTradingEngine:
     조건 충족 시 양 레그 주문을 시뮬레이션.
     """
 
-    # 수수료 (basis points)
-    PERP_TAKER_FEE_BPS = 3.5
-    FUTURES_FEE_PER_CONTRACT = 4.0  # USD
+    # 수수료
+    PERP_TAKER_FEE_BPS = 0.9       # trade.xyz HIP-3 taker (0.009%)
+    FUTURES_FEE_PER_CONTRACT = 7.5  # 키움 해외선물 편도 USD/계약
 
     def __init__(
         self,

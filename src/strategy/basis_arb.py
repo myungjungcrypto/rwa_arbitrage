@@ -91,8 +91,8 @@ class BacktestEngine:
 
     def __init__(
         self,
-        perp_fee_bps: float = 3.5,    # taker 기준
-        futures_fee_bps: float = 5.0,  # 키움 해외선물 추정
+        perp_fee_bps: float = 0.9,    # trade.xyz HIP-3 taker (0.009%)
+        futures_fee_bps: float = 0.83, # 키움 해외선물 ($7.5/계약, CL 기준)
         funding_interval_hours: float = 1.0,
     ):
         self.perp_fee_bps = perp_fee_bps

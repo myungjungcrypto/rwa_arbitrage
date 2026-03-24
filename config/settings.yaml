@@ -32,27 +32,27 @@ kiwoom:
 # 전략 파라미터
 strategy:
   # 베이시스 계산
-  basis_window_hours: 24        # 이동평균 기간
-  basis_std_multiplier: 2.0     # σ 배수 (진입 임계값)
+  basis_window_hours: 4         # 이동평균 기간 (평균 회귀가 분 단위로 발생)
+  basis_std_multiplier: 1.5     # σ 배수 (진입 임계값, 수수료 낮아 공격적 진입)
 
   # 진입/청산
-  entry_threshold_bps: 50       # 최소 진입 베이시스 (bp)
-  exit_threshold_bps: 10        # 청산 임계값 (bp)
-  target_profit_bps: 30         # 목표 수익 (bp)
-  max_hold_hours: 48            # 최대 보유 시간
+  entry_threshold_bps: 8        # 최소 진입 베이시스 (bp), ~1*std 수준
+  exit_threshold_bps: 2         # 청산 임계값 (bp), 타이트한 청산
+  target_profit_bps: 15         # 목표 수익 (bp)
+  max_hold_hours: 4             # 최대 보유 시간 (회귀 대부분 20분 이내)
 
   # 펀딩레이트
   funding_rate_weight: 1.0      # 펀딩 수익 반영 비율
-  min_funding_advantage_bps: 5  # 최소 펀딩 유리 조건
+  min_funding_advantage_bps: 2  # 최소 펀딩 유리 조건
 
 # 리스크 관리
 risk:
   max_position_usd: 50000       # 최대 포지션 (USD)
   max_position_contracts: 10    # 최대 계약 수
   max_margin_usage_pct: 50      # 최대 마진 사용률 (%)
-  max_slippage_bps: 20          # 최대 슬리피지 (bp)
-  max_daily_loss_usd: 2000      # 일일 최대 손실
-  emergency_close_threshold: 100 # 긴급 청산 베이시스 (bp)
+  max_slippage_bps: 5           # 최대 슬리피지 (bp), 좁은 스프레드 환경
+  max_daily_loss_usd: 1000      # 일일 최대 손실 (보수적)
+  emergency_close_threshold: 40  # 긴급 청산 베이시스 (bp), 관측 최대 ~45bp
 
   # 롤오버
   rollover_start_day: 5         # 롤오버 시작 영업일
