@@ -91,9 +91,9 @@ class PaperTradingEngine:
     조건 충족 시 양 레그 주문을 시뮬레이션.
     """
 
-    # 수수료
+    # 수수료 (basis points of notional)
     PERP_TAKER_FEE_BPS = 0.9       # trade.xyz HIP-3 taker (0.009%)
-    FUTURES_FEE_PER_CONTRACT = 7.5  # 키움 해외선물 편도 USD/계약
+    FUTURES_FEE_BPS = 0.83         # 키움 해외선물 ($7.5/CME계약, CL 1000bbl 기준)
 
     def __init__(
         self,
@@ -513,10 +513,10 @@ class PaperTradingEngine:
         avg_price = (trade.perp_entry_price + perp_exit_price) / 2
         funding_pnl_usd = trade.funding_pnl_bps / 10000 * avg_price * contracts
 
-        # 수수료
-        perp_notional = avg_price * contracts
-        perp_fees = perp_notional * self.PERP_TAKER_FEE_BPS / 10000 * 2  # entry + exit
-        futures_fees = self.FUTURES_FEE_PER_CONTRACT * contracts * 2  # entry + exit
+        # 수수료 (양쪽 모두 노셔널 기반 bps)
+        notional = avg_price * contracts
+        perp_fees = notional * self.PERP_TAKER_FEE_BPS / 10000 * 2  # entry + exit
+        futures_fees = notional * self.FUTURES_FEE_BPS / 10000 * 2   # entry + exit
         total_fees = perp_fees + futures_fees
 
         net_pnl = trading_pnl + funding_pnl_usd - total_fees
