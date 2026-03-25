@@ -46,7 +46,8 @@ class TradeRecord:
     futures_entry_price: float = 0.0
     perp_side: str = ""          # "long" or "short"
     futures_side: str = ""       # "long" or "short"
-    size_contracts: int = 1
+    size_contracts: int = 1        # CME 계약 수
+    perp_units: int = 1             # trade.xyz 퍼프 단위 (= 배럴 수)
 
     # 청산
     exit_time: float = 0.0
@@ -91,9 +92,9 @@ class PaperTradingEngine:
     조건 충족 시 양 레그 주문을 시뮬레이션.
     """
 
-    # 수수료 (basis points of notional)
+    # Perp 수수료 (basis points of notional)
     PERP_TAKER_FEE_BPS = 0.9       # trade.xyz HIP-3 taker (0.009%)
-    FUTURES_FEE_BPS = 0.83         # 키움 해외선물 ($7.5/CME계약, CL 1000bbl 기준)
+    # Futures 수수료: config의 futures_fee_per_contract 사용 (고정 $/계약)
 
     def __init__(
         self,
@@ -264,10 +265,12 @@ class PaperTradingEngine:
             return
 
         # 주문 사이즈 결정
+        product_config = self.config.products[product]
         contracts = self._calculate_contracts(product, risk_check.max_size, futures_price)
         if contracts < 1:
             logger.warning(f"[{product.upper()}] Calculated contracts < 1, skipping")
             return
+        perp_units = contracts * product_config.contract_size  # 배럴 수
 
         # 방향 결정
         if signal.type == SignalType.ENTRY_LONG_BASIS:
@@ -296,11 +299,11 @@ class PaperTradingEngine:
 
         # 2) Perp 주문 (시뮬레이션 — 오더북 bid/ask로 체결)
         #    buy → ask 가격, sell → bid 가격으로 체결
+        #    size = perp_units (배럴 수, not CME 계약 수)
         if perp_side == "buy":
             perp_fill_price = self._latest_perp_ask.get(product, perp_price)
         else:
             perp_fill_price = self._latest_perp_bid.get(product, perp_price)
-        perp_fill_size = contracts
 
         # ── 트레이드 기록 ──
         self._trade_counter += 1
@@ -315,6 +318,7 @@ class PaperTradingEngine:
             perp_side="short" if signal.type == SignalType.ENTRY_LONG_BASIS else "long",
             futures_side="long" if signal.type == SignalType.ENTRY_LONG_BASIS else "short",
             size_contracts=contracts,
+            perp_units=perp_units,
             status="open",
         )
         self._open_trades[product] = trade
@@ -327,9 +331,9 @@ class PaperTradingEngine:
         # DB 저장 — 주문
         self.storage.save_order(
             product=product, leg="perp",
-            side=perp_side, size=contracts,
+            side=perp_side, size=perp_units,
             price=perp_fill_price, filled_price=perp_fill_price,
-            filled_size=contracts, status="filled", is_paper=True,
+            filled_size=perp_units, status="filled", is_paper=True,
         )
         self.storage.save_order(
             product=product, leg="futures",
@@ -344,7 +348,7 @@ class PaperTradingEngine:
         # DB 저장 — 포지션
         self.storage.save_position(
             product=product,
-            perp_size=contracts if trade.perp_side == "long" else -contracts,
+            perp_size=perp_units if trade.perp_side == "long" else -perp_units,
             perp_entry=perp_fill_price,
             futures_size=contracts if trade.futures_side == "long" else -contracts,
             futures_entry=futures_order.filled_price,
@@ -353,8 +357,8 @@ class PaperTradingEngine:
         logger.info(
             f"[{product.upper()}] ▶ ENTRY {trade.direction} | "
             f"basis={signal.basis_bps:+.1f}bp | "
-            f"perp {trade.perp_side} {contracts}x @ {perp_fill_price:.2f} | "
-            f"futures {trade.futures_side} {contracts}x @ {futures_order.filled_price:.2f} | "
+            f"perp {trade.perp_side} {perp_units}units @ {perp_fill_price:.2f} | "
+            f"futures {trade.futures_side} {contracts}x{product_config.contract_size}bbl @ {futures_order.filled_price:.2f} | "
             f"confidence={signal.confidence:.2f} | {signal.reason}"
         )
 
@@ -498,24 +502,26 @@ class PaperTradingEngine:
     ) -> dict:
         """트레이드 PnL 계산.
 
+        모든 PnL은 배럴(perp_units) 기준으로 계산.
+        perp_units = CME계약수 × contract_size (예: 1 MCL = 100배럴)
+
         Returns:
             dict with: basis_pnl_bps, trading_pnl_usd, funding_pnl_usd,
                         perp_fees_usd, futures_fees_usd, total_fees_usd, net_pnl_usd
         """
-        contracts = trade.size_contracts
+        barrels = trade.perp_units  # 배럴 수 (양쪽 동일)
 
-        # Perp PnL (USD)
+        # Perp PnL (USD) — 배럴 × 가격차
         if trade.perp_side == "short":
-            perp_pnl = (trade.perp_entry_price - perp_exit_price) * contracts
+            perp_pnl = (trade.perp_entry_price - perp_exit_price) * barrels
         else:
-            perp_pnl = (perp_exit_price - trade.perp_entry_price) * contracts
+            perp_pnl = (perp_exit_price - trade.perp_entry_price) * barrels
 
-        # Futures PnL (USD) — CL: 1000 barrels/contract, BZ: 1000 barrels/contract
-        # But since we're doing 1:1 sizing (contract to contract match), use per-unit price
+        # Futures PnL (USD) — 배럴 × 가격차
         if trade.futures_side == "long":
-            futures_pnl = (futures_exit_price - trade.futures_entry_price) * contracts
+            futures_pnl = (futures_exit_price - trade.futures_entry_price) * barrels
         else:
-            futures_pnl = (trade.futures_entry_price - futures_exit_price) * contracts
+            futures_pnl = (trade.futures_entry_price - futures_exit_price) * barrels
 
         trading_pnl = perp_pnl + futures_pnl
 
@@ -524,14 +530,20 @@ class PaperTradingEngine:
         if trade.direction == "short_basis":
             basis_pnl_bps = -basis_pnl_bps
 
-        # 펀딩 PnL (USD) — bps to USD 근사
+        # 펀딩 PnL (USD) — bps to USD
         avg_price = (trade.perp_entry_price + perp_exit_price) / 2
-        funding_pnl_usd = trade.funding_pnl_bps / 10000 * avg_price * contracts
+        funding_pnl_usd = trade.funding_pnl_bps / 10000 * avg_price * barrels
 
-        # 수수료 (양쪽 모두 노셔널 기반 bps)
-        notional = avg_price * contracts
-        perp_fees = notional * self.PERP_TAKER_FEE_BPS / 10000 * 2  # entry + exit
-        futures_fees = notional * self.FUTURES_FEE_BPS / 10000 * 2   # entry + exit
+        # 수수료
+        # Perp: 노셔널 기반 (bps)
+        perp_notional = avg_price * barrels
+        perp_fees = perp_notional * self.PERP_TAKER_FEE_BPS / 10000 * 2  # entry + exit
+
+        # Futures: 고정 per-contract ($)
+        product_cfg = self.config.products.get(trade.product)
+        fee_per_contract = product_cfg.futures_fee_per_contract if product_cfg else 7.5
+        futures_fees = fee_per_contract * trade.size_contracts * 2  # entry + exit
+
         total_fees = perp_fees + futures_fees
 
         net_pnl = trading_pnl + funding_pnl_usd - total_fees
@@ -549,18 +561,22 @@ class PaperTradingEngine:
     # ── 사이즈 계산 ──
 
     def _calculate_position_size_usd(self, product: str, futures_price: float) -> float:
-        """포지션 사이즈 (USD) 계산."""
-        contracts = self.config.products[product].min_order_size
-        return futures_price * contracts
+        """포지션 사이즈 (USD) 계산. 배럴 기준 노셔널."""
+        product_cfg = self.config.products[product]
+        barrels = product_cfg.min_order_size * product_cfg.contract_size
+        return futures_price * barrels
 
     def _calculate_contracts(
         self, product: str, max_size_usd: float, futures_price: float
     ) -> int:
-        """최대 허용 사이즈 내에서 계약 수 계산."""
+        """최대 허용 사이즈 내에서 CME 계약 수 계산."""
+        product_cfg = self.config.products[product]
         if futures_price <= 0:
             return 0
-        max_contracts = int(max_size_usd / futures_price)
-        min_size = self.config.products[product].min_order_size
+        # 1계약 노셔널 = 가격 × contract_size(배럴)
+        notional_per_contract = futures_price * product_cfg.contract_size
+        max_contracts = int(max_size_usd / notional_per_contract)
+        min_size = product_cfg.min_order_size
         return max(min_size, min(max_contracts, self.config.risk.max_position_contracts))
 
     def _get_perp_margin_usage(self) -> float:

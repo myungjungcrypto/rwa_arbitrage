@@ -8,14 +8,16 @@ mode: "PAPER"  # PAPER or LIVE
 products:
   wti:
     perp_ticker: "xyz:CL"       # trade.xyz WTI 퍼프 (API name)
-    futures_symbol: "CL"        # CME 월물 심볼
-    contract_size: 1.0           # 배럴/계약
+    futures_symbol: "MCL"       # CME Micro WTI (100배럴/계약)
+    contract_size: 100           # 1 MCL = 100배럴 = perp 100단위
     min_order_size: 1
+    futures_fee_per_contract: 2.50  # MCL 편도 수수료 (거래소+브로커)
   brent:
     perp_ticker: "xyz:BRENTOIL" # trade.xyz Brent 퍼프 (API name)
-    futures_symbol: "BZ"        # CME 월물 심볼
-    contract_size: 1.0
+    futures_symbol: "BZ"        # CME Brent (1,000배럴/계약)
+    contract_size: 1000          # 1 BZ = 1,000배럴 = perp 1,000단위
     min_order_size: 1
+    futures_fee_per_contract: 7.50  # BZ 편도 수수료 (거래소+브로커)
 
 # Hyperliquid 설정
 hyperliquid:
@@ -48,7 +50,7 @@ strategy:
 # 리스크 관리
 risk:
   max_position_usd: 50000       # 최대 포지션 (USD)
-  max_position_contracts: 20    # 최대 계약 수
+  max_position_contracts: 2     # 최대 CME 계약 수
   max_margin_usage_pct: 50      # 최대 마진 사용률 (%)
   max_slippage_bps: 5           # 최대 슬리피지 (bp), 좁은 스프레드 환경
   max_daily_loss_usd: 1000      # 일일 최대 손실 (보수적)

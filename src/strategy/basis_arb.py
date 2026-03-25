@@ -84,15 +84,15 @@ class BacktestEngine:
     베이시스 시계열 데이터를 입력받아 전략 시뮬레이션.
 
     수수료 구조:
-    - Hyperliquid perp: maker 0.01%, taker 0.035%
-    - 키움 해외선물: ~$4/계약 (CL 기준 약 5.7bp, BZ 기준 약 4.1bp)
+    - trade.xyz HIP-3 perp: taker 0.009% = 0.9bp
+    - 키움 해외선물: MCL $2.50/계약 ≈ 2.8bp, BZ $7.50/계약 ≈ 0.78bp
     - 진입/청산 각각 양쪽 수수료 발생
     """
 
     def __init__(
         self,
         perp_fee_bps: float = 0.9,    # trade.xyz HIP-3 taker (0.009%)
-        futures_fee_bps: float = 0.83, # 키움 해외선물 ($7.5/계약, CL 기준)
+        futures_fee_bps: float = 2.8,  # MCL $2.50/계약 기준 (=$2.50 / $89 / 100bbl * 10000)
         funding_interval_hours: float = 1.0,
     ):
         self.perp_fee_bps = perp_fee_bps

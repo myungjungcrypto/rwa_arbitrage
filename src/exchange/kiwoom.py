@@ -231,8 +231,13 @@ class KiwoomMock(KiwoomBase):
 
     def _update_position(self, symbol: str, side: str, qty: int, price: float):
         """포지션 업데이트."""
-        # CL 증거금 ~$6,000/계약, BZ ~$5,500/계약
-        margin_per_contract = 6000 if "CL" in symbol else 5500
+        # MCL(마이크로) ~$600, CL ~$6,000, BZ ~$5,500
+        if symbol == "MCL":
+            margin_per_contract = 600
+        elif "CL" in symbol:
+            margin_per_contract = 6000
+        else:
+            margin_per_contract = 5500
 
         existing = next((p for p in self._positions if p.symbol == symbol), None)
         if existing:

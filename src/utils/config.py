@@ -12,8 +12,9 @@ from typing import Any
 class ProductConfig:
     perp_ticker: str
     futures_symbol: str
-    contract_size: float = 1.0
+    contract_size: int = 1             # 배럴/CME계약 (MCL=100, BZ=1000)
     min_order_size: int = 1
+    futures_fee_per_contract: float = 7.5  # CME 편도 수수료 ($/계약)
 
 
 @dataclass
