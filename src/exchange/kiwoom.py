@@ -158,10 +158,9 @@ class KiwoomMock(KiwoomBase):
             logger.warning(f"No base price for {symbol}")
             return None
 
-        # 약간의 노이즈 추가 (±0.05%)
-        noise = random.gauss(0, base * 0.0005)
-        price = base + noise
-        spread = base * 0.0003  # 3bp 스프레드
+        # 노이즈 없이 base price 사용 (index price 기반)
+        price = base
+        spread = base * 0.0001  # 1bp 스프레드 (CME CL/BZ 평균)
 
         return FuturesQuote(
             symbol=symbol,
@@ -171,8 +170,8 @@ class KiwoomMock(KiwoomBase):
             ask=round(price + spread / 2, 2),
             volume=random.randint(1000, 50000),
             open_interest=random.randint(10000, 500000),
-            change=round(noise, 2),
-            change_pct=round(noise / base * 100, 3),
+            change=0.0,
+            change_pct=0.0,
             timestamp=time.time(),
         )
 

@@ -130,6 +130,8 @@ class PaperTradingEngine:
         self._latest_perp_prices: dict[str, float] = {}   # product -> mark_price
         self._latest_index_prices: dict[str, float] = {}   # product -> index_price
         self._latest_futures_prices: dict[str, float] = {}  # product -> futures_price
+        self._latest_perp_bid: dict[str, float] = {}       # product -> best bid
+        self._latest_perp_ask: dict[str, float] = {}       # product -> best ask
 
         # 이벤트 콜백
         self._on_trade_callbacks: list[Callable] = []
@@ -159,6 +161,8 @@ class PaperTradingEngine:
         futures_price: float,
         basis_bps: float,
         funding_rate: float = 0.0,
+        perp_best_bid: float = 0.0,
+        perp_best_ask: float = 0.0,
     ):
         """베이시스 업데이트 처리 — DataCollector 콜백으로 사용.
 
@@ -168,10 +172,14 @@ class PaperTradingEngine:
             futures_price: 선물 가격
             basis_bps: 베이시스 (bp)
             funding_rate: 현재 펀딩레이트
+            perp_best_bid: 퍼프 오더북 최우선 매수호가
+            perp_best_ask: 퍼프 오더북 최우선 매도호가
         """
         # 가격 캐시 업데이트
         self._latest_perp_prices[product] = perp_price
         self._latest_futures_prices[product] = futures_price
+        self._latest_perp_bid[product] = perp_best_bid or perp_price
+        self._latest_perp_ask[product] = perp_best_ask or perp_price
 
         # 시그널 생성
         signal = self.signal_gen.update_basis(product, basis_bps, funding_rate)
@@ -286,8 +294,12 @@ class PaperTradingEngine:
             )
             return
 
-        # 2) Perp 주문 (시뮬레이션 — 실제 API 호출 없이 현재 가격으로 체결 가정)
-        perp_fill_price = perp_price
+        # 2) Perp 주문 (시뮬레이션 — 오더북 bid/ask로 체결)
+        #    buy → ask 가격, sell → bid 가격으로 체결
+        if perp_side == "buy":
+            perp_fill_price = self._latest_perp_ask.get(product, perp_price)
+        else:
+            perp_fill_price = self._latest_perp_bid.get(product, perp_price)
         perp_fill_size = contracts
 
         # ── 트레이드 기록 ──
@@ -372,9 +384,12 @@ class PaperTradingEngine:
 
         # ── 양 레그 청산 주문 ──
 
-        # Perp 청산 (반대 방향)
+        # Perp 청산 (반대 방향) — 오더북 bid/ask로 체결
         perp_close_side = "buy" if trade.perp_side == "short" else "sell"
-        perp_fill_price = perp_price
+        if perp_close_side == "buy":
+            perp_fill_price = self._latest_perp_ask.get(product, perp_price)
+        else:
+            perp_fill_price = self._latest_perp_bid.get(product, perp_price)
 
         # Futures 청산
         futures_close_side = "sell" if trade.futures_side == "long" else "buy"

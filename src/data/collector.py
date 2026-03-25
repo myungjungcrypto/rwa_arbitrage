@@ -66,10 +66,11 @@ class DataCollector:
         self.poll_interval = 5
         self._running = False
 
-    def on_basis_update(self, callback: Callable[[str, float, float, float], None]):
+    def on_basis_update(self, callback: Callable):
         """베이시스 업데이트 콜백 등록.
 
-        callback(product, perp_price, futures_price, basis_bps)
+        callback(product, perp_price, futures_price, basis_bps,
+                 perp_best_bid, perp_best_ask)
         """
         self._basis_callbacks.append(callback)
 
@@ -215,10 +216,16 @@ class DataCollector:
             funding_rate=perp.funding_rate,
         )
 
+        # perp 오더북 bid/ask (WebSocket에서 수신)
+        ob = self._latest_orderbook.get(product_name)
+        perp_best_bid = ob.best_bid if ob else perp.mark_price
+        perp_best_ask = ob.best_ask if ob else perp.mark_price
+
         # 콜백
         for cb in self._basis_callbacks:
             try:
-                cb(product_name, perp.mark_price, futures_price, basis_bps)
+                cb(product_name, perp.mark_price, futures_price, basis_bps,
+                   perp_best_bid, perp_best_ask)
             except Exception as e:
                 logger.error(f"Basis callback error: {e}")
 
