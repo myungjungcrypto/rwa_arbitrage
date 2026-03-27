@@ -23,6 +23,7 @@ from src.utils.notifier import TelegramNotifier
 from src.data.storage import Storage
 from src.data.collector import DataCollector
 from src.exchange.kiwoom import create_kiwoom_client
+from src.exchange.kis import KISAuth, KISFuturesClient
 
 
 # ──────────────────────────────────────────────
@@ -41,25 +42,95 @@ def _setup(config_path: str):
 
 
 def _register_collector_callbacks(collector, kiwoom, config):
-    """데이터 수집기 기본 콜백 등록 (collect + paper 공용)."""
+    """데이터 수집기 기본 콜백 등록 (collect + paper 공용).
 
-    def on_price(product, md):
-        kiwoom.set_base_price(
-            config.products[product].futures_symbol,
-            md.index_price,
-        )
-        quote = kiwoom.get_quote(config.products[product].futures_symbol)
-        if quote:
-            collector.update_futures_price(
-                product_name=product,
-                price=quote.price,
-                bid=quote.bid,
-                ask=quote.ask,
-                contract_month=config.products[product].futures_symbol,
-                volume=quote.volume,
+    KIS 활성화 시: perp 가격 콜백은 등록하되 futures 업데이트는 하지 않음
+                  (KIS WebSocket이 독립적으로 futures 가격 공급)
+    KIS 비활성화 시: 기존 방식 (Kiwoom mock이 index_price 기반 가짜 futures 생성)
+    """
+    if config.kis.enabled:
+        # KIS 모드: Kiwoom mock에서 futures 가격을 주입하지 않음
+        # KIS WebSocket이 별도로 collector.update_futures_price() 호출
+        logger = get_logger()
+        logger.info("KIS enabled — futures prices from KIS WebSocket (independent source)")
+    else:
+        # 기존 모드: Kiwoom mock이 index_price 기반으로 futures 가격 생성
+        def on_price(product, md):
+            kiwoom.set_base_price(
+                config.products[product].futures_symbol,
+                md.index_price,
             )
+            quote = kiwoom.get_quote(config.products[product].futures_symbol)
+            if quote:
+                collector.update_futures_price(
+                    product_name=product,
+                    price=quote.price,
+                    bid=quote.bid,
+                    ask=quote.ask,
+                    contract_month=config.products[product].futures_symbol,
+                    volume=quote.volume,
+                )
 
-    collector.on_price_update(on_price)
+        collector.on_price_update(on_price)
+
+
+async def _setup_kis(config, collector) -> KISFuturesClient | None:
+    """KIS 클라이언트 초기화 + 실시간 구독.
+
+    Returns:
+        KISFuturesClient 또는 None (비활성화 시)
+    """
+    if not config.kis.enabled:
+        return None
+
+    logger = get_logger()
+
+    auth = KISAuth(
+        app_key=config.kis.app_key,
+        app_secret=config.kis.app_secret,
+        base_url=config.kis.base_url,
+        is_paper=config.kis.is_paper,
+    )
+
+    client = KISFuturesClient(
+        auth=auth,
+        ws_url=config.kis.ws_url,
+        is_paper=config.kis.is_paper,
+    )
+
+    connected = await client.connect()
+    if not connected:
+        logger.error("KIS connection failed — falling back to Kiwoom mock")
+        return None
+
+    # KIS 종목 매핑 로드
+    settings_path = Path("config/settings.yaml")
+    import yaml
+    with open(settings_path) as f:
+        raw = yaml.safe_load(f) or {}
+    kis_map = raw.get("kis_symbol_map", {})
+
+    # 종목별 구독
+    for product_name, kis_symbol in kis_map.items():
+        if product_name not in config.products:
+            continue
+
+        def make_callback(pname):
+            def on_kis_quote(quote):
+                collector.update_futures_price(
+                    product_name=pname,
+                    price=quote.price,
+                    bid=quote.bid,
+                    ask=quote.ask,
+                    contract_month=quote.contract_month,
+                    volume=quote.volume,
+                )
+            return on_kis_quote
+
+        await client.subscribe(kis_symbol, make_callback(product_name))
+        logger.info(f"KIS subscribed: {product_name} → {kis_symbol}")
+
+    return client
 
 
 # ──────────────────────────────────────────────
@@ -76,6 +147,9 @@ async def run_collector(config_path: str = "config/settings.yaml"):
 
     # 콜백 등록
     _register_collector_callbacks(collector, kiwoom, config)
+
+    # KIS 실시간 호가 (활성화 시)
+    kis_client = await _setup_kis(config, collector)
 
     def on_basis(product, perp_price, futures_price, basis_bps,
                  perp_best_bid=0.0, perp_best_ask=0.0):
@@ -130,6 +204,8 @@ async def run_collector(config_path: str = "config/settings.yaml"):
     except asyncio.CancelledError:
         pass
     await collector.stop()
+    if kis_client:
+        await kis_client.disconnect()
     kiwoom.disconnect()
     storage.close()
     logger.info("Shutdown complete")
@@ -154,6 +230,9 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     # 데이터 수집기
     collector = DataCollector(config, storage)
     _register_collector_callbacks(collector, kiwoom, config)
+
+    # KIS 실시간 호가 (활성화 시)
+    kis_client = await _setup_kis(config, collector)
 
     # 페이퍼 트레이딩 엔진
     from src.paper.engine import PaperTradingEngine
@@ -281,6 +360,8 @@ async def run_paper(config_path: str = "config/settings.yaml"):
             pass
 
     await collector.stop()
+    if kis_client:
+        await kis_client.disconnect()
     kiwoom.disconnect()
 
     # 최종 요약

@@ -6,10 +6,10 @@ trade.xyz(Hyperliquid 기반)의 원유 퍼페추얼 선물과, 해당 퍼프가
 
 ### 대상 상품
 
-| 구분 | 퍼페추얼 (trade.xyz) | 월물 (키움증권) | 거래소 |
-|------|----------------------|----------------|--------|
-| WTI | WTIOIL (ticker: CL perp) | CL 근월물 (예: CLK6→CLM6) | NYMEX/CME |
-| Brent | BRENTOIL (ticker: BZ perp) | BZ 근월물 (예: BZM6→BZN6) | ICE/CME |
+| 구분 | 퍼페추얼 (trade.xyz) | 월물 (KIS 한국투자증권) | 거래소 |
+|------|----------------------|------------------------|--------|
+| WTI | WTIOIL (ticker: CL perp) | MCL 근월물 (마이크로, 100배럴) | NYMEX/CME |
+| Brent | BRENTOIL (ticker: BZ perp) | BZ 근월물 (1,000배럴) | ICE/CME |
 
 ### 핵심 메커니즘
 
@@ -33,20 +33,24 @@ trade.xyz(Hyperliquid 기반)의 원유 퍼페추얼 선물과, 해당 퍼프가
   - 포지션 조회
   - WebSocket 실시간 데이터
 
-### 1.2 키움증권 해외선물 OpenAPI-W 연동
-- **공식 가이드**: https://download.kiwoom.com/web/openapi/kiwoom_openapi_w_devguide_ver_1.0.pdf
-- **Python 래퍼**: `koapy` (PyPI), `pykiwoom`
-- **주의**: OCX 기반 → Windows 환경 필요 (또는 Wine/VM)
+### 1.2 KIS (한국투자증권) 해외선물 REST/WebSocket API 연동
+- **개발자 포털**: https://apiportal.koreainvestment.com/intro
+- **GitHub**: https://github.com/koreainvestment/open-trading-api
+- **Python 라이브러리**: `python-kis` (PyPI)
+- **장점**: REST/WebSocket 기반 → Linux EC2에서 직접 구동 가능 (Windows 불필요)
 - **필요 기능**:
-  - CL, BZ 월물 시세/호가 조회
-  - 주문 생성/취소/조회
+  - MCL, BZ 월물 실시간 호가(bid/ask) 조회 (WebSocket `HDFFF010`)
+  - 실시간 체결가 조회 (WebSocket `HDFFF020`)
+  - 현재가 REST 조회 (`HHDFC55010000`, `HHDFC86000000`)
+  - 주문 생성/취소/조회 (REST)
   - 잔고/증거금 조회
-  - 모의투자 → 실투자 전환
+- **전제조건**: KIS 계좌 개설, API 키 발급, CME 유료시세 신청 필수
 
 ### 1.3 데이터 파이프라인
 - Hyperliquid: WebSocket으로 실시간 mark price, index price, funding rate 수신
-- 키움: 실시간 시세 FID 구독 (해외선물 호가/체결)
-- 통합 데이터 저장: SQLite 또는 TimescaleDB
+- KIS: WebSocket으로 실시간 MCL/BZ 호가(bid/ask) 수신 → `collector.update_futures_price()` 호출
+- **핵심**: Perp(Hyperliquid)와 Futures(KIS)가 **독립적 데이터 소스**에서 수신되어야 진짜 basis 측정 가능
+- 통합 데이터 저장: SQLite
 - 베이시스 계산: `basis = perp_mark_price - futures_price`
 - 펀딩레이트 누적 추적
 
@@ -63,7 +67,7 @@ trade.xyz(Hyperliquid 기반)의 원유 퍼페추얼 선물과, 해당 퍼프가
 └─────────────────┘     │   Engine         │
                         │                  │
 ┌─────────────────┐     │  - Basis Calc    │──▶ Paper Trade Logger
-│  Kiwoom API     │────▶│  - Signal Gen    │──▶ PnL Tracker
+│  KIS WebSocket  │────▶│  - Signal Gen    │──▶ PnL Tracker
 │  (futures data) │     │  - Risk Mgmt     │──▶ Dashboard
 └─────────────────┘     │                  │
                         └──────────────────┘
@@ -93,8 +97,9 @@ trade.xyz(Hyperliquid 기반)의 원유 퍼페추얼 선물과, 해당 퍼프가
 
 ### 2.4 페이퍼 트레이딩 구현
 
-- Hyperliquid: 테스트넷 API로 실제 주문 시뮬레이션
-- 키움: 모의투자 계좌 사용 (OpenAPI-W 모의투자 모드)
+- Futures 시세: KIS WebSocket 실시간 호가 (실제 CME bid/ask)
+- Perp 시세: Hyperliquid WebSocket (실제 orderbook)
+- 주문 시뮬레이션: KiwoomMock (paper trading 주문용으로 유지)
 - 시뮬레이션 로그: 모든 신호/주문/체결/PnL 기록
 - 일일 리포트 자동 생성
 
@@ -108,7 +113,7 @@ trade.xyz(Hyperliquid 기반)의 원유 퍼페추얼 선물과, 해당 퍼프가
 - [ ] 수익성 검증 (수수료, 슬리피지, 펀딩 포함)
 - [ ] 에지 케이스 테스트 (롤오버, 급변동, 네트워크 장애)
 - [ ] Hyperliquid 메인넷 API 키 발급
-- [ ] 키움 실투자 계좌 해외선물 거래 개설
+- [ ] KIS 실투자 계좌 해외선물 거래 개설
 - [ ] USDC 입금 및 해외선물 증거금 확보
 - [ ] 최소 금액으로 라이브 테스트 (1계약)
 
@@ -132,28 +137,34 @@ trade.xyz(Hyperliquid 기반)의 원유 퍼페추얼 선물과, 해당 퍼프가
 | 구분 | 기술 |
 |------|------|
 | 언어 | Python 3.11+ |
-| Hyperliquid | `hyperliquid-python-sdk` |
-| 키움증권 | OpenAPI-W + `koapy` 또는 자체 래퍼 |
-| 데이터 저장 | SQLite (초기) → TimescaleDB (확장 시) |
-| 스케줄링 | APScheduler 또는 asyncio |
+| Hyperliquid | `hyperliquid-python-sdk` (HIP-3 perp: trade.xyz) |
+| 해외선물 (KIS) | REST + WebSocket API (Linux 네이티브) |
+| 데이터 저장 | SQLite |
+| 스케줄링 | asyncio |
 | 모니터링 | Grafana + Prometheus |
 | 알림 | Telegram Bot API |
-| 환경 | Windows (키움 OCX 의존) + WSL 가능 |
+| 환경 | EC2 Linux (Amazon Linux 2023) |
 
 ---
 
-## 디렉토리 구조 (예정)
+## 디렉토리 구조
+
+**로컬 프로젝트 루트**: `/Users/myunggeunjung/rwa_arbitrage/`
+**EC2 프로젝트 루트**: `~/rwa_arbitrage/`
+
+> 참고: 상위에 중첩 폴더 없이 `rwa_arbitrage/` 가 git repo 루트이자 프로젝트 루트임.
 
 ```
-rwa_arbitrage/
+rwa_arbitrage/   ← git repo root
 ├── CLAUDE.md                  # 이 파일
 ├── config/
 │   ├── settings.yaml          # 전략 파라미터, 임계값
 │   └── secrets.yaml           # API 키 (gitignore)
 ├── src/
 │   ├── exchange/
-│   │   ├── hyperliquid.py     # Hyperliquid API 래퍼
-│   │   └── kiwoom.py          # 키움 OpenAPI-W 래퍼
+│   │   ├── hyperliquid.py     # Hyperliquid API 래퍼 (trade.xyz perp)
+│   │   ├── kis.py             # KIS 한국투자증권 REST/WebSocket (해외선물 실시간 호가)
+│   │   └── kiwoom.py          # KiwoomMock (paper trading 주문 시뮬레이션용)
 │   ├── strategy/
 │   │   ├── basis_arb.py       # 베이시스 차익거래 로직
 │   │   └── signals.py         # 진입/청산 시그널
@@ -193,8 +204,8 @@ rwa_arbitrage/
 - 주말/공휴일에는 퍼프만 거래 가능 → 헤지 불가 구간 존재
 
 ### 수수료 구조
-- Hyperliquid: maker ~0.01%, taker ~0.035%
-- 키움 해외선물: 계약당 수수료 (보통 $3~5/계약)
+- Hyperliquid (trade.xyz): taker ~0.09bp (HIP-3)
+- KIS 해외선물: MCL ~$2.50/계약, BZ ~$7.50/계약
 - 펀딩레이트: 시간당 정산, 포지션 방향에 따라 수취 또는 지급
 
 ### 자본 효율성
@@ -208,10 +219,11 @@ rwa_arbitrage/
 
 | 단계 | 목표 | 예상 기간 |
 |------|------|-----------|
-| M1 | Hyperliquid API 연동 + 시세 수집 | 1주 |
-| M2 | 키움 OpenAPI-W 연동 + 시세 수집 | 1~2주 |
-| M3 | 베이시스 분석 + 백테스트 | 1주 |
-| M4 | 페이퍼 트레이딩 봇 완성 | 2주 |
-| M5 | 페이퍼 트레이딩 안정화 + 전략 튜닝 | 2~4주 |
-| M6 | 실거래 전환 (최소 규모) | 1주 |
-| M7 | 실거래 안정화 + 스케일업 | 지속 |
+| M1 | ✅ Hyperliquid API 연동 + 시세 수집 | 완료 |
+| M2 | ✅ KiwoomMock 기반 페이퍼 트레이딩 + 데이터 수집 | 완료 |
+| M3 | ✅ 베이시스 분석 + 파라미터 튜닝 | 완료 |
+| M4 | ✅ 계약 사이징 현실화 (MCL 100배럴, BZ 1000배럴) | 완료 |
+| M5 | 🔄 KIS API 연동 (실시간 MCL/BZ 호가) | 진행 예정 |
+| M6 | 페이퍼 트레이딩 + 실제 basis 데이터로 전략 검증 (2주+) | - |
+| M7 | KIS 주문 API 연동 → 실거래 전환 (최소 규모) | - |
+| M8 | 실거래 안정화 + 스케일업 | 지속 |

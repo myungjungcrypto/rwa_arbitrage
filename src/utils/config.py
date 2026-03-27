@@ -36,6 +36,19 @@ class KiwoomConfig:
 
 
 @dataclass
+class KISConfig:
+    """KIS (한국투자증권) API 설정."""
+    enabled: bool = False
+    app_key: str = ""
+    app_secret: str = ""
+    account_number: str = ""
+    base_url: str = "https://openapi.koreainvestment.com:9443"
+    ws_url: str = "ws://ops.koreainvestment.com:21000"
+    is_paper: bool = False       # 모의투자 여부
+    cme_realtime: bool = False   # CME 유료시세 신청 여부
+
+
+@dataclass
 class StrategyConfig:
     basis_window_hours: int = 24
     basis_std_multiplier: float = 2.0
@@ -66,6 +79,7 @@ class AppConfig:
     products: dict[str, ProductConfig] = field(default_factory=dict)
     hyperliquid: HyperliquidConfig = field(default_factory=HyperliquidConfig)
     kiwoom: KiwoomConfig = field(default_factory=KiwoomConfig)
+    kis: KISConfig = field(default_factory=KISConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     db_path: str = "data/arbitrage.db"
@@ -126,6 +140,20 @@ def load_config(
         account_password=kw_secrets.get("account_password", ""),
     )
 
+    # KIS 설정
+    kis_settings = settings.get("kis", {})
+    kis_secrets = secrets.get("kis", {})
+    kis_config = KISConfig(
+        enabled=kis_settings.get("enabled", False),
+        app_key=kis_secrets.get("app_key", ""),
+        app_secret=kis_secrets.get("app_secret", ""),
+        account_number=kis_secrets.get("account_number", ""),
+        base_url=kis_settings.get("base_url", "https://openapi.koreainvestment.com:9443"),
+        ws_url=kis_settings.get("ws_url", "ws://ops.koreainvestment.com:21000"),
+        is_paper=kis_settings.get("is_paper", False),
+        cme_realtime=kis_settings.get("cme_realtime", False),
+    )
+
     # 전략/리스크 설정
     strat = settings.get("strategy", {})
     risk = settings.get("risk", {})
@@ -137,6 +165,7 @@ def load_config(
         products=products,
         hyperliquid=hl_config,
         kiwoom=kw_config,
+        kis=kis_config,
         strategy=StrategyConfig(**{k: v for k, v in strat.items() if k in StrategyConfig.__dataclass_fields__}),
         risk=RiskConfig(**{k: v for k, v in risk.items() if k in RiskConfig.__dataclass_fields__}),
         db_path=db.get("path", "data/arbitrage.db"),
