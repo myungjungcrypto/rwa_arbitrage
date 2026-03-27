@@ -43,7 +43,7 @@ kis:
 # 전략 파라미터
 strategy:
   # 베이시스 계산
-  basis_window_hours: 24        # 24시간 window → 안정적 mean/std 확보
+  basis_window_hours: 12        # 12시간 window → 안정적 mean/std 확보
   basis_std_multiplier: 3.0     # σ 배수: 3.0 = 상위 0.1%에서만 진입
 
   # 진입/청산
