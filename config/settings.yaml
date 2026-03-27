@@ -43,14 +43,14 @@ kis:
 # 전략 파라미터
 strategy:
   # 베이시스 계산
-  basis_window_hours: 1         # 단기 mean에 맞춰 빠른 반응
-  basis_std_multiplier: 2.0     # σ 배수 (더 극단적일 때만 진입)
+  basis_window_hours: 24        # 24시간 window → 안정적 mean/std 확보
+  basis_std_multiplier: 3.0     # σ 배수: 3.0 = 상위 0.1%에서만 진입
 
   # 진입/청산
-  entry_threshold_bps: 12       # 최소 진입 베이시스 (bp), 왕복 수수료 3.46bp의 3.5배
+  entry_threshold_bps: 25       # 최소 진입 베이시스 (bp), 왕복 수수료 ~7bp × 3.5배
   exit_threshold_bps: 4         # 청산 임계값 (bp), mean 근처까지 기다림
-  target_profit_bps: 15         # 목표 수익 (bp)
-  max_hold_hours: 2             # 최대 보유 시간
+  target_profit_bps: 20         # 목표 수익 (bp)
+  max_hold_hours: 8             # 최대 보유 시간 (충분히 기다림)
 
   # 펀딩레이트
   funding_rate_weight: 1.0      # 펀딩 수익 반영 비율
