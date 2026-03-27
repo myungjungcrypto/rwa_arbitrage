@@ -133,6 +133,8 @@ class KiwoomMock(KiwoomBase):
         self._order_counter = 0
         self._quote_callbacks: dict[str, list[Callable]] = {}
         self._base_prices: dict[str, float] = {}  # 외부에서 주입
+        self._real_bids: dict[str, float] = {}    # KIS 실제 매수호가
+        self._real_asks: dict[str, float] = {}    # KIS 실제 매도호가
         self._margin = 100_000.0  # 모의 증거금 (USD)
 
     def connect(self) -> bool:
@@ -144,32 +146,54 @@ class KiwoomMock(KiwoomBase):
         self._connected = False
         logger.info("Kiwoom Mock disconnected")
 
-    def set_base_price(self, symbol: str, price: float):
-        """외부에서 기준가 설정 (Hyperliquid index price 연동)."""
+    def set_base_price(self, symbol: str, price: float,
+                       bid: float = 0.0, ask: float = 0.0):
+        """외부에서 기준가 + 실제 bid/ask 설정.
+
+        Args:
+            symbol: 종목코드
+            price: mid price
+            bid: 실제 매수호가 (KIS 등 외부 소스)
+            ask: 실제 매도호가
+        """
         self._base_prices[symbol] = price
+        if bid > 0:
+            self._real_bids[symbol] = bid
+        if ask > 0:
+            self._real_asks[symbol] = ask
 
     def get_quote(self, symbol: str) -> FuturesQuote | None:
-        """Mock 시세 생성.
+        """Mock 시세 반환.
 
-        base price에 약간의 스프레드/노이즈를 추가.
+        KIS 실제 bid/ask가 있으면 그대로 사용,
+        없으면 base price에서 1bp 스프레드 생성.
         """
         base = self._base_prices.get(symbol)
         if base is None:
             logger.warning(f"No base price for {symbol}")
             return None
 
-        # 노이즈 없이 base price 사용 (index price 기반)
-        price = base
-        spread = base * 0.0001  # 1bp 스프레드 (CME CL/BZ 평균)
+        # KIS 실제 호가가 있으면 사용
+        bid = self._real_bids.get(symbol)
+        ask = self._real_asks.get(symbol)
+
+        if bid and ask and bid > 0 and ask > 0:
+            price = (bid + ask) / 2
+        else:
+            # 폴백: 고정 1bp 스프레드
+            price = base
+            spread = base * 0.0001
+            bid = price - spread / 2
+            ask = price + spread / 2
 
         return FuturesQuote(
             symbol=symbol,
             name=f"{symbol} Futures",
             price=round(price, 2),
-            bid=round(price - spread / 2, 2),
-            ask=round(price + spread / 2, 2),
-            volume=random.randint(1000, 50000),
-            open_interest=random.randint(10000, 500000),
+            bid=round(bid, 2),
+            ask=round(ask, 2),
+            volume=0,
+            open_interest=0,
             change=0.0,
             change_pct=0.0,
             timestamp=time.time(),

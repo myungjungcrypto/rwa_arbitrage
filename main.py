@@ -128,7 +128,10 @@ async def _setup_kis(config, collector, kiwoom=None) -> KISFuturesClient | None:
                 # Kiwoom mock에도 가격 주입 (paper trading 주문 시뮬레이션용)
                 if kiwoom:
                     futures_symbol = config.products[pname].futures_symbol
-                    kiwoom.set_base_price(futures_symbol, quote.price)
+                    kiwoom.set_base_price(
+                        futures_symbol, quote.price,
+                        bid=quote.bid, ask=quote.ask,
+                    )
             return on_kis_quote
 
         # KIS는 계약총액 기준 호가 → contract_size로 나눠서 배럴당 가격으로 변환

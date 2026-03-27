@@ -480,6 +480,8 @@ class PaperTradingEngine:
         logger.info(
             f"[{product.upper()}] {emoji} EXIT {trade.direction} | "
             f"basis: {trade.entry_basis_bps:+.1f} → {signal.basis_bps:+.1f}bp | "
+            f"perp {trade.perp_entry_price:.2f}→{perp_fill_price:.2f} | "
+            f"futures {trade.futures_entry_price:.2f}→{futures_order.filled_price:.2f} | "
             f"pnl=${pnl['net_pnl_usd']:+.2f} (basis=${pnl['trading_pnl_usd']:+.2f} "
             f"funding=${pnl['funding_pnl_usd']:+.2f} fees=-${pnl['total_fees_usd']:.2f}) | "
             f"hold={hold_hours:.1f}h | {signal.reason}"
