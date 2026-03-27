@@ -127,8 +127,10 @@ async def _setup_kis(config, collector) -> KISFuturesClient | None:
                 )
             return on_kis_quote
 
-        await client.subscribe(kis_symbol, make_callback(product_name))
-        logger.info(f"KIS subscribed: {product_name} → {kis_symbol}")
+        # KIS는 계약총액 기준 호가 → contract_size로 나눠서 배럴당 가격으로 변환
+        price_divisor = float(config.products[product_name].contract_size)
+        await client.subscribe(kis_symbol, make_callback(product_name), price_divisor=price_divisor)
+        logger.info(f"KIS subscribed: {product_name} → {kis_symbol} (price_divisor={price_divisor})")
 
     return client
 

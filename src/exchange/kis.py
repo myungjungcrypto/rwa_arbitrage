@@ -169,6 +169,7 @@ class KISFuturesClient:
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._callbacks: dict[str, list[Callable]] = {}  # symbol → [callbacks]
+        self._price_divisors: dict[str, float] = {}      # symbol → divisor (KIS는 계약총액으로 호가)
         self._latest_quotes: dict[str, FuturesQuote] = {}
         self._running = False
         self._recv_task: Optional[asyncio.Task] = None
@@ -213,16 +214,19 @@ class KISFuturesClient:
             await self._session.close()
         logger.info("KIS WebSocket disconnected")
 
-    async def subscribe(self, symbol: str, callback: Callable):
+    async def subscribe(self, symbol: str, callback: Callable, price_divisor: float = 1.0):
         """종목 실시간 호가 + 체결 구독.
 
         Args:
             symbol: KIS 종목코드 (예: "MCLM26", "BZN26")
             callback: fn(FuturesQuote) — 호가 업데이트 시 호출
+            price_divisor: 가격 나눗수 (KIS는 계약총액 기준 호가 → 배럴당 가격 변환)
+                           MCL: 100 (100배럴/계약), BZ: 1000 (1000배럴/계약)
         """
         if symbol not in self._callbacks:
             self._callbacks[symbol] = []
         self._callbacks[symbol].append(callback)
+        self._price_divisors[symbol] = price_divisor
 
         # 호가 구독 (HDFFF010)
         await self._send_subscribe("HDFFF010", symbol)
@@ -388,6 +392,12 @@ class KISFuturesClient:
         if bid_price <= 0 or ask_price <= 0:
             return
 
+        # KIS는 계약총액 기준 호가 → 배럴당 가격으로 변환
+        divisor = self._price_divisors.get(symbol, 1.0)
+        if divisor != 1.0:
+            bid_price /= divisor
+            ask_price /= divisor
+
         mid_price = (bid_price + ask_price) / 2.0
 
         quote = FuturesQuote(
@@ -427,6 +437,11 @@ class KISFuturesClient:
             return
 
         if symbol in self._latest_quotes and last_price > 0:
+            # KIS는 계약총액 기준 → 배럴당 가격으로 변환
+            divisor = self._price_divisors.get(symbol, 1.0)
+            if divisor != 1.0:
+                last_price /= divisor
+
             q = self._latest_quotes[symbol]
             q.price = last_price
             q.volume = volume
