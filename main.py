@@ -74,7 +74,7 @@ def _register_collector_callbacks(collector, kiwoom, config):
         collector.on_price_update(on_price)
 
 
-async def _setup_kis(config, collector) -> KISFuturesClient | None:
+async def _setup_kis(config, collector, kiwoom=None) -> KISFuturesClient | None:
     """KIS 클라이언트 초기화 + 실시간 구독.
 
     Returns:
@@ -125,6 +125,10 @@ async def _setup_kis(config, collector) -> KISFuturesClient | None:
                     contract_month=quote.contract_month,
                     volume=quote.volume,
                 )
+                # Kiwoom mock에도 가격 주입 (paper trading 주문 시뮬레이션용)
+                if kiwoom:
+                    futures_symbol = config.products[pname].futures_symbol
+                    kiwoom.set_base_price(futures_symbol, quote.price)
             return on_kis_quote
 
         # KIS는 계약총액 기준 호가 → contract_size로 나눠서 배럴당 가격으로 변환
@@ -151,7 +155,7 @@ async def run_collector(config_path: str = "config/settings.yaml"):
     _register_collector_callbacks(collector, kiwoom, config)
 
     # KIS 실시간 호가 (활성화 시)
-    kis_client = await _setup_kis(config, collector)
+    kis_client = await _setup_kis(config, collector, kiwoom)
 
     def on_basis(product, perp_price, futures_price, basis_bps,
                  perp_best_bid=0.0, perp_best_ask=0.0):
@@ -234,7 +238,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     _register_collector_callbacks(collector, kiwoom, config)
 
     # KIS 실시간 호가 (활성화 시)
-    kis_client = await _setup_kis(config, collector)
+    kis_client = await _setup_kis(config, collector, kiwoom)
 
     # 페이퍼 트레이딩 엔진
     from src.paper.engine import PaperTradingEngine
