@@ -17,6 +17,10 @@ products:
 # NOTE: kis_symbol은 KIS 종목코드 (근월물, 매월 롤오버 필요)
 kis_symbol_map:
   wti: "MCLK26"              # MCL 2026년 5월물 (프론트 월물)
+  # NOTE: trade.xyz oracle는 CME 프론트 월물 기반
+  #   매월 5~10번째 영업일: 근월물→차월물 가중평균 롤오버
+  #   MCLK26(5월물) 만기: 2026-04-21경
+  #   4월 7~14일경 롤오버 시작 → MCLM26(6월물)으로 수동 교체 필요
 
 # Hyperliquid 설정
 hyperliquid:
