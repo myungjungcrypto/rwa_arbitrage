@@ -194,7 +194,11 @@ class DataCollector:
         logger.debug(f"Trade: {trade}")
 
     def _compute_basis(self, product_name: str, product: ProductConfig):
-        """퍼프-월물 베이시스 계산 및 저장."""
+        """퍼프-월물 베이시스 계산 및 저장.
+
+        mid 기준 basis (통계/DB용)와 executable basis (거래 판단용)을
+        모두 계산하여 콜백에 전달.
+        """
         perp = self._latest_perp.get(product_name)
         futures = self._latest_futures.get(product_name)
 
@@ -203,10 +207,13 @@ class DataCollector:
 
         # 키움 월물 시세가 없으면 인덱스(오라클) 가격을 대용으로 사용
         futures_price = futures["price"] if futures else perp.index_price
+        futures_bid = futures["bid"] if futures and futures["bid"] > 0 else futures_price
+        futures_ask = futures["ask"] if futures and futures["ask"] > 0 else futures_price
 
         if futures_price <= 0:
             return
 
+        # mid 기준 basis (통계 추적용)
         basis_bps = (perp.mark_price - futures_price) / futures_price * 10_000
 
         self.storage.save_basis(
@@ -221,11 +228,12 @@ class DataCollector:
         perp_best_bid = ob.best_bid if ob else perp.mark_price
         perp_best_ask = ob.best_ask if ob else perp.mark_price
 
-        # 콜백
+        # 콜백 — futures bid/ask도 전달
         for cb in self._basis_callbacks:
             try:
                 cb(product_name, perp.mark_price, futures_price, basis_bps,
-                   perp_best_bid, perp_best_ask)
+                   perp_best_bid, perp_best_ask,
+                   futures_bid, futures_ask)
             except Exception as e:
                 logger.error(f"Basis callback error: {e}")
 

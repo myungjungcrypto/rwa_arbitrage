@@ -130,9 +130,14 @@ class PaperTradingEngine:
         # 최신 가격 캐시
         self._latest_perp_prices: dict[str, float] = {}   # product -> mark_price
         self._latest_index_prices: dict[str, float] = {}   # product -> index_price
-        self._latest_futures_prices: dict[str, float] = {}  # product -> futures_price
+        self._latest_futures_prices: dict[str, float] = {}  # product -> futures_price (mid)
         self._latest_perp_bid: dict[str, float] = {}       # product -> best bid
         self._latest_perp_ask: dict[str, float] = {}       # product -> best ask
+        self._latest_futures_bid: dict[str, float] = {}    # product -> futures best bid
+        self._latest_futures_ask: dict[str, float] = {}    # product -> futures best ask
+
+        # 최소 워밍업 데이터 수 (이 이하면 거래 안 함)
+        self.MIN_WARMUP_POINTS = 3600  # 약 1시간 분량
 
         # 이벤트 콜백
         self._on_trade_callbacks: list[Callable] = []
@@ -155,6 +160,34 @@ class PaperTradingEngine:
 
     # ── 메인 처리 루프 ──
 
+    def _compute_executable_basis(
+        self,
+        product: str,
+        direction: str,
+    ) -> float:
+        """실제 체결 가능 가격 기반 executable basis 계산.
+
+        진입 시: 매수 측은 ask, 매도 측은 bid 사용
+        - short_basis 진입: perp BUY(ask) + futures SELL(bid)
+          → exec_basis = (perp_ask - futures_bid) / futures_bid * 10000
+        - long_basis 진입: perp SELL(bid) + futures BUY(ask)
+          → exec_basis = (perp_bid - futures_ask) / futures_ask * 10000
+        """
+        perp_bid = self._latest_perp_bid.get(product, 0)
+        perp_ask = self._latest_perp_ask.get(product, 0)
+        futures_bid = self._latest_futures_bid.get(product, 0)
+        futures_ask = self._latest_futures_ask.get(product, 0)
+
+        if not all([perp_bid, perp_ask, futures_bid, futures_ask]):
+            return 0.0
+
+        if direction == "short_basis":
+            # perp LONG(ask) + futures SHORT(bid)
+            return (perp_ask - futures_bid) / futures_bid * 10_000
+        else:  # long_basis
+            # perp SHORT(bid) + futures LONG(ask)
+            return (perp_bid - futures_ask) / futures_ask * 10_000
+
     def process_basis_update(
         self,
         product: str,
@@ -164,25 +197,31 @@ class PaperTradingEngine:
         funding_rate: float = 0.0,
         perp_best_bid: float = 0.0,
         perp_best_ask: float = 0.0,
+        futures_bid: float = 0.0,
+        futures_ask: float = 0.0,
     ):
         """베이시스 업데이트 처리 — DataCollector 콜백으로 사용.
 
         Args:
             product: 상품명 (wti / brent)
             perp_price: 퍼프 mark price
-            futures_price: 선물 가격
-            basis_bps: 베이시스 (bp)
+            futures_price: 선물 mid 가격
+            basis_bps: 베이시스 (bp) — mid 기준, 통계용
             funding_rate: 현재 펀딩레이트
             perp_best_bid: 퍼프 오더북 최우선 매수호가
             perp_best_ask: 퍼프 오더북 최우선 매도호가
+            futures_bid: 선물 매수 최우선호가
+            futures_ask: 선물 매도 최우선호가
         """
         # 가격 캐시 업데이트
         self._latest_perp_prices[product] = perp_price
         self._latest_futures_prices[product] = futures_price
         self._latest_perp_bid[product] = perp_best_bid or perp_price
         self._latest_perp_ask[product] = perp_best_ask or perp_price
+        self._latest_futures_bid[product] = futures_bid or futures_price
+        self._latest_futures_ask[product] = futures_ask or futures_price
 
-        # 시그널 생성
+        # 시그널 생성 (mid 기준 basis로 통계 추적)
         signal = self.signal_gen.update_basis(product, basis_bps, funding_rate)
         self._state.total_signals += 1
 
@@ -196,8 +235,36 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"Signal callback error: {e}")
 
-        # 진입 시그널
+        # 진입 시그널 — executable basis 검증 후 실행
         if signal.type in (SignalType.ENTRY_LONG_BASIS, SignalType.ENTRY_SHORT_BASIS):
+            direction = "long_basis" if signal.type == SignalType.ENTRY_LONG_BASIS else "short_basis"
+
+            # 워밍업 체크
+            history = self.signal_gen._basis_history.get(product)
+            if history and len(history) < self.MIN_WARMUP_POINTS:
+                return  # 데이터 부족, 거래 안 함
+
+            # Executable basis 계산
+            exec_basis = self._compute_executable_basis(product, direction)
+
+            # executable basis가 entry threshold를 넘지 않으면 무시
+            if direction == "short_basis" and exec_basis > -self.config.strategy.entry_threshold_bps:
+                logger.debug(
+                    f"[{product.upper()}] Exec basis {exec_basis:.1f}bp > "
+                    f"-{self.config.strategy.entry_threshold_bps}bp, skipping"
+                )
+                return
+            if direction == "long_basis" and exec_basis < self.config.strategy.entry_threshold_bps:
+                logger.debug(
+                    f"[{product.upper()}] Exec basis {exec_basis:.1f}bp < "
+                    f"+{self.config.strategy.entry_threshold_bps}bp, skipping"
+                )
+                return
+
+            logger.info(
+                f"[{product.upper()}] Executable basis check PASSED: "
+                f"mid={basis_bps:+.1f}bp exec={exec_basis:+.1f}bp"
+            )
             self._handle_entry(product, signal, perp_price, futures_price)
 
         # 청산 시그널

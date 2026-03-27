@@ -161,7 +161,8 @@ async def run_collector(config_path: str = "config/settings.yaml"):
     kis_client = await _setup_kis(config, collector, kiwoom)
 
     def on_basis(product, perp_price, futures_price, basis_bps,
-                 perp_best_bid=0.0, perp_best_ask=0.0):
+                 perp_best_bid=0.0, perp_best_ask=0.0,
+                 futures_bid=0.0, futures_ask=0.0):
         logger.info(
             f"[{product.upper()}] "
             f"perp={perp_price:.2f} futures={futures_price:.2f} "
@@ -263,7 +264,8 @@ async def run_paper(config_path: str = "config/settings.yaml"):
 
     # 1) 베이시스 업데이트 → 엔진에 전달
     def on_basis(product, perp_price, futures_price, basis_bps,
-                 perp_best_bid=0.0, perp_best_ask=0.0):
+                 perp_best_bid=0.0, perp_best_ask=0.0,
+                 futures_bid=0.0, futures_ask=0.0):
         # 펀딩레이트 가져오기
         md = collector.latest_perp.get(product)
         funding_rate = md.funding_rate if md else 0.0
@@ -276,6 +278,8 @@ async def run_paper(config_path: str = "config/settings.yaml"):
             funding_rate=funding_rate,
             perp_best_bid=perp_best_bid,
             perp_best_ask=perp_best_ask,
+            futures_bid=futures_bid,
+            futures_ask=futures_ask,
         )
 
     collector.on_basis_update(on_basis)
