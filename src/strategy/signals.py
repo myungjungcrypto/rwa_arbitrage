@@ -95,6 +95,27 @@ class SignalGenerator:
         # 포지션 상태
         self._positions: dict[str, PositionState] = {}
 
+    def bootstrap_from_db(self, product: str, basis_history: list[float]):
+        """DB에서 로드한 과거 basis 데이터로 히스토리 초기화.
+
+        재시작 시 24시간 window를 처음부터 다시 채우지 않아도 되도록
+        DB의 basis_spread 테이블에서 최근 데이터를 로드하여 주입.
+
+        Args:
+            product: 상품명 (wti / brent)
+            basis_history: basis_bps 리스트 (시간순, 오래된→최신)
+        """
+        if product not in self._basis_history:
+            self._basis_history[product] = deque(maxlen=self._max_points)
+
+        for bps in basis_history:
+            self._basis_history[product].append(bps)
+
+        logger.info(
+            f"[{product.upper()}] Bootstrapped {len(basis_history)} basis points from DB "
+            f"(buffer: {len(self._basis_history[product])}/{self._max_points})"
+        )
+
     def get_position(self, product: str) -> PositionState:
         if product not in self._positions:
             self._positions[product] = PositionState(product=product)

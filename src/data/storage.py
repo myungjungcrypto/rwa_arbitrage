@@ -302,6 +302,18 @@ class Storage:
             "count": cnt,
         }
 
+    def get_basis_history(self, product: str, hours: float = 24) -> list[float]:
+        """최근 N시간의 basis_bps 리스트 반환 (시간순, 오래된→최신).
+
+        SignalGenerator 부트스트랩용.
+        """
+        since = time.time() - hours * 3600
+        rows = self.conn.execute(
+            "SELECT basis_bps FROM basis_spread WHERE product = ? AND ts >= ? ORDER BY ts ASC",
+            (product, since),
+        ).fetchall()
+        return [row["basis_bps"] for row in rows]
+
     def get_cumulative_funding(self, ticker: str, hours: float = 24) -> float:
         """누적 펀딩레이트."""
         since = time.time() - hours * 3600

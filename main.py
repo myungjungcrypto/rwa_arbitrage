@@ -251,6 +251,14 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         kiwoom=kiwoom,
     )
 
+    # DB에서 최근 basis 데이터 부트스트랩 (재시작 시 window 즉시 복원)
+    for product_name in config.products:
+        history = storage.get_basis_history(product_name, hours=config.strategy.basis_window_hours)
+        if history:
+            engine.signal_gen.bootstrap_from_db(product_name, history)
+        else:
+            logger.info(f"[{product_name.upper()}] No basis history in DB — starting fresh")
+
     # ── 콜백 연결 ──
 
     # 1) 베이시스 업데이트 → 엔진에 전달
