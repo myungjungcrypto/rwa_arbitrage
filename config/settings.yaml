@@ -16,7 +16,7 @@ products:
 # KIS 종목코드 매핑 (settings에서 관리, API키는 secrets.yaml)
 # NOTE: kis_symbol은 KIS 종목코드 (근월물, 매월 롤오버 필요)
 kis_symbol_map:
-  wti: "MCLM26"              # MCL 2026년 6월물
+  wti: "MCLK26"              # MCL 2026년 5월물 (프론트 월물)
 
 # Hyperliquid 설정
 hyperliquid:
