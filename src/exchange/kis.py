@@ -293,18 +293,22 @@ class KISFuturesClient:
             asyncio.create_task(self._reconnect())
 
     async def _reconnect(self):
-        """WebSocket 재연결."""
+        """WebSocket 재연결 (토큰 재발급 포함)."""
         try:
             if self._ws and not self._ws.closed:
                 await self._ws.close()
             if self._session:
                 await self._session.close()
 
+            # 토큰 재발급 (만료됐을 수 있음)
+            await self.auth.get_access_token()
+            await self.auth.get_approval_key()
+
             self._session = aiohttp.ClientSession()
             self._ws = await self._session.ws_connect(
                 self.ws_url, heartbeat=30,
             )
-            logger.info("KIS WebSocket reconnected")
+            logger.info("KIS WebSocket reconnected (tokens refreshed)")
 
             # 기존 구독 복원
             for symbol in self._callbacks:

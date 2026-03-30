@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -62,20 +63,28 @@ class BacktestResult:
     basis_max: float = 0.0
     data_points: int = 0
 
+    # exit reason 통계
+    exit_reasons: dict[str, int] = field(default_factory=dict)
+
     def summary(self) -> str:
         """결과 요약 문자열."""
-        return (
-            f"=== Backtest: {self.product} ({self.data_points} data points) ===\n"
+        lines = [
+            f"=== Backtest: {self.product} ({self.data_points} data points) ===",
             f"Basis stats: mean={self.basis_mean:.1f}bp, std={self.basis_std:.1f}bp, "
-            f"range=[{self.basis_min:.1f}, {self.basis_max:.1f}]bp\n"
+            f"range=[{self.basis_min:.1f}, {self.basis_max:.1f}]bp",
             f"Trades: {self.total_trades} (win={self.winning_trades}, lose={self.losing_trades}, "
-            f"rate={self.win_rate:.0%})\n"
+            f"rate={self.win_rate:.0%})",
             f"PnL: total={self.total_pnl_bps:.1f}bp, avg={self.avg_pnl_bps:.1f}bp, "
-            f"best={self.max_pnl_bps:.1f}bp, worst={self.min_pnl_bps:.1f}bp\n"
-            f"Funding: {self.total_funding_pnl_bps:.1f}bp, Fees: -{self.total_fees_bps:.1f}bp\n"
+            f"best={self.max_pnl_bps:.1f}bp, worst={self.min_pnl_bps:.1f}bp",
+            f"Funding: {self.total_funding_pnl_bps:.1f}bp, Fees: -{self.total_fees_bps:.1f}bp",
             f"Avg hold: {self.avg_hold_hours:.1f}h, Sharpe: {self.sharpe_ratio:.2f}, "
-            f"Max DD: {self.max_drawdown_bps:.1f}bp"
-        )
+            f"Max DD: {self.max_drawdown_bps:.1f}bp",
+        ]
+        if self.exit_reasons:
+            lines.append("Exit reasons: " + ", ".join(
+                f"{k}={v}" for k, v in sorted(self.exit_reasons.items(), key=lambda x: -x[1])
+            ))
+        return "\n".join(lines)
 
 
 class BacktestEngine:
@@ -85,19 +94,32 @@ class BacktestEngine:
 
     수수료 구조:
     - trade.xyz HIP-3 perp: taker 0.009% = 0.9bp
-    - 키움 해외선물: MCL $2.50/계약 ≈ 2.8bp, BZ $7.50/계약 ≈ 0.78bp
+    - KIS 해외선물: MCL $2.50/계약 ≈ 2.8bp
     - 진입/청산 각각 양쪽 수수료 발생
+
+    스프레드 비용:
+    - mid basis와 executable basis의 차이를 스프레드 비용으로 반영
+    - perp bid/ask spread + futures bid/ask spread
     """
 
     def __init__(
         self,
-        perp_fee_bps: float = 0.9,    # trade.xyz HIP-3 taker (0.009%)
-        futures_fee_bps: float = 2.8,  # MCL $2.50/계약 기준 (=$2.50 / $89 / 100bbl * 10000)
+        perp_fee_bps: float = 0.9,      # trade.xyz HIP-3 taker (0.009%)
+        futures_fee_bps: float = 2.8,    # MCL $2.50/계약 기준
+        perp_spread_bps: float = 3.0,    # perp 평균 bid/ask 스프레드 (편도)
+        futures_spread_bps: float = 3.0, # futures 평균 bid/ask 스프레드 (편도)
         funding_interval_hours: float = 1.0,
     ):
         self.perp_fee_bps = perp_fee_bps
         self.futures_fee_bps = futures_fee_bps
-        self.round_trip_fee_bps = (perp_fee_bps + futures_fee_bps) * 2  # 진입+청산
+        self.perp_spread_bps = perp_spread_bps
+        self.futures_spread_bps = futures_spread_bps
+        # 왕복 비용 = (수수료 + 스프레드) × 2 legs × 2 (entry+exit)
+        self.round_trip_fee_bps = (perp_fee_bps + futures_fee_bps) * 2
+        # 스프레드 비용: 진입/청산 시 각 leg에서 half-spread만큼 불리
+        # 왕복: perp half-spread × 2(entry+exit) + futures half-spread × 2
+        self.round_trip_spread_bps = perp_spread_bps + futures_spread_bps
+        self.total_round_trip_cost_bps = self.round_trip_fee_bps + self.round_trip_spread_bps
         self.funding_interval_hours = funding_interval_hours
 
     def run(
@@ -153,8 +175,8 @@ class BacktestEngine:
                 gen.add_funding(product, funding)
                 last_funding_time = ts
 
-            # 시그널의 timestamp를 현재 시점으로 설정
-            signal = gen.update_basis(product, basis, funding)
+            # 시뮬레이션 시간을 전달하여 hold_hours 정확히 계산
+            signal = gen.update_basis(product, basis, funding, current_time=ts)
             signal.timestamp = ts
 
             if signal.type in (SignalType.ENTRY_LONG_BASIS, SignalType.ENTRY_SHORT_BASIS):
@@ -172,7 +194,7 @@ class BacktestEngine:
 
                 funding_pnl = pos.cumulative_funding * 10000
                 gross_pnl = basis_pnl + funding_pnl
-                net_pnl = gross_pnl - self.round_trip_fee_bps
+                net_pnl = gross_pnl - self.total_round_trip_cost_bps
 
                 trade = Trade(
                     product=product,
@@ -185,7 +207,7 @@ class BacktestEngine:
                     basis_pnl_bps=basis_pnl,
                     funding_pnl_bps=funding_pnl,
                     gross_pnl_bps=gross_pnl,
-                    fees_bps=self.round_trip_fee_bps,
+                    fees_bps=self.total_round_trip_cost_bps,
                     net_pnl_bps=net_pnl,
                     hold_hours=(ts - pos.entry_time) / 3600,
                     exit_reason=signal.reason,
@@ -227,6 +249,14 @@ class BacktestEngine:
         result.avg_hold_hours = np.mean([t.hold_hours for t in trades])
         result.total_funding_pnl_bps = sum(t.funding_pnl_bps for t in trades)
         result.total_fees_bps = sum(t.fees_bps for t in trades)
+
+        # Exit reason 통계
+        reason_counter: Counter[str] = Counter()
+        for t in trades:
+            # 간결하게: "Mean reversion: ..." → "mean_reversion"
+            reason = t.exit_reason.split(":")[0].strip().lower().replace(" ", "_")
+            reason_counter[reason] += 1
+        result.exit_reasons = dict(reason_counter)
 
         # Sharpe ratio (bp 기준)
         if len(pnls) > 1:

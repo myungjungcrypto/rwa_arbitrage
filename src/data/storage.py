@@ -258,6 +258,45 @@ class Storage:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_all_basis(self, product: str) -> list[dict]:
+        """전체 베이시스 데이터 로드 (백테스트용)."""
+        rows = self.conn.execute(
+            """SELECT * FROM basis_spread
+               WHERE product = ?
+               ORDER BY ts ASC""",
+            (product,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_basis_range(self, product: str, start_ts: float, end_ts: float) -> list[dict]:
+        """특정 시간 범위의 베이시스 데이터 로드."""
+        rows = self.conn.execute(
+            """SELECT * FROM basis_spread
+               WHERE product = ? AND ts >= ? AND ts <= ?
+               ORDER BY ts ASC""",
+            (product, start_ts, end_ts),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_spread_stats(self, product: str, hours: float = 24) -> dict:
+        """futures bid/ask 스프레드 통계 (백테스트 스프레드 추정용)."""
+        since = time.time() - hours * 3600
+        # futures_prices에서 bid/ask 스프레드 계산
+        row = self.conn.execute(
+            """SELECT
+                AVG((ask - bid) / ((ask + bid) / 2) * 10000) as avg_spread_bps,
+                MIN((ask - bid) / ((ask + bid) / 2) * 10000) as min_spread_bps,
+                MAX((ask - bid) / ((ask + bid) / 2) * 10000) as max_spread_bps,
+                COUNT(*) as n
+               FROM futures_prices
+               WHERE symbol = ? AND ts >= ? AND bid > 0 AND ask > 0""",
+            (product.upper() if product == "mcl" else
+             {"wti": "MCL", "brent": "BZ"}.get(product, product), since),
+        ).fetchone()
+        if row:
+            return dict(row)
+        return {"avg_spread_bps": 0, "min_spread_bps": 0, "max_spread_bps": 0, "n": 0}
+
     def get_recent_perp_prices(self, ticker: str, hours: float = 24) -> list[dict]:
         """최근 N시간 퍼프 시세."""
         since = time.time() - hours * 3600

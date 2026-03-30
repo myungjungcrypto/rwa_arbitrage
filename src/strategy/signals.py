@@ -121,17 +121,23 @@ class SignalGenerator:
             self._positions[product] = PositionState(product=product)
         return self._positions[product]
 
-    def update_basis(self, product: str, basis_bps: float, funding_rate: float = 0.0) -> Signal:
+    def update_basis(
+        self, product: str, basis_bps: float, funding_rate: float = 0.0,
+        current_time: float | None = None,
+    ) -> Signal:
         """베이시스 데이터 업데이트 + 시그널 생성.
 
         Args:
             product: 상품명 (wti / brent)
             basis_bps: 현재 베이시스 (bp)
             funding_rate: 현재 펀딩레이트
+            current_time: 현재 시간 (백테스트에서는 시뮬레이션 시간, None이면 time.time())
 
         Returns:
             생성된 Signal
         """
+        self._current_time = current_time or time.time()
+
         # 히스토리 추가
         if product not in self._basis_history:
             self._basis_history[product] = deque(maxlen=self._max_points)
@@ -241,7 +247,7 @@ class SignalGenerator:
         pos: PositionState,
     ) -> Signal:
         """청산 시그널 체크."""
-        hold_hours = (time.time() - pos.entry_time) / 3600
+        hold_hours = (self._current_time - pos.entry_time) / 3600
 
         # 긴급 청산: 베이시스가 반대로 너무 크게 벌어짐
         if pos.direction == "long_basis" and basis_bps < -(self.emergency_close_bps):
