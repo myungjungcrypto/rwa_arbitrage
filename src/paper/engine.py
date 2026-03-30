@@ -242,6 +242,7 @@ class PaperTradingEngine:
             # 워밍업 체크
             history = self.signal_gen._basis_history.get(product)
             if history and len(history) < self.MIN_WARMUP_POINTS:
+                logger.info(f"[{product.upper()}] Warmup skip: {len(history)}/{self.MIN_WARMUP_POINTS}")
                 return  # 데이터 부족, 거래 안 함
 
             # Executable basis 계산
@@ -249,15 +250,23 @@ class PaperTradingEngine:
 
             # executable basis가 entry threshold를 넘지 않으면 무시
             if direction == "short_basis" and exec_basis > -self.config.strategy.entry_threshold_bps:
-                logger.debug(
-                    f"[{product.upper()}] Exec basis {exec_basis:.1f}bp > "
-                    f"-{self.config.strategy.entry_threshold_bps}bp, skipping"
+                logger.info(
+                    f"[{product.upper()}] Exec basis SKIP: exec={exec_basis:.1f}bp > "
+                    f"-{self.config.strategy.entry_threshold_bps}bp "
+                    f"(perp_bid={self._latest_perp_bid.get(product, 0):.2f} "
+                    f"ask={self._latest_perp_ask.get(product, 0):.2f} "
+                    f"fut_bid={self._latest_futures_bid.get(product, 0):.2f} "
+                    f"ask={self._latest_futures_ask.get(product, 0):.2f})"
                 )
                 return
             if direction == "long_basis" and exec_basis < self.config.strategy.entry_threshold_bps:
-                logger.debug(
-                    f"[{product.upper()}] Exec basis {exec_basis:.1f}bp < "
-                    f"+{self.config.strategy.entry_threshold_bps}bp, skipping"
+                logger.info(
+                    f"[{product.upper()}] Exec basis SKIP: exec={exec_basis:.1f}bp < "
+                    f"+{self.config.strategy.entry_threshold_bps}bp "
+                    f"(perp_bid={self._latest_perp_bid.get(product, 0):.2f} "
+                    f"ask={self._latest_perp_ask.get(product, 0):.2f} "
+                    f"fut_bid={self._latest_futures_bid.get(product, 0):.2f} "
+                    f"ask={self._latest_futures_ask.get(product, 0):.2f})"
                 )
                 return
 
