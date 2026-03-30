@@ -342,24 +342,16 @@ class Storage:
         }
 
     def get_basis_history(self, product: str, hours: float = 24) -> list[float]:
-        """최근 N시간의 basis_bps 리스트 반환 (시간순, 오래된→최신).
+        """basis_bps 리스트 반환 (시간순, 오래된→최신).
 
         SignalGenerator 부트스트랩용.
-        max_points로 deque 크기 제한이 있으므로 전체 로드해도 안전.
+        deque maxlen이 자동으로 잘라주므로 전체 DB 데이터를 로드하여
+        window를 최대한 채운다.
         """
-        since = time.time() - hours * 3600
         rows = self.conn.execute(
-            "SELECT basis_bps FROM basis_spread WHERE product = ? AND ts >= ? ORDER BY ts ASC",
-            (product, since),
+            "SELECT basis_bps FROM basis_spread WHERE product = ? ORDER BY ts ASC",
+            (product,),
         ).fetchall()
-
-        # 최근 데이터가 부족하면 전체 DB에서 로드
-        if len(rows) < 100:
-            rows = self.conn.execute(
-                "SELECT basis_bps FROM basis_spread WHERE product = ? ORDER BY ts ASC",
-                (product,),
-            ).fetchall()
-
         return [row["basis_bps"] for row in rows]
 
     def get_cumulative_funding(self, ticker: str, hours: float = 24) -> float:
