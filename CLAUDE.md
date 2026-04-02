@@ -217,13 +217,40 @@ rwa_arbitrage/   ← git repo root
 
 ## 마일스톤
 
-| 단계 | 목표 | 예상 기간 |
-|------|------|-----------|
+| 단계 | 목표 | 상태 |
+|------|------|------|
 | M1 | ✅ Hyperliquid API 연동 + 시세 수집 | 완료 |
 | M2 | ✅ KiwoomMock 기반 페이퍼 트레이딩 + 데이터 수집 | 완료 |
 | M3 | ✅ 베이시스 분석 + 파라미터 튜닝 | 완료 |
 | M4 | ✅ 계약 사이징 현실화 (MCL 100배럴, BZ 1000배럴) | 완료 |
-| M5 | 🔄 KIS API 연동 (실시간 MCL/BZ 호가) | 진행 예정 |
-| M6 | 페이퍼 트레이딩 + 실제 basis 데이터로 전략 검증 (2주+) | - |
-| M7 | KIS 주문 API 연동 → 실거래 전환 (최소 규모) | - |
-| M8 | 실거래 안정화 + 스케일업 | 지속 |
+| M5 | ✅ KIS API 연동 (실시간 MCL 호가, WebSocket) | 완료 |
+| M6 | ✅ executable basis 검증 + 백테스트 그리드서치 | 완료 |
+| M7 | 🔄 exit 전략 개선 (entry 기준 profit exit) | **현재 진행** |
+| M8 | 페이퍼 트레이딩 수익성 검증 (2주+) | - |
+| M9 | KIS 주문 API 연동 → 실거래 전환 (최소 규모) | - |
+| M10 | 실거래 안정화 + 스케일업 | 지속 |
+
+---
+
+## 현재 이슈 및 방향 (2026-04-02)
+
+### 핵심 문제: 즉시 청산으로 수수료 손실
+- 49건 거래, 승률 16%, 총 PnL -$599.65
+- 평균 보유 시간 6초 — mean reversion exit이 즉시 발동
+- trading PnL은 +$65 (진입 방향은 올바름) 하지만 수수료 -$665가 이를 초과
+- entry spread 23bp+ 인 거래에서만 수익 발생
+
+### 다음 단계: M7 exit 전략 변경 — 스프레드 수렴 기반 청산
+- **원리**: perp는 시장 원칙상 futures(인덱스) 가격으로 수렴해야 함. 수렴 안 해도 펀딩 받는 쪽이므로 보유 비용 없음.
+- **기존**: mid basis가 mean±3bp에 도달하면 청산 → 수 초 만에 발동
+- **변경**: perp 가격 ≈ futures 가격 (spread ≈ 0bp)일 때 청산
+  - `convergence_target_bps: 3` → spread가 3bp 이하면 수렴 완료
+  - `max_hold_hours: 48` → 수렴 기다리며 펀딩 수취
+  - mean reversion exit, target_profit exit 제거
+- **기대**: -25bp 진입 → 0bp 근처 수렴 청산 → 25bp 수익 → 수수료 13bp → 순수익 ~12bp
+
+### 운영 환경
+- EC2 (Amazon Linux): PM2로 `rwa-arb` 프로세스 관리
+- 매일 UTC 00:00 (KST 09:00) PM2 cron restart → KIS 토큰 자동 갱신
+- KIS CME/NYMEX 유료시세: 24시간 토큰 유효, 1일 1회 발급 원칙
+- WTI(MCL) 전용 (Brent는 ICE 시세 미신청 + 계약 단위 비현실적)

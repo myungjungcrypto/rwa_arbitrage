@@ -113,11 +113,10 @@ class PaperTradingEngine:
             window_hours=config.strategy.basis_window_hours,
             std_multiplier=config.strategy.basis_std_multiplier,
             entry_threshold_bps=config.strategy.entry_threshold_bps,
-            exit_threshold_bps=config.strategy.exit_threshold_bps,
-            target_profit_bps=config.strategy.target_profit_bps,
             max_hold_hours=config.strategy.max_hold_hours,
             funding_rate_weight=config.strategy.funding_rate_weight,
             min_funding_advantage_bps=config.strategy.min_funding_advantage_bps,
+            convergence_target_bps=config.strategy.convergence_target_bps,
         )
         self.risk_mgr = risk_mgr or RiskManager(config.risk)
 
@@ -221,8 +220,14 @@ class PaperTradingEngine:
         self._latest_futures_bid[product] = futures_bid or futures_price
         self._latest_futures_ask[product] = futures_ask or futures_price
 
-        # 시그널 생성 (mid 기준 basis로 통계 추적)
-        signal = self.signal_gen.update_basis(product, basis_bps, funding_rate)
+        # 시그널 생성 (mid basis + bid/ask 전달)
+        signal = self.signal_gen.update_basis(
+            product, basis_bps, funding_rate,
+            perp_bid=self._latest_perp_bid.get(product, 0),
+            perp_ask=self._latest_perp_ask.get(product, 0),
+            futures_bid=self._latest_futures_bid.get(product, 0),
+            futures_ask=self._latest_futures_ask.get(product, 0),
+        )
         self._state.total_signals += 1
 
         if signal.type == SignalType.NONE:
@@ -401,8 +406,10 @@ class PaperTradingEngine:
         self._state.total_entries += 1
         self._state.open_positions += 1
 
-        # 시그널 생성기에 포지션 기록
+        # 시그널 생성기에 포지션 기록 + executable basis 저장
         self.signal_gen.open_position(product, signal, size=contracts)
+        pos = self.signal_gen.get_position(product)
+        pos.entry_exec_basis_bps = self._compute_executable_basis(product, trade.direction)
 
         # DB 저장 — 주문
         self.storage.save_order(

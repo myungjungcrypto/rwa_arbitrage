@@ -47,6 +47,7 @@ class PositionState:
     is_open: bool = False
     direction: str = ""           # "long_basis" or "short_basis"
     entry_basis_bps: float = 0.0
+    entry_exec_basis_bps: float = 0.0  # 진입 시 executable basis (bid/ask 기반)
     entry_time: float = 0.0
     perp_side: str = ""           # "long" or "short"
     futures_side: str = ""        # "long" or "short"
@@ -70,12 +71,13 @@ class SignalGenerator:
         window_hours: float = 24,
         std_multiplier: float = 2.0,
         entry_threshold_bps: float = 50,
-        exit_threshold_bps: float = 10,
-        target_profit_bps: float = 30,
+        exit_threshold_bps: float = 10,       # deprecated (kept for backward compat)
+        target_profit_bps: float = 30,         # deprecated
         max_hold_hours: float = 48,
         funding_rate_weight: float = 1.0,
         min_funding_advantage_bps: float = 5,
         emergency_close_bps: float = 100,
+        convergence_target_bps: float = 3.0,   # spread ≤ 이 값이면 수렴 완료
     ):
         self.window_hours = window_hours
         self.std_multiplier = std_multiplier
@@ -86,6 +88,7 @@ class SignalGenerator:
         self.funding_rate_weight = funding_rate_weight
         self.min_funding_advantage_bps = min_funding_advantage_bps
         self.emergency_close_bps = emergency_close_bps
+        self.convergence_target_bps = convergence_target_bps
 
         # 베이시스 히스토리 (in-memory ring buffer)
         max_points = int(window_hours * 3600 / 5) + 100  # 5초 간격 가정
@@ -123,20 +126,28 @@ class SignalGenerator:
 
     def update_basis(
         self, product: str, basis_bps: float, funding_rate: float = 0.0,
+        perp_bid: float = 0.0, perp_ask: float = 0.0,
+        futures_bid: float = 0.0, futures_ask: float = 0.0,
         current_time: float | None = None,
     ) -> Signal:
         """베이시스 데이터 업데이트 + 시그널 생성.
 
         Args:
             product: 상품명 (wti / brent)
-            basis_bps: 현재 베이시스 (bp)
+            basis_bps: 현재 베이시스 (bp) — mid price 기준, 통계용
             funding_rate: 현재 펀딩레이트
-            current_time: 현재 시간 (백테스트에서는 시뮬레이션 시간, None이면 time.time())
+            perp_bid/ask: perp 오더북 최우선 호가 (실시간)
+            futures_bid/ask: futures 오더북 최우선 호가 (KIS 실시간)
+            current_time: 현재 시간 (백테스트에서는 시뮬레이션 시간)
 
         Returns:
             생성된 Signal
         """
         self._current_time = current_time or time.time()
+        self._perp_bid = perp_bid
+        self._perp_ask = perp_ask
+        self._futures_bid = futures_bid
+        self._futures_ask = futures_ask
 
         # 히스토리 추가
         if product not in self._basis_history:
@@ -246,10 +257,14 @@ class SignalGenerator:
         funding_rate: float,
         pos: PositionState,
     ) -> Signal:
-        """청산 시그널 체크."""
+        """청산 시그널 체크 — 스프레드 수렴 기반.
+
+        perp 가격이 futures 가격에 수렴(spread ≈ 0)하면 청산.
+        수렴 전까지는 펀딩을 받으며 보유.
+        """
         hold_hours = (self._current_time - pos.entry_time) / 3600
 
-        # 긴급 청산: 베이시스가 반대로 너무 크게 벌어짐
+        # 1. 긴급 청산: 베이시스가 반대로 극단적 확대
         if pos.direction == "long_basis" and basis_bps < -(self.emergency_close_bps):
             return Signal(
                 type=SignalType.EMERGENCY_CLOSE, product=product,
@@ -265,7 +280,7 @@ class SignalGenerator:
                 reason=f"Emergency: basis {basis_bps:.1f}bp reversed beyond +{self.emergency_close_bps}bp",
             )
 
-        # 최대 보유 시간 초과
+        # 2. 최대 보유 시간 초과
         if hold_hours >= self.max_hold_hours:
             return Signal(
                 type=SignalType.EXIT, product=product,
@@ -274,44 +289,40 @@ class SignalGenerator:
                 reason=f"Max hold time exceeded ({hold_hours:.1f}h >= {self.max_hold_hours}h)",
             )
 
-        # 목표 수익 도달
-        if pos.direction == "long_basis":
-            pnl_bps = pos.entry_basis_bps - basis_bps  # basis 축소가 수익
+        # 3. 스프레드 수렴 완료: perp ≈ futures (executable basis 기준)
+        #    bid/ask가 있으면 executable spread 계산, 없으면 mid basis 사용
+        if self._perp_bid > 0 and self._futures_bid > 0:
+            if pos.direction == "short_basis":
+                # perp long → exit at bid, futures short → exit at ask
+                current_spread_bps = (self._perp_bid - self._futures_ask) / self._futures_ask * 10_000
+            else:  # long_basis
+                # perp short → exit at ask, futures long → exit at bid
+                current_spread_bps = (self._perp_ask - self._futures_bid) / self._futures_bid * 10_000
         else:
-            pnl_bps = basis_bps - pos.entry_basis_bps  # basis 확대가 수익
+            current_spread_bps = basis_bps
 
-        # 펀딩 수익 추가
-        pnl_bps += pos.cumulative_funding * 10000
-
-        if pnl_bps >= self.target_profit_bps:
+        if abs(current_spread_bps) <= self.convergence_target_bps:
+            profit_bps = abs(pos.entry_exec_basis_bps) - abs(current_spread_bps)
+            funding_bps = pos.cumulative_funding * 10000
             return Signal(
                 type=SignalType.EXIT, product=product,
                 basis_bps=basis_bps, basis_mean=mean, basis_std=std,
-                funding_rate=funding_rate, confidence=0.9,
-                reason=f"Target profit reached: {pnl_bps:.1f}bp >= {self.target_profit_bps}bp",
+                funding_rate=funding_rate, confidence=0.95,
+                reason=(
+                    f"Spread converged to {current_spread_bps:.1f}bp "
+                    f"(entry={pos.entry_exec_basis_bps:.1f}bp, "
+                    f"profit={profit_bps:.1f}bp, funding={funding_bps:.1f}bp, "
+                    f"hold={hold_hours:.1f}h)"
+                ),
             )
 
-        # 평균 회귀
-        if pos.direction == "long_basis" and basis_bps <= mean + self.exit_threshold_bps:
-            return Signal(
-                type=SignalType.EXIT, product=product,
-                basis_bps=basis_bps, basis_mean=mean, basis_std=std,
-                funding_rate=funding_rate, confidence=0.7,
-                reason=f"Mean reversion: basis {basis_bps:.1f}bp <= mean+exit {mean + self.exit_threshold_bps:.1f}bp",
-            )
-        if pos.direction == "short_basis" and basis_bps >= mean - self.exit_threshold_bps:
-            return Signal(
-                type=SignalType.EXIT, product=product,
-                basis_bps=basis_bps, basis_mean=mean, basis_std=std,
-                funding_rate=funding_rate, confidence=0.7,
-                reason=f"Mean reversion: basis {basis_bps:.1f}bp >= mean-exit {mean - self.exit_threshold_bps:.1f}bp",
-            )
-
+        # 4. 아직 수렴 안 됨 → HOLD (펀딩 받으며 대기)
+        funding_bps = pos.cumulative_funding * 10000
         return Signal(
             type=SignalType.NONE, product=product,
             basis_bps=basis_bps, basis_mean=mean, basis_std=std,
             funding_rate=funding_rate,
-            reason=f"Holding (pnl={pnl_bps:.1f}bp, hold={hold_hours:.1f}h)",
+            reason=f"Holding (spread={current_spread_bps:.1f}bp, entry={pos.entry_exec_basis_bps:.1f}bp, funding={funding_bps:.1f}bp, hold={hold_hours:.1f}h)",
         )
 
     def open_position(self, product: str, signal: Signal, size: float = 1.0):
@@ -319,6 +330,7 @@ class SignalGenerator:
         pos = self.get_position(product)
         pos.is_open = True
         pos.entry_basis_bps = signal.basis_bps
+        pos.entry_exec_basis_bps = 0.0  # engine에서 설정
         pos.entry_time = signal.timestamp
         pos.size = size
         pos.cumulative_funding = 0.0
@@ -340,6 +352,7 @@ class SignalGenerator:
             is_open=False,
             direction=pos.direction,
             entry_basis_bps=pos.entry_basis_bps,
+            entry_exec_basis_bps=pos.entry_exec_basis_bps,
             entry_time=pos.entry_time,
             perp_side=pos.perp_side,
             futures_side=pos.futures_side,
@@ -350,6 +363,7 @@ class SignalGenerator:
         pos.is_open = False
         pos.direction = ""
         pos.entry_basis_bps = 0
+        pos.entry_exec_basis_bps = 0
         pos.entry_time = 0
         pos.size = 0
         pos.cumulative_funding = 0

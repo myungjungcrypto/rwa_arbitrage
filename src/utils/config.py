@@ -53,8 +53,9 @@ class StrategyConfig:
     basis_window_hours: int = 24
     basis_std_multiplier: float = 2.0
     entry_threshold_bps: float = 50
-    exit_threshold_bps: float = 10
-    target_profit_bps: float = 30
+    exit_threshold_bps: float = 10         # deprecated (backward compat)
+    target_profit_bps: float = 30          # deprecated
+    convergence_target_bps: float = 3.0    # spread ≤ 이 값이면 수렴 완료 → 청산
     max_hold_hours: int = 48
     funding_rate_weight: float = 1.0
     min_funding_advantage_bps: float = 5
