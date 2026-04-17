@@ -12,6 +12,7 @@ import asyncio
 import argparse
 import signal
 import sys
+from datetime import date
 from pathlib import Path
 
 # 프로젝트 루트를 path에 추가
@@ -24,6 +25,7 @@ from src.data.storage import Storage
 from src.data.collector import DataCollector
 from src.exchange.kiwoom import create_kiwoom_client
 from src.exchange.kis import KISAuth, KISFuturesClient
+from src.strategy.rollover import get_active_contract, us_market_holidays
 
 
 # ──────────────────────────────────────────────
@@ -74,14 +76,15 @@ def _register_collector_callbacks(collector, kiwoom, config):
         collector.on_price_update(on_price)
 
 
-async def _setup_kis(config, collector, kiwoom=None) -> KISFuturesClient | None:
+async def _setup_kis(config, collector, kiwoom=None):
     """KIS 클라이언트 초기화 + 실시간 구독.
 
     Returns:
-        KISFuturesClient 또는 None (비활성화 시)
+        (client, subs_state) 튜플. 비활성화 시 (None, None).
+        subs_state: {"current_subs", "callbacks", "divisors"} — rollover_watch_loop에서 사용.
     """
     if not config.kis.enabled:
-        return None
+        return None, None
 
     logger = get_logger()
 
@@ -101,19 +104,29 @@ async def _setup_kis(config, collector, kiwoom=None) -> KISFuturesClient | None:
     connected = await client.connect()
     if not connected:
         logger.error("KIS connection failed — falling back to Kiwoom mock")
-        return None
+        return None, None
 
-    # KIS 종목 매핑 로드
-    settings_path = Path("config/settings.yaml")
-    import yaml
-    with open(settings_path) as f:
-        raw = yaml.safe_load(f) or {}
-    kis_map = raw.get("kis_symbol_map", {})
+    subs_state = {
+        "current_subs": {},   # product → active KIS symbol
+        "callbacks": {},      # product → callback fn
+        "divisors": {},       # product → price divisor
+    }
 
-    # 종목별 구독
-    for product_name, kis_symbol in kis_map.items():
+    today = date.today()
+    hols = us_market_holidays(today.year)
+
+    for product_name, configured_symbol in config.kis_symbol_map.items():
         if product_name not in config.products:
             continue
+
+        prefix = config.products[product_name].futures_symbol
+        active_symbol = get_active_contract(today, prefix=prefix, holidays=hols)
+        if active_symbol != configured_symbol:
+            logger.warning(
+                f"[{product_name}] config symbol {configured_symbol} != computed active "
+                f"{active_symbol} — using {active_symbol} (rollover auto-correction)"
+            )
+        target_symbol = active_symbol
 
         def make_callback(pname):
             def on_kis_quote(quote):
@@ -125,7 +138,6 @@ async def _setup_kis(config, collector, kiwoom=None) -> KISFuturesClient | None:
                     contract_month=quote.contract_month,
                     volume=quote.volume,
                 )
-                # Kiwoom mock에도 가격 주입 (paper trading 주문 시뮬레이션용)
                 if kiwoom:
                     futures_symbol = config.products[pname].futures_symbol
                     kiwoom.set_base_price(
@@ -134,12 +146,71 @@ async def _setup_kis(config, collector, kiwoom=None) -> KISFuturesClient | None:
                     )
             return on_kis_quote
 
-        # KIS는 계약총액 기준 호가 → contract_size로 나눠서 배럴당 가격으로 변환
+        cb = make_callback(product_name)
         price_divisor = float(config.products[product_name].contract_size)
-        await client.subscribe(kis_symbol, make_callback(product_name), price_divisor=price_divisor)
-        logger.info(f"KIS subscribed: {product_name} → {kis_symbol} (price_divisor={price_divisor})")
 
-    return client
+        await client.subscribe(target_symbol, cb, price_divisor=price_divisor)
+        subs_state["current_subs"][product_name] = target_symbol
+        subs_state["callbacks"][product_name] = cb
+        subs_state["divisors"][product_name] = price_divisor
+        logger.info(
+            f"KIS subscribed: {product_name} → {target_symbol} "
+            f"(price_divisor={price_divisor})"
+        )
+
+    return client, subs_state
+
+
+async def rollover_watch_loop(
+    kis_client: KISFuturesClient,
+    config,
+    subs_state: dict,
+    stop_event: asyncio.Event,
+    check_interval: int = 3600,
+):
+    """매시간 active contract 재계산 후 변화 시 resubscribe.
+
+    stop_event 설정 시 즉시 종료.
+    """
+    logger = get_logger()
+    if kis_client is None or subs_state is None:
+        return
+    logger.info(f"[ROLLOVER] watch loop started (interval={check_interval}s)")
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=check_interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        today = date.today()
+        hols = us_market_holidays(today.year)
+
+        for product, current in list(subs_state["current_subs"].items()):
+            prefix = config.products[product].futures_symbol
+            desired = get_active_contract(today, prefix=prefix, holidays=hols)
+            if desired == current:
+                continue
+
+            logger.warning(
+                f"[ROLLOVER] {product}: {current} → {desired} (today={today}), resubscribing"
+            )
+            ok = await kis_client.resubscribe(
+                old_symbol=current,
+                new_symbol=desired,
+                callback=subs_state["callbacks"][product],
+                price_divisor=subs_state["divisors"][product],
+            )
+            if ok:
+                subs_state["current_subs"][product] = desired
+                logger.warning(f"[ROLLOVER] {product}: now subscribed to {desired}")
+            else:
+                logger.error(
+                    f"[ROLLOVER] {product}: resubscribe failed, will retry next cycle"
+                )
+
+    logger.info("[ROLLOVER] watch loop stopped")
 
 
 # ──────────────────────────────────────────────
@@ -158,7 +229,7 @@ async def run_collector(config_path: str = "config/settings.yaml"):
     _register_collector_callbacks(collector, kiwoom, config)
 
     # KIS 실시간 호가 (활성화 시)
-    kis_client = await _setup_kis(config, collector, kiwoom)
+    kis_client, kis_subs = await _setup_kis(config, collector, kiwoom)
 
     def on_basis(product, perp_price, futures_price, basis_bps,
                  perp_best_bid=0.0, perp_best_ask=0.0,
@@ -183,6 +254,9 @@ async def run_collector(config_path: str = "config/settings.yaml"):
         loop.add_signal_handler(sig, shutdown)
 
     collect_task = asyncio.create_task(collector.start())
+    rollover_task = asyncio.create_task(
+        rollover_watch_loop(kis_client, config, kis_subs, stop_event)
+    )
 
     # 상태 출력 루프
     async def status_loop():
@@ -205,14 +279,11 @@ async def run_collector(config_path: str = "config/settings.yaml"):
     logger.info("Shutting down...")
     collect_task.cancel()
     status_task.cancel()
-    try:
-        await collect_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await status_task
-    except asyncio.CancelledError:
-        pass
+    for task in (collect_task, status_task, rollover_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await collector.stop()
     if kis_client:
         await kis_client.disconnect()
@@ -242,7 +313,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     _register_collector_callbacks(collector, kiwoom, config)
 
     # KIS 실시간 호가 (활성화 시)
-    kis_client = await _setup_kis(config, collector, kiwoom)
+    kis_client, kis_subs = await _setup_kis(config, collector, kiwoom)
 
     # 페이퍼 트레이딩 엔진
     from src.paper.engine import PaperTradingEngine
@@ -365,6 +436,9 @@ async def run_paper(config_path: str = "config/settings.yaml"):
                     )
 
     funding_task = asyncio.create_task(funding_loop())
+    rollover_task = asyncio.create_task(
+        rollover_watch_loop(kis_client, config, kis_subs, stop_event)
+    )
 
     logger.info("Paper trading engine started — waiting for signals...")
     await stop_event.wait()
@@ -374,7 +448,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     status_task.cancel()
     funding_task.cancel()
 
-    for task in [collect_task, status_task, funding_task]:
+    for task in [collect_task, status_task, funding_task, rollover_task]:
         try:
             await task
         except asyncio.CancelledError:

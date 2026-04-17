@@ -78,6 +78,7 @@ class RiskConfig:
 class AppConfig:
     mode: str = "PAPER"
     products: dict[str, ProductConfig] = field(default_factory=dict)
+    kis_symbol_map: dict[str, str] = field(default_factory=dict)  # product → KIS contract symbol
     hyperliquid: HyperliquidConfig = field(default_factory=HyperliquidConfig)
     kiwoom: KiwoomConfig = field(default_factory=KiwoomConfig)
     kis: KISConfig = field(default_factory=KISConfig)
@@ -164,6 +165,7 @@ def load_config(
     return AppConfig(
         mode=settings.get("mode", "PAPER"),
         products=products,
+        kis_symbol_map=dict(settings.get("kis_symbol_map", {})),
         hyperliquid=hl_config,
         kiwoom=kw_config,
         kis=kis_config,

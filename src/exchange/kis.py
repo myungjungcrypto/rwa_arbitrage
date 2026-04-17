@@ -235,15 +235,21 @@ class KISFuturesClient:
 
         logger.info(f"KIS subscribed: {symbol} (hoka + ccnl)")
 
-    async def _send_subscribe(self, tr_id: str, tr_key: str):
-        """WebSocket 구독 메시지 전송."""
+    async def _send_subscribe(self, tr_id: str, tr_key: str, tr_type: str = "1"):
+        """WebSocket 구독/해제 메시지 전송.
+
+        Args:
+            tr_id: KIS 서비스 ID (HDFFF010=호가, HDFFF020=체결)
+            tr_key: 종목코드
+            tr_type: "1"=등록, "2"=해제
+        """
         if not self._ws:
             return
         msg = json.dumps({
             "header": {
                 "approval_key": self.auth._approval_key,
                 "custtype": "P",
-                "tr_type": "1",  # 1=등록, 0=해제
+                "tr_type": tr_type,
                 "content-type": "utf-8",
             },
             "body": {
@@ -255,6 +261,56 @@ class KISFuturesClient:
         })
         await self._ws.send_str(msg)
         await asyncio.sleep(0.5)  # KIS 요구: 구독 간 0.5초 간격
+
+    async def unsubscribe(self, symbol: str):
+        """종목 구독 해제 (HDFFF010 + HDFFF020).
+
+        내부 콜백/divisor/캐시 맵에서 symbol 제거.
+        tr_type="2"로 서버에 unregister 요청.
+        """
+        if symbol not in self._callbacks:
+            logger.warning(f"KIS unsubscribe: {symbol} not subscribed")
+            return
+
+        try:
+            await self._send_subscribe("HDFFF010", symbol, tr_type="2")
+            await self._send_subscribe("HDFFF020", symbol, tr_type="2")
+        except Exception as e:
+            logger.error(f"KIS unsubscribe send error [{symbol}]: {e}")
+
+        self._callbacks.pop(symbol, None)
+        self._price_divisors.pop(symbol, None)
+        self._latest_quotes.pop(symbol, None)
+        logger.info(f"KIS unsubscribed: {symbol}")
+
+    async def resubscribe(
+        self,
+        old_symbol: str,
+        new_symbol: str,
+        callback: Callable,
+        price_divisor: float = 1.0,
+    ) -> bool:
+        """old_symbol 해제 → new_symbol 구독 (rollover 전용).
+
+        WebSocket 프로토콜 레벨 unregister 실패 시에도 내부 dict는 정리하고
+        new_symbol 구독을 진행한다. 완전 실패 시 False 반환.
+        """
+        if old_symbol == new_symbol:
+            logger.info(f"KIS resubscribe skipped (same symbol): {old_symbol}")
+            return True
+
+        try:
+            await self.unsubscribe(old_symbol)
+        except Exception as e:
+            logger.error(f"KIS resubscribe unsubscribe error: {e}")
+
+        try:
+            await self.subscribe(new_symbol, callback, price_divisor=price_divisor)
+            logger.warning(f"[ROLLOVER] KIS resubscribe: {old_symbol} → {new_symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"KIS resubscribe subscribe error: {e}")
+            return False
 
     async def _recv_loop(self):
         """WebSocket 메시지 수신 루프."""
