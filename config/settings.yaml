@@ -16,11 +16,13 @@ products:
 # KIS 종목코드 매핑 (settings에서 관리, API키는 secrets.yaml)
 # NOTE: kis_symbol은 KIS 종목코드 (근월물, 매월 롤오버 필요)
 kis_symbol_map:
-  wti: "MCLK26"              # MCL 2026년 5월물 (프론트 월물)
+  wti: "MCLM26"              # MCL 2026년 6월물 (프론트 월물, effective 2026-04-14 roll 완료 후)
   # NOTE: trade.xyz oracle는 CME 프론트 월물 기반
   #   매월 5~10번째 영업일: 근월물→차월물 가중평균 롤오버
-  #   MCLK26(5월물) 만기: 2026-04-21경
-  #   4월 7~14일경 롤오버 시작 → MCLM26(6월물)으로 수동 교체 필요
+  #   MCLM26(6월물) 만기: 2026-05-20경
+  #   다음 롤오버 window: 2026-05-07 ~ 2026-05-14 (5월 5~10 영업일)
+  #   P1 자동 롤오버: src/strategy/rollover.py 의 get_active_contract()가 계산
+  #     매시간 watch loop가 desired != current 감지 시 resubscribe
 
 # Hyperliquid 설정
 hyperliquid:
