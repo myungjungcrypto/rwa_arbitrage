@@ -143,7 +143,6 @@ def plot(df, positions, divergence_start, out_png: str):
     ax2.axhline(50, color="gray", linestyle="--", linewidth=0.5)
     ax2.axhline(-50, color="gray", linestyle="--", linewidth=0.5)
     ax2.set_ylabel("basis (bp)")
-    ax2.legend(loc="upper left")
     ax2.grid(True, alpha=0.3)
 
     start_date = df.index[0].normalize()
@@ -177,7 +176,8 @@ def plot(df, positions, divergence_start, out_png: str):
     ax3.grid(True, alpha=0.3)
 
     roll_patch = mpatches.Patch(color="yellow", alpha=0.3, label="CME roll window (BD 5-10)")
-    ax2.legend(handles=[*ax2.get_legend().legendHandles, roll_patch], loc="upper left")
+    line_handles, line_labels = ax2.get_legend_handles_labels()
+    ax2.legend(handles=[*line_handles, roll_patch], loc="upper left")
 
     ax3.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     fig.autofmt_xdate()
