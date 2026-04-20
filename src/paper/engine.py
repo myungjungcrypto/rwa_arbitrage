@@ -117,6 +117,9 @@ class PaperTradingEngine:
             funding_rate_weight=config.strategy.funding_rate_weight,
             min_funding_advantage_bps=config.strategy.min_funding_advantage_bps,
             convergence_target_bps=config.strategy.convergence_target_bps,
+            cme_closed_skip_entry=config.strategy.cme_closed_skip_entry,
+            pre_close_flatten_minutes=config.strategy.pre_close_flatten_minutes,
+            flatten_threshold_hours=config.strategy.flatten_threshold_hours,
         )
         self.risk_mgr = risk_mgr or RiskManager(config.risk)
 

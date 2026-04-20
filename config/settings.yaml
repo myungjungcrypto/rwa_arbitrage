@@ -61,6 +61,12 @@ strategy:
   funding_rate_weight: 1.0      # 펀딩 수익 반영 비율
   min_funding_advantage_bps: 2  # 최소 펀딩 유리 조건
 
+  # CME 장 시간 가드 (M9 대비 보수적 엔트리/엑싯)
+  cme_closed_skip_entry: true       # CME 폐장 중엔 신규 진입 차단 (futures leg 체결 불가)
+  pre_close_flatten_minutes: 30     # 마감 30분 전부터 진입 차단 + 보유 포지션 flatten
+  flatten_threshold_hours: 4.0      # 다가오는 휴장이 이 시간 이상(주말/휴일)이면 flatten 발동
+                                     # Mon-Thu 16:00-17:00 CT 일일 1h break는 threshold 미달 → 보유 유지
+
 # 리스크 관리
 risk:
   max_position_usd: 50000       # 최대 포지션 (USD)

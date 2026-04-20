@@ -9,11 +9,19 @@ from __future__ import annotations
 import time
 import logging
 from dataclasses import dataclass, field
+from datetime import timedelta
 from enum import Enum
 from collections import deque
 from typing import Optional
 
 import math
+
+from .market_hours import (
+    from_timestamp,
+    is_cme_open,
+    next_closure_duration,
+    time_until_close,
+)
 
 logger = logging.getLogger("arbitrage.signals")
 
@@ -78,6 +86,9 @@ class SignalGenerator:
         min_funding_advantage_bps: float = 5,
         emergency_close_bps: float = 100,
         convergence_target_bps: float = 3.0,   # spread ≤ 이 값이면 수렴 완료
+        cme_closed_skip_entry: bool = True,
+        pre_close_flatten_minutes: int = 30,
+        flatten_threshold_hours: float = 4.0,
     ):
         self.window_hours = window_hours
         self.std_multiplier = std_multiplier
@@ -89,6 +100,9 @@ class SignalGenerator:
         self.min_funding_advantage_bps = min_funding_advantage_bps
         self.emergency_close_bps = emergency_close_bps
         self.convergence_target_bps = convergence_target_bps
+        self.cme_closed_skip_entry = cme_closed_skip_entry
+        self.pre_close_flatten_minutes = pre_close_flatten_minutes
+        self.flatten_threshold_hours = flatten_threshold_hours
 
         # 베이시스 히스토리 (in-memory ring buffer)
         max_points = int(window_hours * 3600 / 5) + 100  # 5초 간격 가정
@@ -191,6 +205,30 @@ class SignalGenerator:
         upper = mean + self.std_multiplier * std
         lower = mean - self.std_multiplier * std
 
+        # CME 장 시간 가드 (폐장 중 진입 불가 + 마감 임박 시 진입 차단)
+        if self.cme_closed_skip_entry:
+            now = from_timestamp(self._current_time)
+            if not is_cme_open(now):
+                return Signal(
+                    type=SignalType.NONE, product=product,
+                    basis_bps=basis_bps, basis_mean=mean, basis_std=std,
+                    funding_rate=funding_rate, reason="CME closed — entry skipped",
+                )
+            tuc = time_until_close(now)
+            if tuc is not None and tuc < timedelta(minutes=self.pre_close_flatten_minutes):
+                # 긴 휴장 임박 시만 차단. 일일 1h break는 허용 (flatten_threshold_hours 검사)
+                upcoming = next_closure_duration(now)
+                if upcoming >= timedelta(hours=self.flatten_threshold_hours):
+                    return Signal(
+                        type=SignalType.NONE, product=product,
+                        basis_bps=basis_bps, basis_mean=mean, basis_std=std,
+                        funding_rate=funding_rate,
+                        reason=(
+                            f"Approaching CME close (in {tuc.total_seconds()/60:.0f}min, "
+                            f"next closure {upcoming.total_seconds()/3600:.1f}h)"
+                        ),
+                    )
+
         # 최소 임계값 체크
         if std < 1.0:
             return Signal(
@@ -280,7 +318,23 @@ class SignalGenerator:
                 reason=f"Emergency: basis {basis_bps:.1f}bp reversed beyond +{self.emergency_close_bps}bp",
             )
 
-        # 2. 최대 보유 시간 초과
+        # 2. Pre-CME-close flatten: 긴 휴장 임박 시 무조건 청산
+        now = from_timestamp(self._current_time)
+        tuc = time_until_close(now)
+        if tuc is not None and tuc < timedelta(minutes=self.pre_close_flatten_minutes):
+            upcoming = next_closure_duration(now)
+            if upcoming >= timedelta(hours=self.flatten_threshold_hours):
+                return Signal(
+                    type=SignalType.EXIT, product=product,
+                    basis_bps=basis_bps, basis_mean=mean, basis_std=std,
+                    funding_rate=funding_rate, confidence=0.9,
+                    reason=(
+                        f"pre_cme_close flatten (close in {tuc.total_seconds()/60:.0f}min, "
+                        f"upcoming closure {upcoming.total_seconds()/3600:.1f}h)"
+                    ),
+                )
+
+        # 3. 최대 보유 시간 초과
         if hold_hours >= self.max_hold_hours:
             return Signal(
                 type=SignalType.EXIT, product=product,

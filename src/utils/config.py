@@ -60,6 +60,11 @@ class StrategyConfig:
     funding_rate_weight: float = 1.0
     min_funding_advantage_bps: float = 5
 
+    # CME 장 시간 가드 — 폐장 중 진입 차단 + 장기 휴장 전 flatten
+    cme_closed_skip_entry: bool = True
+    pre_close_flatten_minutes: int = 30     # 마감 몇 분 전부터 진입 차단 + 청산 시작
+    flatten_threshold_hours: float = 4.0    # 다가오는 휴장이 이 시간 이상이면 flatten
+
 
 @dataclass
 class RiskConfig:
