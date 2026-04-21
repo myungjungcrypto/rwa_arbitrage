@@ -50,7 +50,7 @@ strategy:
   basis_std_multiplier: 3.0     # 3σ = 극단값에서만 진입
 
   # 진입
-  entry_threshold_bps: 25       # exec basis가 이 값 이상 벌어져야 진입
+  entry_threshold_bps: 20       # exec basis가 이 값 이상 벌어져야 진입 (수수료 ~13bp + 슬리피지 버퍼)
 
   # 청산 — 스프레드 수렴 기반
   convergence_target_bps: 3     # spread ≤ 3bp면 수렴 완료 → 청산

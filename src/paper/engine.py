@@ -78,6 +78,10 @@ class EngineState:
     open_positions: int = 0
     closed_trades: int = 0
     cumulative_pnl_usd: float = 0.0
+    # 엔트리 near-miss 진단 카운터 (mid signal 있었지만 진입 안 됨)
+    entry_signals_generated: int = 0     # signal generator가 ENTRY type 반환
+    entry_exec_filter_skip: int = 0      # exec basis < threshold로 skip
+    entry_warmup_skip: int = 0            # 워밍업 부족으로 skip
 
 
 # ──────────────────────────────────────────────
@@ -246,11 +250,17 @@ class PaperTradingEngine:
         # 진입 시그널 — executable basis 검증 후 실행
         if signal.type in (SignalType.ENTRY_LONG_BASIS, SignalType.ENTRY_SHORT_BASIS):
             direction = "long_basis" if signal.type == SignalType.ENTRY_LONG_BASIS else "short_basis"
+            self._state.entry_signals_generated += 1
+            logger.warning(
+                f"[{product.upper()}] ENTRY_SIGNAL {direction} mid_basis={signal.basis_bps:+.1f}bp | "
+                f"{signal.reason}"
+            )
 
             # 워밍업 체크
             history = self.signal_gen._basis_history.get(product)
             if history and len(history) < self.MIN_WARMUP_POINTS:
-                logger.info(f"[{product.upper()}] Warmup skip: {len(history)}/{self.MIN_WARMUP_POINTS}")
+                self._state.entry_warmup_skip += 1
+                logger.warning(f"[{product.upper()}] ENTRY_SKIP warmup: {len(history)}/{self.MIN_WARMUP_POINTS}")
                 return  # 데이터 부족, 거래 안 함
 
             # Executable basis 계산
@@ -258,8 +268,9 @@ class PaperTradingEngine:
 
             # executable basis가 entry threshold를 넘지 않으면 무시
             if direction == "short_basis" and exec_basis > -self.config.strategy.entry_threshold_bps:
-                logger.info(
-                    f"[{product.upper()}] Exec basis SKIP: exec={exec_basis:.1f}bp > "
+                self._state.entry_exec_filter_skip += 1
+                logger.warning(
+                    f"[{product.upper()}] ENTRY_SKIP exec_filter: exec={exec_basis:.1f}bp > "
                     f"-{self.config.strategy.entry_threshold_bps}bp "
                     f"(perp_bid={self._latest_perp_bid.get(product, 0):.2f} "
                     f"ask={self._latest_perp_ask.get(product, 0):.2f} "
@@ -268,8 +279,9 @@ class PaperTradingEngine:
                 )
                 return
             if direction == "long_basis" and exec_basis < self.config.strategy.entry_threshold_bps:
-                logger.info(
-                    f"[{product.upper()}] Exec basis SKIP: exec={exec_basis:.1f}bp < "
+                self._state.entry_exec_filter_skip += 1
+                logger.warning(
+                    f"[{product.upper()}] ENTRY_SKIP exec_filter: exec={exec_basis:.1f}bp < "
                     f"+{self.config.strategy.entry_threshold_bps}bp "
                     f"(perp_bid={self._latest_perp_bid.get(product, 0):.2f} "
                     f"ask={self._latest_perp_ask.get(product, 0):.2f} "
@@ -278,9 +290,8 @@ class PaperTradingEngine:
                 )
                 return
 
-            logger.info(
-                f"[{product.upper()}] Executable basis check PASSED: "
-                f"mid={basis_bps:+.1f}bp exec={exec_basis:+.1f}bp"
+            logger.warning(
+                f"[{product.upper()}] ENTRY_EXEC_OK: mid={basis_bps:+.1f}bp exec={exec_basis:+.1f}bp"
             )
             self._handle_entry(product, signal, perp_price, futures_price)
 
@@ -707,6 +718,7 @@ class PaperTradingEngine:
             f"=== Paper Trading Summary ===",
             f"Signals: {s.total_signals} | Entries: {s.total_entries} | Exits: {s.total_exits}",
             f"Risk rejected: {s.rejected_by_risk} | Order failures: {s.failed_orders}",
+            f"Entry signals: {s.entry_signals_generated} | exec_skip: {s.entry_exec_filter_skip} | warmup_skip: {s.entry_warmup_skip}",
             f"Open: {s.open_positions} | Closed: {s.closed_trades}",
             f"Cumulative PnL: ${s.cumulative_pnl_usd:+.2f}",
         ]
