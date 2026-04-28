@@ -2,17 +2,42 @@ from __future__ import annotations
 """SQLite 데이터 저장소.
 
 베이시스, 시세, 펀딩레이트, 주문, PnL 등을 시계열로 저장.
+
+스키마 버전 (v2, 2026-04-28): pair_id 추가 + leg_prices 통합 테이블.
+기존 컬럼은 유지하고 추가만(additive migration), legacy row는 connect() 시
+자동 backfill. 자세한 내용은 `MIGRATION_V2_*` 상수 참고.
 """
 
 
+import os
 import sqlite3
 import time
+import shutil
 import logging
 from pathlib import Path
 from dataclasses import asdict
 from typing import Any
 
 logger = logging.getLogger("arbitrage.storage")
+
+
+# ──────────────────────────────────────────────
+# Schema version
+# ──────────────────────────────────────────────
+
+SCHEMA_VERSION = 2
+
+# legacy product → pair_id 매핑 (Phase B backward compat)
+LEGACY_PRODUCT_PAIR_MAP = {
+    "wti": "wti_cme_hl",
+    "brent": "brent_cme_hl",
+}
+
+# legacy product → 어느 leg 어느 거래소인지 (orders 테이블 backfill용)
+LEGACY_LEG_EXCHANGE_MAP = {
+    "perp": "hyperliquid",
+    "futures": "kis",
+}
 
 
 CREATE_TABLES_SQL = """
@@ -114,6 +139,98 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_pnl ON daily_pnl(date, product);
 """
 
 
+# ──────────────────────────────────────────────
+# Migration v2 — additive only
+# ──────────────────────────────────────────────
+
+MIGRATION_V2_SCHEMA_META = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+
+MIGRATION_V2_PAIRS = """
+CREATE TABLE IF NOT EXISTS pairs (
+    pair_id TEXT PRIMARY KEY,
+    leg_a_exchange TEXT NOT NULL,
+    leg_a_symbol TEXT NOT NULL,
+    leg_a_role TEXT NOT NULL,
+    leg_b_exchange TEXT NOT NULL,
+    leg_b_symbol TEXT NOT NULL,
+    leg_b_role TEXT NOT NULL,
+    strategy TEXT NOT NULL DEFAULT 'basis_convergence',
+    gate TEXT NOT NULL DEFAULT 'cme_hours',
+    created_at REAL NOT NULL
+);
+"""
+
+MIGRATION_V2_LEG_PRICES = """
+CREATE TABLE IF NOT EXISTS leg_prices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id TEXT NOT NULL,
+    leg TEXT NOT NULL,                  -- 'a' | 'b'
+    exchange TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    mid_price REAL NOT NULL,
+    bid REAL,
+    ask REAL,
+    bid_qty REAL,
+    ask_qty REAL,
+    index_price REAL,
+    funding_rate REAL,
+    funding_interval_hours REAL,
+    contract_month TEXT,
+    volume_24h REAL,
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_leg_prices_pair_ts ON leg_prices(pair_id, leg, ts);
+"""
+
+# (table, column, type_with_default)
+MIGRATION_V2_ALTER_COLUMNS = [
+    ("basis_spread", "pair_id", "TEXT"),
+    ("basis_spread", "leg_a_price", "REAL"),
+    ("basis_spread", "leg_b_price", "REAL"),
+    ("perp_prices", "exchange", "TEXT DEFAULT 'hyperliquid'"),
+    ("futures_prices", "exchange", "TEXT DEFAULT 'kis'"),
+    ("orders", "pair_id", "TEXT"),
+    ("orders", "exchange", "TEXT"),
+    ("positions", "pair_id", "TEXT"),
+    ("daily_pnl", "pair_id", "TEXT"),
+]
+
+# legacy 단일 페어 시드 (wti 운영 데이터를 새 스키마와 연결)
+MIGRATION_V2_SEED_LEGACY_PAIR = """
+INSERT OR IGNORE INTO pairs
+    (pair_id, leg_a_exchange, leg_a_symbol, leg_a_role,
+     leg_b_exchange, leg_b_symbol, leg_b_role, strategy, gate, created_at)
+VALUES
+    ('wti_cme_hl', 'hyperliquid', 'xyz:CL', 'perp',
+     'kis', 'MCLM26', 'dated_futures', 'basis_convergence', 'cme_hours',
+     strftime('%s','now'));
+"""
+
+MIGRATION_V2_BACKFILL = [
+    """UPDATE basis_spread
+          SET pair_id='wti_cme_hl',
+              leg_a_price=perp_price,
+              leg_b_price=futures_price
+        WHERE pair_id IS NULL AND product='wti'""",
+    """UPDATE orders
+          SET pair_id='wti_cme_hl',
+              exchange = CASE leg WHEN 'perp' THEN 'hyperliquid' ELSE 'kis' END
+        WHERE pair_id IS NULL AND product='wti'""",
+    """UPDATE positions
+          SET pair_id='wti_cme_hl'
+        WHERE pair_id IS NULL AND product='wti'""",
+    """UPDATE daily_pnl
+          SET pair_id='wti_cme_hl'
+        WHERE pair_id IS NULL AND product='wti'""",
+]
+
+
 class Storage:
     """SQLite 저장소 관리."""
 
@@ -123,11 +240,12 @@ class Storage:
         self._conn: sqlite3.Connection | None = None
 
     def connect(self):
-        """DB 연결 및 테이블 생성."""
+        """DB 연결 + 테이블 생성 + 자동 마이그레이션."""
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(CREATE_TABLES_SQL)
         self._conn.commit()
+        self._auto_migrate()
         logger.info(f"Database connected: {self.db_path}")
 
     def close(self):
@@ -140,6 +258,93 @@ class Storage:
         if self._conn is None:
             self.connect()
         return self._conn  # type: ignore
+
+    # ── 마이그레이션 ──
+
+    def _get_schema_version(self) -> int:
+        """schema_meta가 없거나 비어있으면 1 (legacy)."""
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM schema_meta WHERE key='version'"
+            ).fetchone()
+            if row:
+                return int(row["value"])
+        except sqlite3.OperationalError:
+            pass  # 테이블 없음
+        return 1
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == column for r in rows)
+
+    def _has_data(self) -> bool:
+        """기존 운영 데이터(basis_spread) 유무 — 마이그레이션 백업 결정용."""
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM basis_spread"
+            ).fetchone()
+            return bool(row and row["n"] > 0)
+        except sqlite3.OperationalError:
+            return False
+
+    def _backup_once(self, version: int) -> None:
+        """v{N} 마이그레이션 직전 1회 백업. 백업 파일 이미 있으면 skip."""
+        backup_path = f"{self.db_path}.pre-v{version}.bak"
+        if Path(backup_path).exists():
+            logger.info(f"Backup already exists: {backup_path} (skip)")
+            return
+        if not Path(self.db_path).exists():
+            return
+        # WAL 등 dirty 상태 안전한 백업 — sqlite3.Connection.backup() 사용
+        backup_conn = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(backup_conn)
+            logger.warning(f"DB backup created: {backup_path}")
+        finally:
+            backup_conn.close()
+
+    def _auto_migrate(self) -> None:
+        """현재 버전이 SCHEMA_VERSION 미만이면 단계별 마이그레이션 실행."""
+        # schema_meta 테이블은 항상 생성 (v1 DB도 OK)
+        self.conn.executescript(MIGRATION_V2_SCHEMA_META)
+        self.conn.commit()
+
+        current = self._get_schema_version()
+        if current >= SCHEMA_VERSION:
+            return
+
+        had_data = self._has_data()
+        if had_data:
+            logger.warning(f"Migrating DB from v{current} to v{SCHEMA_VERSION}")
+            self._backup_once(SCHEMA_VERSION)
+
+        # v1 → v2
+        if current < 2:
+            self._migrate_to_v2()
+
+        # 버전 기록
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value, updated_at) VALUES (?, ?, ?)",
+            ("version", str(SCHEMA_VERSION), time.time()),
+        )
+        self.conn.commit()
+        if had_data:
+            logger.warning(f"DB migrated to schema v{SCHEMA_VERSION}")
+
+    def _migrate_to_v2(self) -> None:
+        """v1 → v2: 컬럼 추가 + pairs/leg_prices 신규 + legacy backfill (additive)."""
+        cur = self.conn.cursor()
+        cur.executescript(MIGRATION_V2_PAIRS)
+        cur.executescript(MIGRATION_V2_LEG_PRICES)
+
+        for table, col, type_def in MIGRATION_V2_ALTER_COLUMNS:
+            if not self._column_exists(table, col):
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_def}")
+
+        cur.executescript(MIGRATION_V2_SEED_LEGACY_PAIR)
+        for stmt in MIGRATION_V2_BACKFILL:
+            cur.execute(stmt)
+        self.conn.commit()
 
     # ── 시세 저장 ──
 
@@ -195,17 +400,123 @@ class Storage:
         funding_rate: float = 0,
         ts: float | None = None,
     ):
-        """베이시스 스프레드 저장."""
+        """베이시스 스프레드 저장. v2 신규 컬럼(pair_id/leg_a_price/leg_b_price)도 함께 채움."""
         ts = ts or time.time()
         basis = perp_price - futures_price
         basis_bps = basis / futures_price * 10_000 if futures_price else 0
+        pair_id = LEGACY_PRODUCT_PAIR_MAP.get(product)
         self.conn.execute(
             """INSERT INTO basis_spread
-               (product, perp_price, futures_price, basis, basis_bps, funding_rate, ts)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (product, perp_price, futures_price, basis, basis_bps, funding_rate, ts),
+               (product, perp_price, futures_price, basis, basis_bps, funding_rate, ts,
+                pair_id, leg_a_price, leg_b_price)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (product, perp_price, futures_price, basis, basis_bps, funding_rate, ts,
+             pair_id, perp_price, futures_price),
         )
         self.conn.commit()
+
+    def save_basis_by_pair(
+        self,
+        pair_id: str,
+        leg_a_price: float,
+        leg_b_price: float,
+        funding_rate: float = 0,
+        product: str | None = None,
+        ts: float | None = None,
+    ):
+        """v2 forward-path: pair_id 기반 basis 저장.
+
+        legacy `product` 필드도 채움 (조회 호환성). product 미지정 시 pair_id에서
+        역산 (`wti_cme_hl` → `wti`).
+        """
+        ts = ts or time.time()
+        basis = leg_a_price - leg_b_price
+        basis_bps = basis / leg_b_price * 10_000 if leg_b_price else 0
+        if product is None:
+            product = pair_id.split("_", 1)[0]   # "wti_cme_hl" → "wti"
+        self.conn.execute(
+            """INSERT INTO basis_spread
+               (product, perp_price, futures_price, basis, basis_bps, funding_rate, ts,
+                pair_id, leg_a_price, leg_b_price)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (product, leg_a_price, leg_b_price, basis, basis_bps, funding_rate, ts,
+             pair_id, leg_a_price, leg_b_price),
+        )
+        self.conn.commit()
+
+    def save_leg_quote(
+        self,
+        pair_id: str,
+        leg: str,
+        exchange: str,
+        symbol: str,
+        mid_price: float,
+        bid: float = 0.0,
+        ask: float = 0.0,
+        bid_qty: float = 0.0,
+        ask_qty: float = 0.0,
+        index_price: float = 0.0,
+        funding_rate: float = 0.0,
+        funding_interval_hours: float = 0.0,
+        contract_month: str = "",
+        volume_24h: float = 0.0,
+        ts: float | None = None,
+    ):
+        """v2 forward-path: leg_prices 통합 테이블에 호가 1건 저장.
+
+        Phase C 콜렉터가 사용. leg는 'a' | 'b'.
+        """
+        ts = ts or time.time()
+        self.conn.execute(
+            """INSERT INTO leg_prices
+               (pair_id, leg, exchange, symbol, mid_price, bid, ask, bid_qty, ask_qty,
+                index_price, funding_rate, funding_interval_hours, contract_month,
+                volume_24h, ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (pair_id, leg, exchange, symbol, mid_price, bid, ask, bid_qty, ask_qty,
+             index_price, funding_rate, funding_interval_hours, contract_month,
+             volume_24h, ts),
+        )
+        self.conn.commit()
+
+    def upsert_pair(
+        self,
+        pair_id: str,
+        leg_a_exchange: str,
+        leg_a_symbol: str,
+        leg_a_role: str,
+        leg_b_exchange: str,
+        leg_b_symbol: str,
+        leg_b_role: str,
+        strategy: str = "basis_convergence",
+        gate: str = "cme_hours",
+    ) -> None:
+        """pairs 테이블에 페어 정의 등록 (idempotent)."""
+        self.conn.execute(
+            """INSERT INTO pairs
+                 (pair_id, leg_a_exchange, leg_a_symbol, leg_a_role,
+                  leg_b_exchange, leg_b_symbol, leg_b_role, strategy, gate, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(pair_id) DO UPDATE SET
+                   leg_a_exchange=excluded.leg_a_exchange,
+                   leg_a_symbol=excluded.leg_a_symbol,
+                   leg_a_role=excluded.leg_a_role,
+                   leg_b_exchange=excluded.leg_b_exchange,
+                   leg_b_symbol=excluded.leg_b_symbol,
+                   leg_b_role=excluded.leg_b_role,
+                   strategy=excluded.strategy,
+                   gate=excluded.gate""",
+            (pair_id, leg_a_exchange, leg_a_symbol, leg_a_role,
+             leg_b_exchange, leg_b_symbol, leg_b_role, strategy, gate, time.time()),
+        )
+        self.conn.commit()
+
+    def get_pairs(self) -> list[dict]:
+        """등록된 페어 목록."""
+        rows = self.conn.execute(
+            "SELECT * FROM pairs ORDER BY pair_id"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def save_funding(self, ticker: str, funding_rate: float, premium: float = 0, ts: float | None = None):
         """펀딩레이트 저장."""
@@ -231,16 +542,22 @@ class Storage:
         status: str = "pending",
         is_paper: bool = True,
         ts: float | None = None,
+        pair_id: str | None = None,
+        exchange: str | None = None,
     ) -> int:
-        """주문 기록 저장. 반환: row id."""
+        """주문 기록 저장. v2 컬럼(pair_id/exchange) 함께 채움. 반환: row id."""
         ts = ts or time.time()
+        if pair_id is None:
+            pair_id = LEGACY_PRODUCT_PAIR_MAP.get(product)
+        if exchange is None:
+            exchange = LEGACY_LEG_EXCHANGE_MAP.get(leg)
         cursor = self.conn.execute(
             """INSERT INTO orders
                (order_id, product, leg, side, size, price, filled_price,
-                filled_size, status, is_paper, ts)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                filled_size, status, is_paper, ts, pair_id, exchange)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (order_id, product, leg, side, size, price, filled_price,
-             filled_size, status, 1 if is_paper else 0, ts),
+             filled_size, status, 1 if is_paper else 0, ts, pair_id, exchange),
         )
         self.conn.commit()
         return cursor.lastrowid  # type: ignore
@@ -373,15 +690,18 @@ class Storage:
         futures_size: float,
         futures_entry: float,
         ts: float | None = None,
+        pair_id: str | None = None,
     ) -> int:
-        """포지션 오픈 기록. 반환: row id."""
+        """포지션 오픈 기록. v2 pair_id 함께 채움. 반환: row id."""
         ts = ts or time.time()
+        if pair_id is None:
+            pair_id = LEGACY_PRODUCT_PAIR_MAP.get(product)
         cursor = self.conn.execute(
             """INSERT INTO positions
                (product, perp_size, perp_entry, futures_size, futures_entry,
-                status, opened_at)
-               VALUES (?, ?, ?, ?, ?, 'open', ?)""",
-            (product, perp_size, perp_entry, futures_size, futures_entry, ts),
+                status, opened_at, pair_id)
+               VALUES (?, ?, ?, ?, ?, 'open', ?, ?)""",
+            (product, perp_size, perp_entry, futures_size, futures_entry, ts, pair_id),
         )
         self.conn.commit()
         return cursor.lastrowid  # type: ignore
@@ -420,22 +740,27 @@ class Storage:
         funding_pnl: float = 0,
         fees: float = 0,
         dt: str | None = None,
+        pair_id: str | None = None,
     ):
-        """일일 PnL 업데이트 (UPSERT)."""
+        """일일 PnL 업데이트 (UPSERT). v2 pair_id 함께 채움."""
         from datetime import date as date_cls
         dt = dt or date_cls.today().isoformat()
         net = trading_pnl + funding_pnl - fees
+        if pair_id is None:
+            pair_id = LEGACY_PRODUCT_PAIR_MAP.get(product)
 
         self.conn.execute(
-            """INSERT INTO daily_pnl (date, product, trading_pnl, funding_pnl, fees, net_pnl, num_trades)
-               VALUES (?, ?, ?, ?, ?, ?, 1)
-               ON CONFLICT(date, product) DO UPDATE SET
-                 trading_pnl = trading_pnl + excluded.trading_pnl,
-                 funding_pnl = funding_pnl + excluded.funding_pnl,
-                 fees = fees + excluded.fees,
-                 net_pnl = net_pnl + excluded.net_pnl,
-                 num_trades = num_trades + 1""",
-            (dt, product, trading_pnl, funding_pnl, fees, net),
+            """INSERT INTO daily_pnl
+                 (date, product, trading_pnl, funding_pnl, fees, net_pnl, num_trades, pair_id)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                 ON CONFLICT(date, product) DO UPDATE SET
+                   trading_pnl = trading_pnl + excluded.trading_pnl,
+                   funding_pnl = funding_pnl + excluded.funding_pnl,
+                   fees = fees + excluded.fees,
+                   net_pnl = net_pnl + excluded.net_pnl,
+                   num_trades = num_trades + 1,
+                   pair_id = COALESCE(daily_pnl.pair_id, excluded.pair_id)""",
+            (dt, product, trading_pnl, funding_pnl, fees, net, pair_id),
         )
         self.conn.commit()
 
