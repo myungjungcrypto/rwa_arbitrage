@@ -603,3 +603,182 @@ class HyperliquidWebSocket:
                     cb(trade)
                 except Exception as e:
                     logger.error(f"Trade callback error: {e}")
+
+
+# ──────────────────────────────────────────────
+# ExchangeBase Adapter (Phase A 스캐폴딩)
+# ──────────────────────────────────────────────
+#
+# 기존 HyperliquidClient + HyperliquidWebSocket을 감싸 ExchangeBase protocol을
+# 구현하는 어댑터. main.py와 collector가 거래소 종류와 무관하게 동일 API로
+# Hyperliquid를 사용할 수 있게 한다. 기존 클래스는 무수정 유지.
+
+from src.exchange import base as _base   # noqa: E402
+
+
+class HyperliquidExchange:
+    """ExchangeBase 어댑터 — HyperliquidClient + HyperliquidWebSocket 래퍼.
+
+    Phase A에서는 quote 수신 + 단순 정보 조회 메서드만 충실. 주문 메서드는
+    기존 HyperliquidClient.place_order에 위임 (주문 시그니처 변환).
+    """
+
+    name = "hyperliquid"
+    venue_type = _base.VenueType.PERP.value
+    margin_asset = "USDC"
+
+    def __init__(self, rest: HyperliquidClient, ws: HyperliquidWebSocket):
+        self._rest = rest
+        self._ws = ws
+        # symbol → callback (외부에서 등록한 ExchangeBase 콜백)
+        self._symbol_callbacks: dict[str, list[_base.QuoteCallback]] = {}
+        # symbol별 funding/index 캐시 (orderbook 콜백 시 합쳐서 Quote 생성)
+        self._latest_meta: dict[str, MarketData] = {}
+        self._ws_callback_registered = False
+
+    async def connect(self) -> bool:
+        # WS는 main.py의 별도 task에서 start() 호출 — 여기서는 콜백 훅만 부착
+        if not self._ws_callback_registered:
+            self._ws.on_orderbook(self._on_orderbook)
+            self._ws_callback_registered = True
+        return True
+
+    async def disconnect(self) -> None:
+        await self._rest.close()
+        await self._ws.stop()
+
+    async def subscribe_quotes(
+        self,
+        symbol: str,
+        callback: _base.QuoteCallback,
+        *,
+        contract_size: float = 1.0,
+    ) -> None:
+        self._symbol_callbacks.setdefault(symbol, []).append(callback)
+        await self._ws.subscribe_market(symbol)
+
+    async def unsubscribe_quotes(self, symbol: str) -> None:
+        self._symbol_callbacks.pop(symbol, None)
+        # HyperliquidWebSocket은 명시적 unsubscribe 미구현 — 추후 확장
+
+    async def get_quote(self, symbol: str) -> Optional[_base.Quote]:
+        md = await self._rest.get_market_data(symbol)
+        if md is None:
+            return None
+        ob = await self._rest.get_orderbook(symbol, depth=1)
+        bid = ob.best_bid if ob else md.mark_price
+        ask = ob.best_ask if ob else md.mark_price
+        return _base.Quote(
+            exchange=self.name,
+            symbol=symbol,
+            mid_price=md.mark_price,
+            bid=bid,
+            ask=ask,
+            index_price=md.index_price,
+            funding_rate=md.funding_rate,
+            funding_interval_hours=1.0,
+            predicted_funding_rate=md.predicted_funding_rate,
+            open_interest=md.open_interest,
+            volume_24h=md.volume_24h,
+            timestamp=md.timestamp,
+        )
+
+    async def place_order(
+        self,
+        symbol: str,
+        side: _base.OrderSideLiteral,
+        size: float,
+        order_type: _base.OrderTypeLiteral = "market",
+        limit_price: Optional[float] = None,
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+    ) -> _base.OrderResult:
+        rest_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+        price_arg = limit_price if order_type == "limit" else None
+        result = await self._rest.place_order(
+            ticker=symbol,
+            side=rest_side,
+            size=size,
+            price=price_arg,
+            reduce_only=reduce_only,
+        )
+        return _base.OrderResult(
+            success=result.success,
+            exchange=self.name,
+            symbol=symbol,
+            order_id=result.order_id,
+            filled_size=result.filled_size,
+            filled_price=result.filled_price,
+            error=result.error,
+        )
+
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        try:
+            return await self._rest.cancel_order(symbol, int(order_id))
+        except (ValueError, TypeError):
+            logger.error(f"HL cancel_order: invalid order_id {order_id!r}")
+            return False
+
+    async def get_positions(self) -> list[_base.Position]:
+        positions = await self._rest.get_positions()
+        return [
+            _base.Position(
+                exchange=self.name,
+                symbol=p.ticker,
+                size=p.size,
+                entry_price=p.entry_price,
+                mark_price=p.mark_price,
+                unrealized_pnl=p.unrealized_pnl,
+                margin_used=p.margin_used,
+                leverage=p.leverage,
+            )
+            for p in positions
+        ]
+
+    async def get_account_value(self) -> float:
+        return await self._rest.get_account_value()
+
+    # ── 내부 콜백 ──
+
+    def _on_orderbook(self, ob: OrderBook) -> None:
+        """WS 오더북 업데이트 → 등록된 ExchangeBase 콜백으로 Quote fan-out.
+
+        funding/index는 별도 REST 폴링이 필요. Phase A에서는 ob 정보만
+        Quote에 채워 보내고, funding 필드는 0으로 둔다 (Phase D-E에서
+        funding 캐시 합류 시점에 채움).
+        """
+        symbol = ob.ticker
+        callbacks = self._symbol_callbacks.get(symbol)
+        if not callbacks:
+            return
+        meta = self._latest_meta.get(symbol)
+        quote = _base.Quote(
+            exchange=self.name,
+            symbol=symbol,
+            mid_price=ob.mid_price,
+            bid=ob.best_bid,
+            ask=ob.best_ask,
+            bid_qty=ob.bids[0].size if ob.bids else 0.0,
+            ask_qty=ob.asks[0].size if ob.asks else 0.0,
+            index_price=meta.index_price if meta else 0.0,
+            funding_rate=meta.funding_rate if meta else 0.0,
+            funding_interval_hours=1.0,
+            predicted_funding_rate=meta.predicted_funding_rate if meta else 0.0,
+            open_interest=meta.open_interest if meta else 0.0,
+            volume_24h=meta.volume_24h if meta else 0.0,
+            timestamp=ob.timestamp,
+        )
+        for cb in callbacks:
+            try:
+                result = cb(quote)
+                if result is not None and asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception as e:
+                logger.error(f"HL ExchangeBase callback error [{symbol}]: {e}")
+
+    def update_meta(self, symbol: str, market_data: MarketData) -> None:
+        """REST 폴링에서 받은 funding/index 정보 캐시 갱신.
+
+        main.py의 funding poll task가 주기적으로 호출하면 다음 ob 콜백에 반영.
+        """
+        self._latest_meta[symbol] = market_data

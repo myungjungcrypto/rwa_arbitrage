@@ -564,3 +564,124 @@ class KISFuturesClient:
     def get_latest_quote(self, symbol: str) -> Optional[FuturesQuote]:
         """캐시된 최신 호가 반환."""
         return self._latest_quotes.get(symbol)
+
+
+# ──────────────────────────────────────────────
+# ExchangeBase Adapter (Phase A 스캐폴딩)
+# ──────────────────────────────────────────────
+#
+# 기존 KISFuturesClient를 감싸 ExchangeBase protocol을 구현. KIS는 dated_futures
+# venue이고 주문 API는 아직 미구현 상태(KIS REST 주문은 M10에서 합류 예정).
+# Phase A에서는 quote 수신 + 단순 정보 조회만 충실. place_order는 NotImplementedError.
+
+from src.exchange import base as _base   # noqa: E402
+
+
+class KISExchange:
+    """ExchangeBase 어댑터 — KISFuturesClient 래퍼.
+
+    내부적으로 FuturesQuote → Quote 변환만 수행. KIS는 perp이 아니라 dated
+    futures이므로 funding 관련 필드는 모두 0, contract_month는 symbol 그대로.
+
+    주문 API는 페이퍼 단계에서 미구현 → NotImplementedError. paper engine은
+    별도 KiwoomMock 경유로 시뮬레이션 fill 처리 (M10에서 KIS REST 주문 합류).
+    """
+
+    name = "kis"
+    venue_type = _base.VenueType.DATED_FUTURES.value
+    margin_asset = "KRW_equiv"
+
+    def __init__(self, client: KISFuturesClient):
+        self._client = client
+        # symbol → ExchangeBase 콜백 (KISFuturesClient 콜백과 별도 유지)
+        self._symbol_callbacks: dict[str, list[_base.QuoteCallback]] = {}
+        self._contract_sizes: dict[str, float] = {}
+
+    async def connect(self) -> bool:
+        return await self._client.connect()
+
+    async def disconnect(self) -> None:
+        await self._client.disconnect()
+
+    async def subscribe_quotes(
+        self,
+        symbol: str,
+        callback: _base.QuoteCallback,
+        *,
+        contract_size: float = 1.0,
+    ) -> None:
+        self._symbol_callbacks.setdefault(symbol, []).append(callback)
+        self._contract_sizes[symbol] = contract_size
+
+        # KIS native callback은 FuturesQuote를 받음 → Quote 변환 후 ExchangeBase 콜백 호출
+        async def _bridge(fq: FuturesQuote) -> None:
+            quote = self._to_base_quote(fq)
+            for cb in self._symbol_callbacks.get(symbol, []):
+                try:
+                    result = cb(quote)
+                    if result is not None and asyncio.iscoroutine(result):
+                        await result
+                except Exception as e:
+                    logger.error(f"KIS ExchangeBase callback error [{symbol}]: {e}")
+
+        # KIS callback은 sync — bridge를 동기 wrapper로 등록
+        def _sync_bridge(fq: FuturesQuote) -> None:
+            asyncio.create_task(_bridge(fq))
+
+        await self._client.subscribe(symbol, _sync_bridge, price_divisor=contract_size)
+
+    async def unsubscribe_quotes(self, symbol: str) -> None:
+        self._symbol_callbacks.pop(symbol, None)
+        self._contract_sizes.pop(symbol, None)
+        await self._client.unsubscribe(symbol)
+
+    async def get_quote(self, symbol: str) -> Optional[_base.Quote]:
+        # 우선 캐시, 없으면 REST 폴백
+        cached = self._client.get_latest_quote(symbol)
+        if cached:
+            return self._to_base_quote(cached)
+        fq = await self._client.get_quote_rest(symbol)
+        return self._to_base_quote(fq) if fq else None
+
+    async def place_order(
+        self,
+        symbol: str,
+        side: _base.OrderSideLiteral,
+        size: float,
+        order_type: _base.OrderTypeLiteral = "market",
+        limit_price: Optional[float] = None,
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+    ) -> _base.OrderResult:
+        raise NotImplementedError(
+            "KIS REST 주문 API는 M10에서 합류 예정. 페이퍼 단계는 KiwoomMock 사용."
+        )
+
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        raise NotImplementedError("KIS 주문 취소는 M10에서 합류 예정.")
+
+    async def get_positions(self) -> list[_base.Position]:
+        # KIS 잔고 조회 REST 미구현 — 페이퍼 단계는 빈 리스트
+        return []
+
+    async def get_account_value(self) -> float:
+        return 0.0
+
+    # ── 내부 변환 ──
+
+    def _to_base_quote(self, fq: FuturesQuote) -> _base.Quote:
+        return _base.Quote(
+            exchange=self.name,
+            symbol=fq.symbol,
+            mid_price=fq.price,
+            bid=fq.bid,
+            ask=fq.ask,
+            bid_qty=float(fq.bid_qty),
+            ask_qty=float(fq.ask_qty),
+            index_price=0.0,
+            funding_rate=0.0,
+            funding_interval_hours=0.0,
+            contract_month=fq.contract_month or fq.symbol,
+            volume_24h=float(fq.volume),
+            timestamp=fq.timestamp,
+        )
