@@ -97,6 +97,30 @@ class Position:
     leverage: float = 1.0
 
 
+@dataclass
+class FundingInfo:
+    """펀딩 정보 + 거래소가 실제 보고하는 주기.
+
+    `observed_interval_hours`는 거래소 응답에서 추정한 실제 정산 간격 —
+    HL은 fundingHistory 마지막 N개 timestamp 차이, Binance/Bybit/OKX는
+    `nextFundingTime` 기반 (다음 정산 시각 - 직전 정산 시각).
+
+    `FundingIntervalMonitor`가 이 값을 leg config의 `funding_interval_hours`와
+    매시간 대조해 거래소 정책 변경(과거 Binance 1h→8h 사례, OKX 8h→4h 등)
+    감지.
+    """
+
+    exchange: str
+    symbol: str
+    current_rate: float                 # 현재 펀딩 (raw, 예: 0.00001 = 0.001%/시간)
+    next_settlement_ts: float           # 다음 정산 unix timestamp (초)
+    observed_interval_hours: float      # 거래소가 보고하는 실제 정산 주기 (h)
+    timestamp: float = field(default_factory=time.time)
+
+    def matches_expected(self, expected_hours: float, tolerance_hours: float = 0.1) -> bool:
+        return abs(self.observed_interval_hours - expected_hours) <= tolerance_hours
+
+
 QuoteCallback = Callable[[Quote], Optional[Awaitable[None]]]
 
 
@@ -153,3 +177,12 @@ class ExchangeBase(Protocol):
     async def get_positions(self) -> list[Position]: ...
 
     async def get_account_value(self) -> float: ...
+
+    async def get_funding_info(self, symbol: str) -> Optional[FundingInfo]:
+        """현재 펀딩 + 실제 정산 주기 (`FundingIntervalMonitor`가 검증에 사용).
+
+        월물(KIS 등 dated_futures venue)은 None 반환.
+        perp 거래소는 거래소 API에서 정산 timestamp 2회 이상 추적해
+        실제 주기를 응답해야 함. 미구현 시 None 가능.
+        """
+        ...

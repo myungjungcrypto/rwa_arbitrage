@@ -738,6 +738,49 @@ class HyperliquidExchange:
     async def get_account_value(self) -> float:
         return await self._rest.get_account_value()
 
+    async def get_funding_info(self, symbol: str) -> Optional[_base.FundingInfo]:
+        """HL fundingHistory에서 마지막 정산 시각 차이 → 실제 주기 추정.
+
+        HL HIP-3 oil은 hourly funding이 표준. 정책 변경 시 history에서 즉시
+        detect (예: 마지막 3개 정산이 4h 간격으로 보이면 observed=4.0).
+        """
+        # 최근 24h 펀딩 히스토리 조회 (HL은 ms timestamp 사용)
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - 24 * 3600 * 1000
+        history = await self._rest.get_funding_history(symbol, start_ms, now_ms)
+        if not history or len(history) < 2:
+            return None
+
+        # 정산 timestamp 추출 (HL 응답 키: 'time' ms)
+        try:
+            timestamps_s = sorted(int(h.get("time", 0)) / 1000 for h in history)
+        except (TypeError, ValueError):
+            return None
+        if len(timestamps_s) < 2:
+            return None
+
+        # 인접 정산 간격 → 중앙값 (간헐적 누락 방지)
+        diffs = [timestamps_s[i + 1] - timestamps_s[i] for i in range(len(timestamps_s) - 1)]
+        diffs.sort()
+        median_seconds = diffs[len(diffs) // 2]
+        observed_hours = median_seconds / 3600.0
+
+        last_settlement_s = timestamps_s[-1]
+        next_settlement_s = last_settlement_s + median_seconds
+
+        try:
+            current_rate = float(history[-1].get("fundingRate", 0))
+        except (TypeError, ValueError):
+            current_rate = 0.0
+
+        return _base.FundingInfo(
+            exchange=self.name,
+            symbol=symbol,
+            current_rate=current_rate,
+            next_settlement_ts=next_settlement_s,
+            observed_interval_hours=observed_hours,
+        )
+
     # ── 내부 콜백 ──
 
     def _on_orderbook(self, ob: OrderBook) -> None:

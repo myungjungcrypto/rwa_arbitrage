@@ -667,6 +667,10 @@ class KISExchange:
     async def get_account_value(self) -> float:
         return 0.0
 
+    async def get_funding_info(self, symbol: str) -> Optional[_base.FundingInfo]:
+        """KIS는 dated_futures venue → funding 개념 없음. 항상 None."""
+        return None
+
     # ── 내부 변환 ──
 
     def _to_base_quote(self, fq: FuturesQuote) -> _base.Quote:
