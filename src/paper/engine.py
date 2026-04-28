@@ -223,10 +223,13 @@ class PaperTradingEngine:
         # 가격 캐시 업데이트
         self._latest_perp_prices[product] = perp_price
         self._latest_futures_prices[product] = futures_price
-        self._latest_perp_bid[product] = perp_best_bid or perp_price
-        self._latest_perp_ask[product] = perp_best_ask or perp_price
-        self._latest_futures_bid[product] = futures_bid or futures_price
-        self._latest_futures_ask[product] = futures_ask or futures_price
+        # bid/ask가 0이면 0 그대로 저장 — exec_filter가 진입 차단.
+        # 이전 `or perp_price` fallback은 bid=ask=mid가 되어 exec_basis ≈ mid_basis,
+        # 결과적으로 exec_filter가 무력화돼 sub-10bp 진입 다수 발생 (2026-04-21~04-27 14건).
+        self._latest_perp_bid[product] = perp_best_bid
+        self._latest_perp_ask[product] = perp_best_ask
+        self._latest_futures_bid[product] = futures_bid
+        self._latest_futures_ask[product] = futures_ask
 
         # 시그널 생성 (mid basis + bid/ask 전달)
         signal = self.signal_gen.update_basis(
@@ -407,10 +410,12 @@ class PaperTradingEngine:
         # 2) Perp 주문 (시뮬레이션 — 오더북 bid/ask로 체결)
         #    buy → ask 가격, sell → bid 가격으로 체결
         #    size = perp_units (배럴 수, not CME 계약 수)
+        # cache가 0(오더북 미수신)이면 mid로 fallback — entry는 어차피 exec_filter가
+        # 0을 차단하므로 여기 도달하지 않음. 안전망.
         if perp_side == "buy":
-            perp_fill_price = self._latest_perp_ask.get(product, perp_price)
+            perp_fill_price = self._latest_perp_ask.get(product) or perp_price
         else:
-            perp_fill_price = self._latest_perp_bid.get(product, perp_price)
+            perp_fill_price = self._latest_perp_bid.get(product) or perp_price
 
         # ── 트레이드 기록 ──
         self._trade_counter += 1
@@ -498,11 +503,12 @@ class PaperTradingEngine:
         # ── 양 레그 청산 주문 ──
 
         # Perp 청산 (반대 방향) — 오더북 bid/ask로 체결
+        # cache가 0이면 mid(perp_price)로 fallback (안전망 — exit은 exec_filter 거치지 않음)
         perp_close_side = "buy" if trade.perp_side == "short" else "sell"
         if perp_close_side == "buy":
-            perp_fill_price = self._latest_perp_ask.get(product, perp_price)
+            perp_fill_price = self._latest_perp_ask.get(product) or perp_price
         else:
-            perp_fill_price = self._latest_perp_bid.get(product, perp_price)
+            perp_fill_price = self._latest_perp_bid.get(product) or perp_price
 
         # Futures 청산
         futures_close_side = "sell" if trade.futures_side == "long" else "buy"

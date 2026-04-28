@@ -207,8 +207,10 @@ class DataCollector:
 
         # 키움 월물 시세가 없으면 인덱스(오라클) 가격을 대용으로 사용
         futures_price = futures["price"] if futures else perp.index_price
-        futures_bid = futures["bid"] if futures and futures["bid"] > 0 else futures_price
-        futures_ask = futures["ask"] if futures and futures["ask"] > 0 else futures_price
+        # bid/ask는 실제 호가가 없으면 0 전달 — 엔진이 exec_filter로 진입 차단.
+        # (fallback 금지: mid로 대체하면 exec_basis ≈ mid_basis가 되어 필터 우회)
+        futures_bid = futures["bid"] if futures and futures["bid"] > 0 else 0.0
+        futures_ask = futures["ask"] if futures and futures["ask"] > 0 else 0.0
 
         if futures_price <= 0:
             return
@@ -223,10 +225,10 @@ class DataCollector:
             funding_rate=perp.funding_rate,
         )
 
-        # perp 오더북 bid/ask (WebSocket에서 수신)
+        # perp 오더북 bid/ask (WebSocket에서 수신) — 미수신이면 0 전달 (mid fallback 금지)
         ob = self._latest_orderbook.get(product_name)
-        perp_best_bid = ob.best_bid if ob else perp.mark_price
-        perp_best_ask = ob.best_ask if ob else perp.mark_price
+        perp_best_bid = ob.best_bid if ob else 0.0
+        perp_best_ask = ob.best_ask if ob else 0.0
 
         # 콜백 — futures bid/ask도 전달
         for cb in self._basis_callbacks:
