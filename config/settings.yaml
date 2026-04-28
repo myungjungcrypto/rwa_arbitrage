@@ -51,6 +51,8 @@ strategy:
 
   # 진입
   entry_threshold_bps: 20       # exec basis가 이 값 이상 벌어져야 진입 (수수료 ~13bp + 슬리피지 버퍼)
+  min_abs_entry_bps: 10         # 절대값 floor: |exec_basis| 이 값 미만이면 진입 차단 (통계신호와 무관)
+                                # (post-rollover 30건 분석: <10bp는 14% WR -$202, 10bp+는 94% WR +$199)
 
   # 청산 — 스프레드 수렴 기반
   convergence_target_bps: 3     # spread ≤ 3bp면 수렴 완료 → 청산

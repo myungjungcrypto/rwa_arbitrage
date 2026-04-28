@@ -82,6 +82,7 @@ class EngineState:
     entry_signals_generated: int = 0     # signal generator가 ENTRY type 반환
     entry_exec_filter_skip: int = 0      # exec basis < threshold로 skip
     entry_warmup_skip: int = 0            # 워밍업 부족으로 skip
+    entry_min_abs_skip: int = 0           # min_abs_entry_bps floor 미달로 skip
 
 
 # ──────────────────────────────────────────────
@@ -287,6 +288,17 @@ class PaperTradingEngine:
                     f"ask={self._latest_perp_ask.get(product, 0):.2f} "
                     f"fut_bid={self._latest_futures_bid.get(product, 0):.2f} "
                     f"ask={self._latest_futures_ask.get(product, 0):.2f})"
+                )
+                return
+
+            # 절대값 진입 floor — historical analysis(<10bp는 14% WR -$202,
+            # 10bp+는 94% WR +$199)에 따라 통계 신호와 무관한 추가 가드
+            min_abs = self.config.strategy.min_abs_entry_bps
+            if min_abs > 0 and abs(exec_basis) < min_abs:
+                self._state.entry_min_abs_skip += 1
+                logger.warning(
+                    f"[{product.upper()}] ENTRY_SKIP min_abs: |exec|={abs(exec_basis):.1f}bp "
+                    f"< min_abs={min_abs:.1f}bp (mid={basis_bps:+.1f}bp dir={direction})"
                 )
                 return
 

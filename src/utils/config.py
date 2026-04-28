@@ -60,6 +60,12 @@ class StrategyConfig:
     funding_rate_weight: float = 1.0
     min_funding_advantage_bps: float = 5
 
+    # 절대값 진입 floor — exec basis가 이 값 이상이어야 진입 (statistical band과 무관)
+    # 30건 표본 분석(2026-04-21~04-27): <10bp 진입 14/14건 14% 승률 -$202,
+    # 10bp+ 진입 16/16건 94% 승률 +$199. 따라서 절대 floor 필수.
+    # 0 = 비활성화 (backward compat).
+    min_abs_entry_bps: float = 0.0
+
     # CME 장 시간 가드 — 폐장 중 진입 차단 + 장기 휴장 전 flatten
     cme_closed_skip_entry: bool = True
     pre_close_flatten_minutes: int = 30     # 마감 몇 분 전부터 진입 차단 + 청산 시작
