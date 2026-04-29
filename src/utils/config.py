@@ -99,6 +99,74 @@ class AppConfig:
     log_level: str = "INFO"
     log_file: str = "logs/arbitrage.log"
 
+    def get_pairs(self) -> "list":
+        """레거시 products+kis_symbol_map 구성에서 ArbitragePair 리스트 합성.
+
+        Phase C 멀티 페어 인프라가 사용. 추후 settings.yaml에 명시적 `pairs:`
+        블록이 추가되면 그것을 우선시 (현재는 합성만).
+
+        매핑 규칙 (legacy → pair):
+          product='wti'   → pair_id='wti_cme_hl'
+                            leg_a = HL  xyz:CL  perp
+                            leg_b = KIS MCLM26  dated_futures (kis_symbol_map['wti'])
+          product='brent' → pair_id='brent_cme_hl' (brent 운영 시작 후)
+        """
+        # 늦은 import — config.py가 strategy 모듈에 의존하지 않게
+        from src.strategy.pair import (
+            ArbitragePair, ExchangeLeg, LegRole, PairGate, PairStrategyParams,
+        )
+
+        params = PairStrategyParams(
+            basis_window_hours=self.strategy.basis_window_hours,
+            basis_std_multiplier=self.strategy.basis_std_multiplier,
+            entry_threshold_bps=self.strategy.entry_threshold_bps,
+            convergence_target_bps=self.strategy.convergence_target_bps,
+            max_hold_hours=self.strategy.max_hold_hours,
+            min_funding_advantage_bps=self.strategy.min_funding_advantage_bps,
+            funding_rate_weight=self.strategy.funding_rate_weight,
+            emergency_close_bps=self.risk.emergency_close_threshold,
+            pre_close_flatten_minutes=self.strategy.pre_close_flatten_minutes,
+            flatten_threshold_hours=self.strategy.flatten_threshold_hours,
+        )
+
+        pairs: list[ArbitragePair] = []
+        for product_key, prod in self.products.items():
+            kis_symbol = self.kis_symbol_map.get(product_key, prod.futures_symbol)
+            pair_id = f"{product_key}_cme_hl"
+            pair = ArbitragePair(
+                id=pair_id,
+                enabled=True,
+                strategy="basis_convergence",
+                gate=PairGate.CME_HOURS,
+                leg_a=ExchangeLeg(
+                    exchange="hyperliquid",
+                    symbol=prod.perp_ticker,
+                    role=LegRole.PERP,
+                    contract_size=1.0,                 # HL은 배럴 단위
+                    taker_fee_bps=0.9,                  # HIP-3 taker
+                    funding_interval_hours=1.0,
+                    margin_asset="USDC",
+                ),
+                leg_b=ExchangeLeg(
+                    exchange="kis",
+                    symbol=kis_symbol,
+                    role=LegRole.DATED_FUTURES,
+                    contract_size=float(prod.contract_size),
+                    fee_per_contract_usd=prod.futures_fee_per_contract,
+                    margin_asset="KRW_equiv",
+                ),
+                params=params,
+            )
+            pairs.append(pair)
+        return pairs
+
+    def get_pair(self, pair_id: str) -> "object | None":
+        """pair_id로 ArbitragePair 조회."""
+        for p in self.get_pairs():
+            if p.id == pair_id:
+                return p
+        return None
+
 
 def load_config(
     settings_path: str = "config/settings.yaml",
