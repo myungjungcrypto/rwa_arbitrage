@@ -72,6 +72,12 @@ class SignalGenerator:
     3. 베이시스가 평균 - K*σ를 하회하면 → ENTRY_SHORT_BASIS (perp long, futures short)
     4. 베이시스가 평균으로 회귀하거나 목표 수익 도달 시 → EXIT
     5. 펀딩레이트가 유리한 방향이면 가산점
+
+    Phase C3 메모: 모든 메서드의 첫 인자 (`product`)는 사실 **opaque key**다.
+    레거시 코드는 `'wti'` 같은 product를 키로 쓰지만, Phase C5 이후 main.py는
+    `'wti_cme_hl'` 같은 pair_id를 동일한 시그니처로 넘긴다. 두 키 같은
+    SignalGenerator 인스턴스에 공존 가능 (dict 키만 다를 뿐).
+    `update_basis_for_pair` 등 명시적 alias 메서드는 self-documenting purpose.
     """
 
     def __init__(
@@ -456,3 +462,51 @@ class SignalGenerator:
                 pos.cumulative_funding += funding_rate
             else:
                 pos.cumulative_funding -= funding_rate
+
+    # ──────────────────────────────────────────────
+    # Phase C3: pair_id alias 메서드 (self-documenting; 내부 동일)
+    # ──────────────────────────────────────────────
+
+    def bootstrap_from_db_for_pair(
+        self, pair_id: str, basis_history: list[float]
+    ) -> None:
+        """`bootstrap_from_db` alias — 키를 `pair_id`로 명시한 호출 형태."""
+        self.bootstrap_from_db(pair_id, basis_history)
+
+    def update_basis_for_pair(
+        self,
+        pair_id: str,
+        basis_bps: float,
+        funding_rate: float = 0.0,
+        leg_a_bid: float = 0.0,
+        leg_a_ask: float = 0.0,
+        leg_b_bid: float = 0.0,
+        leg_b_ask: float = 0.0,
+        current_time: float | None = None,
+    ) -> Signal:
+        """`update_basis` alias — pair_id 시맨틱.
+
+        호환성을 위해 leg_a/leg_b 인자는 내부적으로 perp/futures 인자에 매핑.
+        Phase C5 후 main.py가 이 메서드 사용. 알고리즘은 동일.
+        """
+        return self.update_basis(
+            pair_id, basis_bps, funding_rate,
+            perp_bid=leg_a_bid, perp_ask=leg_a_ask,
+            futures_bid=leg_b_bid, futures_ask=leg_b_ask,
+            current_time=current_time,
+        )
+
+    def get_position_for_pair(self, pair_id: str) -> PositionState:
+        return self.get_position(pair_id)
+
+    def open_position_for_pair(self, pair_id: str, signal: Signal, size: float = 1.0):
+        return self.open_position(pair_id, signal, size=size)
+
+    def close_position_for_pair(self, pair_id: str) -> PositionState:
+        return self.close_position(pair_id)
+
+    def add_funding_for_pair(self, pair_id: str, funding_rate: float):
+        return self.add_funding(pair_id, funding_rate)
+
+    def get_basis_stats_for_pair(self, pair_id: str, window: int | None = None) -> dict:
+        return self.get_basis_stats(pair_id, window=window)
