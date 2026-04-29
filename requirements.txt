@@ -8,3 +8,4 @@ streamlit>=1.30
 pandas>=2.0
 plotly>=5.18
 streamlit-autorefresh>=1.0
+jinja2>=3.0           # pandas DataFrame.style.format() 의존성
