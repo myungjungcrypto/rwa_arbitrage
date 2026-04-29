@@ -215,20 +215,33 @@ class DataCollector:
         if futures_price <= 0:
             return
 
-        # mid 기준 basis (통계 추적용)
-        basis_bps = (perp.mark_price - futures_price) / futures_price * 10_000
-
-        self.storage.save_basis(
-            product=product_name,
-            perp_price=perp.mark_price,
-            futures_price=futures_price,
-            funding_rate=perp.funding_rate,
-        )
-
         # perp 오더북 bid/ask (WebSocket에서 수신) — 미수신이면 0 전달 (mid fallback 금지)
         ob = self._latest_orderbook.get(product_name)
         perp_best_bid = ob.best_bid if ob else 0.0
         perp_best_ask = ob.best_ask if ob else 0.0
+
+        # basis 계산 — orderbook-mid 기반이 우선 (HL mark_price는 oracle 추적이라
+        # HL 자체 orderbook과 ~20bp 괴리 가능. 신호의 "phantom basis" 원인).
+        # 양쪽 다 호가 있으면 orderbook-mid, 아니면 mark-based (fallback — 신호는
+        # exec_filter가 자동 차단하므로 stats 흐름 유지가 목적).
+        if perp_best_bid > 0 and perp_best_ask > 0 and futures_bid > 0 and futures_ask > 0:
+            perp_mid_ob = (perp_best_bid + perp_best_ask) / 2
+            fut_mid_ob = (futures_bid + futures_ask) / 2
+            basis_bps = (perp_mid_ob - fut_mid_ob) / fut_mid_ob * 10_000
+            basis_perp_price = perp_mid_ob
+            basis_fut_price = fut_mid_ob
+        else:
+            # mark-based fallback (호가 미수신 윈도우)
+            basis_bps = (perp.mark_price - futures_price) / futures_price * 10_000
+            basis_perp_price = perp.mark_price
+            basis_fut_price = futures_price
+
+        self.storage.save_basis(
+            product=product_name,
+            perp_price=basis_perp_price,
+            futures_price=basis_fut_price,
+            funding_rate=perp.funding_rate,
+        )
 
         # 콜백 — futures bid/ask도 전달
         for cb in self._basis_callbacks:
