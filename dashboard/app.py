@@ -89,6 +89,12 @@ def _registered_pairs(db_path: str):
     return queries.list_registered_pairs(con)
 
 
+@st.cache_data(ttl=DEFAULT_REFRESH_S)
+def _alltime_stats(db_path: str, pair_id: str | None):
+    con = _con(db_path)
+    return queries.load_alltime_stats(con, pair_id)
+
+
 # ──────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────
@@ -156,15 +162,18 @@ def main():
         else:
             st.error(f"🔴 Bot dead? · last update {fresh/60:.1f}m ago")
 
-    if state:
-        cols[1].metric("Open positions", state["open_positions"])
-        cols[2].metric("Closed trades", state["closed_trades"])
-        cols[3].metric("Cumulative PnL", f"${state['cumulative_pnl_usd']:+.2f}")
-        cols[4].metric("Total signals", state["total_signals"])
+    # 메트릭은 DB 기반 (engine_state 카운터는 봇 프로세스 재시작 시 리셋되므로
+    # "전체 기간" 표기는 positions 테이블에서 직접 집계)
+    stats = _alltime_stats(db_path, pair_id)
+    cols[1].metric("Open positions", stats["open_n"])
+    cols[2].metric("Closed trades", stats["closed_n"])
+    cols[3].metric("Cumulative PnL", f"${stats['closed_net']:+.2f}")
 
+    if state:
+        cols[4].metric("Total signals (session)", state["total_signals"])
         st.caption(
             f"Pair: **{state['pair_id']}** · "
-            f"Entry signals: {state['entry_signals_generated']} · "
+            f"Session entry signals: {state['entry_signals_generated']} · "
             f"Skips → exec: {state['entry_exec_filter_skip']}, "
             f"warmup: {state['entry_warmup_skip']}, "
             f"min_abs: {state['entry_min_abs_skip']} · "
@@ -178,6 +187,8 @@ def main():
                 f"std {state['basis_std_bps']:.1f}bp · "
                 f"range [{state['basis_min_bps']:+.1f}, {state['basis_max_bps']:+.1f}]bp"
             )
+    else:
+        cols[4].metric("Total signals (session)", "—")
 
     st.divider()
 
@@ -250,17 +261,17 @@ def main():
             "net_pnl": "net",
         })
         st.dataframe(
-            view.style.format({
-                "hold_h": "{:.1f}",
-                "entry_bp": "{:+.1f}",
-                "perp_in": "{:.2f}",
-                "fut_in": "{:.2f}",
-                "realized": "{:+.2f}",
-                "funding": "{:+.2f}",
-                "fees(est)": "{:.2f}",
-                "net": "{:+.2f}",
-            }),
-            use_container_width=True, hide_index=True,
+            view, use_container_width=True, hide_index=True,
+            column_config={
+                "hold_h": st.column_config.NumberColumn("hold_h", format="%.1f"),
+                "entry_bp": st.column_config.NumberColumn("entry_bp", format="%+.1f"),
+                "perp_in": st.column_config.NumberColumn("perp_in", format="%.2f"),
+                "fut_in": st.column_config.NumberColumn("fut_in", format="%.2f"),
+                "realized": st.column_config.NumberColumn("realized", format="$%+.2f"),
+                "funding": st.column_config.NumberColumn("funding", format="$%+.2f"),
+                "fees(est)": st.column_config.NumberColumn("fees(est)", format="$%.2f"),
+                "net": st.column_config.NumberColumn("net", format="$%+.2f"),
+            },
         )
 
         # 합계
@@ -286,11 +297,14 @@ def main():
             view_d = daily_df[["date", "n", "trading", "funding", "fees", "net", "cumulative"]].copy()
             view_d["date"] = view_d["date"].dt.strftime("%Y-%m-%d")
             st.dataframe(
-                view_d.style.format({
-                    "trading": "{:+.2f}", "funding": "{:+.2f}",
-                    "fees": "{:.2f}", "net": "{:+.2f}", "cumulative": "{:+.2f}",
-                }),
-                use_container_width=True, hide_index=True,
+                view_d, use_container_width=True, hide_index=True,
+                column_config={
+                    "trading": st.column_config.NumberColumn("trading", format="$%+.2f"),
+                    "funding": st.column_config.NumberColumn("funding", format="$%+.2f"),
+                    "fees": st.column_config.NumberColumn("fees", format="$%.2f"),
+                    "net": st.column_config.NumberColumn("net", format="$%+.2f"),
+                    "cumulative": st.column_config.NumberColumn("cumulative", format="$%+.2f"),
+                },
             )
 
     with col_right:
@@ -310,11 +324,14 @@ def main():
         st.plotly_chart(charts.entry_bp_bucket_bar(bucket_df), use_container_width=True)
         view_b = bucket_df.copy()
         view_b["bucket"] = view_b["bucket"].astype(str)
+        view_b["win_rate"] = (view_b["win_rate"] * 100).round(0)   # 0-1 → 0-100
         st.dataframe(
-            view_b.style.format({
-                "win_rate": "{:.0%}", "avg_pnl": "${:+.2f}", "total_pnl": "${:+.2f}",
-            }),
-            use_container_width=True, hide_index=True,
+            view_b, use_container_width=True, hide_index=True,
+            column_config={
+                "win_rate": st.column_config.NumberColumn("win_rate", format="%.0f%%"),
+                "avg_pnl": st.column_config.NumberColumn("avg_pnl", format="$%+.2f"),
+                "total_pnl": st.column_config.NumberColumn("total_pnl", format="$%+.2f"),
+            },
         )
 
         st.subheader("⏱️ Hold time bucket × Avg PnL")
@@ -322,10 +339,11 @@ def main():
         view_h = hold_df.copy()
         view_h["bucket"] = view_h["bucket"].astype(str)
         st.dataframe(
-            view_h.style.format({
-                "avg_pnl": "${:+.2f}", "total_pnl": "${:+.2f}",
-            }),
-            use_container_width=True, hide_index=True,
+            view_h, use_container_width=True, hide_index=True,
+            column_config={
+                "avg_pnl": st.column_config.NumberColumn("avg_pnl", format="$%+.2f"),
+                "total_pnl": st.column_config.NumberColumn("total_pnl", format="$%+.2f"),
+            },
         )
 
         st.subheader("📍 Entry spread vs Net PnL")

@@ -291,3 +291,38 @@ def test_compute_entry_funnel_no_state():
     funnel = queries.compute_entry_funnel(None)
     assert funnel["total_signals"] == 0
     assert funnel["total_entries"] == 0
+
+
+# ──────────────────────────────────────────────
+# All-time stats (DB-derived, 봇 재시작 영향 없음)
+# ──────────────────────────────────────────────
+
+
+def test_alltime_stats_pair_id(db_path):
+    con = queries.open_connection(db_path)
+    s = queries.load_alltime_stats(con, "wti_cme_hl")
+    assert s["closed_n"] == 4    # fixture에 4건 closed
+    assert s["open_n"] == 1
+    # 합계: +50 -10 -15 -20 = +5
+    assert s["closed_realized"] == 5.0
+    assert s["closed_funding"] == 0.0
+    assert s["closed_net"] == 5.0
+    assert s["open_unrealized"] == 25.0
+    con.close()
+
+
+def test_alltime_stats_no_pair_returns_aggregate(db_path):
+    con = queries.open_connection(db_path)
+    s = queries.load_alltime_stats(con, None)
+    assert s["closed_n"] == 4
+    assert s["open_n"] == 1
+    con.close()
+
+
+def test_alltime_stats_unknown_pair_returns_zeros(db_path):
+    con = queries.open_connection(db_path)
+    s = queries.load_alltime_stats(con, "nonexistent_pair")
+    assert s["closed_n"] == 0
+    assert s["open_n"] == 0
+    assert s["closed_net"] == 0
+    con.close()

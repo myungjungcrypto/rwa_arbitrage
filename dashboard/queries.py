@@ -334,3 +334,41 @@ def state_freshness_seconds(state_latest: Optional[dict]) -> Optional[float]:
         return None
     import time as _t
     return _t.time() - state_latest["ts"]
+
+
+def load_alltime_stats(con: sqlite3.Connection, pair_id: Optional[str] = None) -> dict:
+    """positions 테이블에서 누적 통계.
+
+    engine_state 카운터는 봇 프로세스 메모리 기준(재시작 시 리셋) →
+    "전체 기간" 표기는 이 DB 기반 stats 사용.
+    """
+    if pair_id:
+        legacy_product = pair_id.split("_", 1)[0]
+        where = "AND (pair_id = ? OR (pair_id IS NULL AND product = ?))"
+        params: tuple = (pair_id, legacy_product)
+    else:
+        where = ""
+        params = ()
+    closed_row = con.execute(
+        f"""SELECT COUNT(*) AS n,
+                   COALESCE(SUM(realized_pnl), 0) AS realized,
+                   COALESCE(SUM(funding_pnl), 0) AS funding
+              FROM positions
+             WHERE status='closed' {where}""",
+        params,
+    ).fetchone()
+    open_row = con.execute(
+        f"""SELECT COUNT(*) AS n,
+                   COALESCE(SUM(unrealized_pnl), 0) AS unrealized
+              FROM positions
+             WHERE status='open' {where}""",
+        params,
+    ).fetchone()
+    return {
+        "closed_n": closed_row["n"],
+        "closed_realized": closed_row["realized"],
+        "closed_funding": closed_row["funding"],
+        "closed_net": closed_row["realized"] + closed_row["funding"],
+        "open_n": open_row["n"],
+        "open_unrealized": open_row["unrealized"],
+    }
