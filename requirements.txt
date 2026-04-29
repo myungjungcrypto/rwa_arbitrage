@@ -2,3 +2,9 @@
 aiohttp>=3.9
 websockets>=12.0
 pyyaml>=6.0
+
+# Dashboard (Phase M)
+streamlit>=1.30
+pandas>=2.0
+plotly>=5.18
+streamlit-autorefresh>=1.0
