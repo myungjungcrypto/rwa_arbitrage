@@ -3,15 +3,22 @@ from __future__ import annotations
 
 Hyperliquid WebSocket + 키움 시세를 통합하여
 베이시스 계산, DB 저장, 콜백 처리를 담당.
+
+Phase C2: pair-keyed 신규 경로 추가. 기존 product-keyed 경로는 무수정 유지
+(레거시 봇 운영 호환). 신규 경로는 ExchangeBase 어댑터에서 들어오는 Quote를
+`update_leg_quote(pair_id, leg, quote)`로 받아 leg_prices 테이블에 저장 +
+양쪽 leg 모두 도착하면 basis 계산 → pair-aware 콜백 fan-out.
 """
 
 
 import asyncio
 import time
 import logging
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
+from src.exchange.base import Quote
 from src.exchange.hyperliquid import MarketData, OrderBook
+from src.strategy.pair import ArbitragePair, LegRole
 
 # Lazy imports for classes that need aiohttp/websockets
 def _get_hl_client():
@@ -27,11 +34,19 @@ from src.utils.config import AppConfig, ProductConfig
 logger = logging.getLogger("arbitrage.collector")
 
 
+# pair-aware basis callback signature:
+#   cb(pair_id, basis_bps, leg_a_quote, leg_b_quote)
+PairBasisCallback = Callable[[str, float, Quote, Quote], Optional[Awaitable[None]]]
+
+
 class DataCollector:
     """통합 데이터 수집기.
 
     Hyperliquid 퍼프 시세 + 키움 월물 시세를 수집하고,
     베이시스를 계산하여 DB에 저장.
+
+    레거시 product-keyed API와 신규 pair-keyed API를 동시에 제공.
+    Phase C5에서 main.py가 pair-keyed로 switch할 때까지 둘 다 살아있음.
     """
 
     def __init__(self, config: AppConfig, storage: Storage):
@@ -53,29 +68,32 @@ class DataCollector:
             ping_interval=config.hyperliquid.ws_ping_interval,
         )
 
-        # 최신 시세 캐시
+        # ── 레거시 product-keyed 경로 ──
         self._latest_perp: dict[str, MarketData] = {}
-        self._latest_futures: dict[str, dict] = {}  # symbol -> {price, bid, ask, ...}
+        self._latest_futures: dict[str, dict] = {}     # symbol -> {price, bid, ask, ...}
         self._latest_orderbook: dict[str, OrderBook] = {}
-
-        # 콜백
         self._basis_callbacks: list[Callable] = []
         self._price_callbacks: list[Callable] = []
+
+        # ── Phase C2: pair-keyed 경로 ──
+        self._pairs: dict[str, ArbitragePair] = {}                  # pair_id → pair
+        self._latest_quote: dict[tuple[str, str], Quote] = {}       # (pair_id, leg) → Quote
+        self._pair_callbacks: list[PairBasisCallback] = []
 
         # 폴링 인터벌 (초)
         self.poll_interval = 5
         self._running = False
 
     def on_basis_update(self, callback: Callable):
-        """베이시스 업데이트 콜백 등록.
+        """[Legacy] 베이시스 업데이트 콜백 등록.
 
         callback(product, perp_price, futures_price, basis_bps,
-                 perp_best_bid, perp_best_ask)
+                 perp_best_bid, perp_best_ask, futures_bid, futures_ask)
         """
         self._basis_callbacks.append(callback)
 
     def on_price_update(self, callback: Callable[[str, MarketData], None]):
-        """시세 업데이트 콜백 등록."""
+        """[Legacy] 시세 업데이트 콜백 등록."""
         self._price_callbacks.append(callback)
 
     @property
@@ -85,6 +103,120 @@ class DataCollector:
     @property
     def latest_futures(self) -> dict[str, dict]:
         return self._latest_futures
+
+    # ──────────────────────────────────────────────
+    # Phase C2: pair-keyed API (신규, 레거시와 병존)
+    # ──────────────────────────────────────────────
+
+    def register_pair(self, pair: ArbitragePair) -> None:
+        """page-keyed 기반 추적 대상 페어 등록. pair_id 중복 시 덮어씀.
+
+        ExchangeBase 어댑터들이 이 페어의 leg 심볼을 구독한 뒤
+        `update_leg_quote(pair_id, leg, quote)`로 시세를 push.
+        """
+        self._pairs[pair.id] = pair
+        logger.info(
+            f"[PAIR] registered {pair.id}: "
+            f"leg_a={pair.leg_a.exchange}/{pair.leg_a.symbol} ({pair.leg_a.role.value}), "
+            f"leg_b={pair.leg_b.exchange}/{pair.leg_b.symbol} ({pair.leg_b.role.value})"
+        )
+
+    def get_pair(self, pair_id: str) -> Optional[ArbitragePair]:
+        return self._pairs.get(pair_id)
+
+    @property
+    def registered_pairs(self) -> dict[str, ArbitragePair]:
+        return dict(self._pairs)
+
+    def on_pair_basis(self, callback: PairBasisCallback) -> None:
+        """pair-keyed basis 콜백 등록.
+
+        callback signature: (pair_id, basis_bps, leg_a_quote, leg_b_quote)
+        Quote는 src.exchange.base.Quote 인스턴스. 양쪽 leg 모두 도착했을 때만
+        호출됨. 호출자가 동기/비동기 모두 가능.
+        """
+        self._pair_callbacks.append(callback)
+
+    def update_leg_quote(self, pair_id: str, leg: str, quote: Quote) -> None:
+        """page-keyed 신규 경로의 메인 entry point.
+
+        ExchangeBase 어댑터가 호출. 호출 흐름:
+          1. (pair_id, leg) 키로 최신 Quote 캐시
+          2. leg_prices 테이블에 저장 (실패해도 계속)
+          3. 양쪽 leg 모두 캐시에 있으면 orderbook-mid 기반 basis 계산
+          4. pair-aware 콜백 fan-out
+
+        leg는 'a' | 'b' 중 하나.
+        """
+        if leg not in ("a", "b"):
+            raise ValueError(f"leg must be 'a' or 'b', got {leg!r}")
+        if pair_id not in self._pairs:
+            logger.warning(f"[{pair_id}] update_leg_quote: pair not registered (ignored)")
+            return
+
+        self._latest_quote[(pair_id, leg)] = quote
+
+        # leg_prices 테이블 INSERT (best-effort)
+        try:
+            self.storage.save_leg_quote(
+                pair_id=pair_id, leg=leg,
+                exchange=quote.exchange, symbol=quote.symbol,
+                mid_price=quote.mid_price,
+                bid=quote.bid, ask=quote.ask,
+                bid_qty=quote.bid_qty, ask_qty=quote.ask_qty,
+                index_price=quote.index_price,
+                funding_rate=quote.funding_rate,
+                funding_interval_hours=quote.funding_interval_hours,
+                contract_month=quote.contract_month,
+                volume_24h=quote.volume_24h,
+                ts=quote.timestamp,
+            )
+        except Exception as e:
+            logger.error(f"[{pair_id}/{leg}] leg_prices save failed: {e}")
+
+        # 양쪽 leg 모두 있으면 basis 계산 + 콜백
+        leg_a = self._latest_quote.get((pair_id, "a"))
+        leg_b = self._latest_quote.get((pair_id, "b"))
+        if leg_a is None or leg_b is None:
+            return
+
+        basis_bps = self._compute_pair_basis(leg_a, leg_b)
+        if basis_bps is None:
+            return
+
+        # 콜백 fan-out
+        for cb in self._pair_callbacks:
+            try:
+                result = cb(pair_id, basis_bps, leg_a, leg_b)
+                if result is not None and asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception as e:
+                logger.error(f"[{pair_id}] pair callback error: {e}")
+
+    @staticmethod
+    def _compute_pair_basis(leg_a: Quote, leg_b: Quote) -> Optional[float]:
+        """양 leg의 orderbook-mid 기반 basis (bp). leg_b 가격이 0이면 None.
+
+        호가 누락 시 mid_price fallback (mark/last 등 ExchangeBase가 채운 값).
+        엔진은 별도 exec_filter로 진입 차단하므로 stats 흐름만 유지.
+        """
+        # orderbook mid 우선
+        if leg_a.bid > 0 and leg_a.ask > 0 and leg_b.bid > 0 and leg_b.ask > 0:
+            a_mid = (leg_a.bid + leg_a.ask) / 2
+            b_mid = (leg_b.bid + leg_b.ask) / 2
+        else:
+            a_mid = leg_a.mid_price
+            b_mid = leg_b.mid_price
+        if b_mid <= 0:
+            return None
+        return (a_mid - b_mid) / b_mid * 10_000
+
+    def latest_pair_quote(self, pair_id: str, leg: str) -> Optional[Quote]:
+        """캐시된 최신 Quote 반환."""
+        return self._latest_quote.get((pair_id, leg))
+
+    def has_both_legs(self, pair_id: str) -> bool:
+        return (pair_id, "a") in self._latest_quote and (pair_id, "b") in self._latest_quote
 
     async def start(self):
         """데이터 수집 시작."""
