@@ -440,6 +440,11 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         rollover_watch_loop(kis_client, config, kis_subs, stop_event)
     )
 
+    # 대시보드용 engine_state 스냅샷 (30초마다 DB에 dump)
+    state_snapshot_task = asyncio.create_task(
+        engine.state_snapshot_loop(interval_seconds=30, stop_event=stop_event)
+    )
+
     logger.info("Paper trading engine started — waiting for signals...")
     await stop_event.wait()
 

@@ -13,15 +13,16 @@ from __future__ import annotations
 """
 
 
+import asyncio
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import date
 from typing import Optional, Callable
 
 from src.strategy.signals import SignalGenerator, Signal, SignalType, PositionState
 from src.risk.manager import RiskManager, RiskCheck
-from src.data.storage import Storage
+from src.data.storage import Storage, LEGACY_PRODUCT_PAIR_MAP
 from src.exchange.kiwoom import KiwoomBase, FuturesOrder
 from src.utils.config import AppConfig, StrategyConfig, RiskConfig
 
@@ -709,6 +710,64 @@ class PaperTradingEngine:
     def get_state(self) -> EngineState:
         """엔진 상태 반환."""
         return self._state
+
+    # ── State snapshot loop (Phase M1, 대시보드용) ──
+
+    def snapshot_state_to_db(self) -> int:
+        """현재 EngineState + 페어별 basis 통계를 engine_state 테이블에 1 row INSERT.
+
+        반환: 작성된 row 수 (페어 수). 호출자가 주기적으로 부르거나 백그라운드
+        루프에서 호출.
+        """
+        n = 0
+        state_dict = asdict(self._state)
+        for product in self.config.products:
+            pair_id = LEGACY_PRODUCT_PAIR_MAP.get(product, product)
+            try:
+                basis_stats = self.signal_gen.get_basis_stats(product)
+            except Exception:
+                basis_stats = None
+            try:
+                self.storage.save_engine_state(pair_id, state_dict, basis_stats)
+                n += 1
+            except Exception as e:
+                logger.error(f"engine_state save failed [{pair_id}]: {e}")
+        return n
+
+    async def state_snapshot_loop(
+        self,
+        interval_seconds: int = 30,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """백그라운드: 매 N초마다 engine_state 스냅샷 dump.
+
+        main.py가 `asyncio.create_task(engine.state_snapshot_loop(stop_event=...))`
+        로 기동. stop_event.set()으로 종료.
+        """
+        logger.info(f"[STATE_SNAPSHOT] loop started (interval={interval_seconds}s)")
+        # 부팅 직후 첫 스냅샷
+        try:
+            self.snapshot_state_to_db()
+        except Exception as e:
+            logger.error(f"state_snapshot_loop initial dump error: {e}")
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                logger.info("[STATE_SNAPSHOT] loop stopped")
+                return
+            try:
+                if stop_event is not None:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    if stop_event.is_set():
+                        return
+                else:
+                    await asyncio.sleep(interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                self.snapshot_state_to_db()
+            except Exception as e:
+                logger.error(f"state_snapshot_loop dump error: {e}")
 
     def get_open_trades(self) -> dict[str, TradeRecord]:
         """현재 오픈 트레이드."""

@@ -178,7 +178,7 @@ def test_legacy_data_backfilled_with_pair_id(legacy_v1_db_path):
 def test_legacy_db_creates_backup(legacy_v1_db_path):
     s = Storage(legacy_v1_db_path)
     s.connect()
-    backup_path = f"{legacy_v1_db_path}.pre-v{SCHEMA_VERSION}.bak"
+    backup_path = f"{legacy_v1_db_path}.pre-v2.bak"
     assert Path(backup_path).exists()
     # 백업이 실제 v1 데이터 보유
     bcon = sqlite3.connect(backup_path)
@@ -229,7 +229,7 @@ def test_migration_idempotent_second_connect_no_change(legacy_v1_db_path):
 def test_migration_backup_not_overwritten_on_second_run(legacy_v1_db_path):
     s = Storage(legacy_v1_db_path)
     s.connect()
-    backup_path = f"{legacy_v1_db_path}.pre-v{SCHEMA_VERSION}.bak"
+    backup_path = f"{legacy_v1_db_path}.pre-v2.bak"
     backup_mtime_1 = os.path.getmtime(backup_path)
     s.close()
 

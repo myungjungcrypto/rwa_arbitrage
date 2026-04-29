@@ -138,6 +138,30 @@ class SignalGenerator:
             self._positions[product] = PositionState(product=product)
         return self._positions[product]
 
+    def get_basis_stats(self, product: str, window: int | None = None) -> dict:
+        """현재 basis 히스토리에서 mean/std/min/max/count 계산.
+
+        Phase M1: 대시보드 engine_state 스냅샷용.
+        window: 최근 N 포인트만 사용 (None=전체 deque, 기본 24h window).
+        """
+        history = self._basis_history.get(product)
+        if not history:
+            return {"mean": None, "std": None, "min": None, "max": None, "count": 0}
+        data = list(history) if window is None else list(history)[-window:]
+        n = len(data)
+        if n == 0:
+            return {"mean": None, "std": None, "min": None, "max": None, "count": 0}
+        mean = sum(data) / n
+        variance = sum((x - mean) ** 2 for x in data) / n
+        std = math.sqrt(max(0.0, variance))
+        return {
+            "mean": mean,
+            "std": std,
+            "min": min(data),
+            "max": max(data),
+            "count": n,
+        }
+
     def update_basis(
         self, product: str, basis_bps: float, funding_rate: float = 0.0,
         perp_bid: float = 0.0, perp_ask: float = 0.0,

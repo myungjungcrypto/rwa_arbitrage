@@ -25,7 +25,7 @@ logger = logging.getLogger("arbitrage.storage")
 # Schema version
 # ──────────────────────────────────────────────
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # legacy product → pair_id 매핑 (Phase B backward compat)
 LEGACY_PRODUCT_PAIR_MAP = {
@@ -231,6 +231,41 @@ MIGRATION_V2_BACKFILL = [
 ]
 
 
+# ──────────────────────────────────────────────
+# Migration v3 — engine_state snapshot 테이블 (대시보드용)
+# ──────────────────────────────────────────────
+#
+# 봇이 30초마다 EngineState dataclass + 최근 basis 통계를 dump.
+# Streamlit 대시보드가 이 테이블을 읽어 live counter 표시.
+# additive only — 백업 불필요 (v2에서 이미 백업됨).
+
+MIGRATION_V3_ENGINE_STATE = """
+CREATE TABLE IF NOT EXISTS engine_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    total_signals INTEGER DEFAULT 0,
+    total_entries INTEGER DEFAULT 0,
+    total_exits INTEGER DEFAULT 0,
+    rejected_by_risk INTEGER DEFAULT 0,
+    failed_orders INTEGER DEFAULT 0,
+    open_positions INTEGER DEFAULT 0,
+    closed_trades INTEGER DEFAULT 0,
+    cumulative_pnl_usd REAL DEFAULT 0,
+    entry_signals_generated INTEGER DEFAULT 0,
+    entry_exec_filter_skip INTEGER DEFAULT 0,
+    entry_warmup_skip INTEGER DEFAULT 0,
+    entry_min_abs_skip INTEGER DEFAULT 0,
+    basis_mean_bps REAL,
+    basis_std_bps REAL,
+    basis_min_bps REAL,
+    basis_max_bps REAL,
+    basis_n INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_engine_state_pair_ts ON engine_state(pair_id, ts);
+"""
+
+
 class Storage:
     """SQLite 저장소 관리."""
 
@@ -304,7 +339,11 @@ class Storage:
             backup_conn.close()
 
     def _auto_migrate(self) -> None:
-        """현재 버전이 SCHEMA_VERSION 미만이면 단계별 마이그레이션 실행."""
+        """현재 버전이 SCHEMA_VERSION 미만이면 단계별 마이그레이션 실행.
+
+        백업 정책: v1 → v2는 ALTER TABLE 다수라 위험 → 백업.
+        v2 → v3는 CREATE TABLE only (additive) → 백업 불필요.
+        """
         # schema_meta 테이블은 항상 생성 (v1 DB도 OK)
         self.conn.executescript(MIGRATION_V2_SCHEMA_META)
         self.conn.commit()
@@ -316,11 +355,17 @@ class Storage:
         had_data = self._has_data()
         if had_data:
             logger.warning(f"Migrating DB from v{current} to v{SCHEMA_VERSION}")
-            self._backup_once(SCHEMA_VERSION)
+            # v1에서 시작할 때만 백업 (v1→v2 단계에 ALTER TABLE 다수 포함)
+            if current < 2:
+                self._backup_once(2)
 
         # v1 → v2
         if current < 2:
             self._migrate_to_v2()
+
+        # v2 → v3 (additive only — engine_state 추가, 백업 불필요)
+        if current < 3:
+            self._migrate_to_v3()
 
         # 버전 기록
         self.conn.execute(
@@ -344,6 +389,11 @@ class Storage:
         cur.executescript(MIGRATION_V2_SEED_LEGACY_PAIR)
         for stmt in MIGRATION_V2_BACKFILL:
             cur.execute(stmt)
+        self.conn.commit()
+
+    def _migrate_to_v3(self) -> None:
+        """v2 → v3: engine_state 스냅샷 테이블 신규 (additive only)."""
+        self.conn.executescript(MIGRATION_V3_ENGINE_STATE)
         self.conn.commit()
 
     # ── 시세 저장 ──
@@ -786,3 +836,86 @@ class Storage:
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Engine state snapshot (Phase M1, 대시보드용) ──
+
+    def save_engine_state(
+        self,
+        pair_id: str,
+        state: dict,
+        basis_stats: dict | None = None,
+        ts: float | None = None,
+    ) -> int:
+        """EngineState dataclass + 최근 basis 통계를 1 row로 INSERT.
+
+        engine.state_snapshot_loop이 30초마다 호출. 대시보드는 이 row를 polling.
+
+        Args:
+            pair_id: e.g. 'wti_cme_hl'
+            state: EngineState 필드 dict (asdict(engine._state))
+            basis_stats: {'mean': .., 'std': .., 'min': .., 'max': .., 'count': ..} 옵션
+        """
+        ts = ts or time.time()
+        bs = basis_stats or {}
+        cursor = self.conn.execute(
+            """INSERT INTO engine_state
+                 (pair_id, ts,
+                  total_signals, total_entries, total_exits,
+                  rejected_by_risk, failed_orders,
+                  open_positions, closed_trades, cumulative_pnl_usd,
+                  entry_signals_generated, entry_exec_filter_skip,
+                  entry_warmup_skip, entry_min_abs_skip,
+                  basis_mean_bps, basis_std_bps, basis_min_bps, basis_max_bps,
+                  basis_n)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                pair_id, ts,
+                state.get("total_signals", 0),
+                state.get("total_entries", 0),
+                state.get("total_exits", 0),
+                state.get("rejected_by_risk", 0),
+                state.get("failed_orders", 0),
+                state.get("open_positions", 0),
+                state.get("closed_trades", 0),
+                state.get("cumulative_pnl_usd", 0.0),
+                state.get("entry_signals_generated", 0),
+                state.get("entry_exec_filter_skip", 0),
+                state.get("entry_warmup_skip", 0),
+                state.get("entry_min_abs_skip", 0),
+                bs.get("mean"),
+                bs.get("std"),
+                bs.get("min"),
+                bs.get("max"),
+                bs.get("count"),
+            ),
+        )
+        self.conn.commit()
+        return cursor.lastrowid  # type: ignore
+
+    def get_latest_engine_state(self, pair_id: str) -> dict | None:
+        """가장 최근 engine_state 1건. 없으면 None."""
+        row = self.conn.execute(
+            "SELECT * FROM engine_state WHERE pair_id = ? ORDER BY ts DESC LIMIT 1",
+            (pair_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_engine_state_history(self, pair_id: str, hours: float = 24) -> list[dict]:
+        """최근 N시간 engine_state 시계열 (대시보드 funnel/trend 차트용)."""
+        since = time.time() - hours * 3600
+        rows = self.conn.execute(
+            """SELECT * FROM engine_state
+                 WHERE pair_id = ? AND ts >= ?
+                 ORDER BY ts ASC""",
+            (pair_id, since),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def cleanup_engine_state_older_than(self, days: float = 30) -> int:
+        """오래된 snapshot 정리 (운영 도구). 반환: 삭제 row 수."""
+        cutoff = time.time() - days * 86400
+        cur = self.conn.execute(
+            "DELETE FROM engine_state WHERE ts < ?", (cutoff,)
+        )
+        self.conn.commit()
+        return cur.rowcount
