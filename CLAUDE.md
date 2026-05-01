@@ -1,262 +1,367 @@
-# RWA Arbitrage Bot — Oil Perpetual vs Monthly Futures
+# RWA Arbitrage Bot — Multi-Exchange Oil Basis & Spread Arbitrage
 
 ## 프로젝트 개요
 
-trade.xyz(Hyperliquid 기반)의 원유 퍼페추얼 선물과, 해당 퍼프가 인덱스로 추적하는 CME 월물 선물 간의 베이시스 차익거래(basis arbitrage) 봇.
+원유(WTI) 페이퍼 트레이딩 봇. 5개 거래소를 허브-스포크 구조로 연결한 멀티 베뉴 차익거래.
 
-### 대상 상품
+- **Web2-Web3 (운영 중)**: trade.xyz(Hyperliquid) WTI perp ↔ KIS MCL 월물
+- **Web3-Web3 (확장 진행 중)**: Hyperliquid 허브 ↔ Lighter / Binance / Bybit / OKX 페어
 
-| 구분 | 퍼페추얼 (trade.xyz) | 월물 (KIS 한국투자증권) | 거래소 |
-|------|----------------------|------------------------|--------|
-| WTI | WTIOIL (ticker: CL perp) | MCL 근월물 (마이크로, 100배럴) | NYMEX/CME |
-| Brent | BRENTOIL (ticker: BZ perp) | BZ 근월물 (1,000배럴) | ICE/CME |
+5개 거래소 모두 WTI perp 상장 확인 (2026-04-21 검증).
+모든 페어가 HL을 leg_a 허브로 사용 → 단일 USDC 잔고로 전환 + leg_b 다양화.
+
+### 거래소별 perp 사양 (확인 완료)
+
+| 거래소 | 심볼 | Funding | Margin | 비고 |
+|---|---|---|---|---|
+| Hyperliquid (trade.xyz) | XYZ:CL | 1h | USDC | HIP-3 |
+| Lighter | WTI | 1h | USDC | zkEVM L2 |
+| Binance | CLUSDT | 4h | USDT | 100x, 2026-04-01 런칭 |
+| Bybit | CLUSDT | 4h | USDT | 50x, 2026-03-27 런칭 |
+| OKX | CL-USDT-SWAP | 4h | USDT | — |
+| KIS (CME 월물) | MCL 근월물 | — | KRW 환산 | 100배럴/계약, dated futures |
 
 ### 핵심 메커니즘
 
-- trade.xyz 퍼프는 CME 근월물 가격을 오라클 인덱스로 사용
-- 매월 5~10 영업일에 롤오버 (가중 전환 방식)
-- 펀딩레이트: 매시간 정산, 연간 ~5% (전통자산 0.5x 스케일링)
-- 베이시스(perp price - index price) 확대 시 진입, 수렴 시 청산
+- trade.xyz 퍼프는 CME 근월물 가격을 oracle 인덱스로 사용 (HIP-3)
+- CME 근월물은 매월 5~10 영업일에 차월물로 가중 롤오버 (오라클 자동 전환)
+- 베이시스(perp price - 상대 leg price) 확대 시 진입, 수렴 시 청산
+- 양 leg 동시 발주 (`asyncio.gather`)로 한쪽만 체결 위험 최소화
+- 펀딩 비대칭 위험 회피를 위해 **CME 휴장 시 전체 페어 OFF** (Strict gate)
 
 ---
 
-## Phase 1: 인프라 구축 및 데이터 수집
+## 아키텍처
 
-### 1.1 Hyperliquid API 연동
-- **SDK**: `pip install hyperliquid-python-sdk`
-- **GitHub**: https://github.com/hyperliquid-dex/hyperliquid-python-sdk
-- **테스트넷 사용**: `constants.TESTNET_API_URL` 로 페이퍼 트레이딩
-- **필요 기능**:
-  - 시세 조회 (mark price, index price, funding rate)
-  - 오더북 조회
-  - 주문 생성/취소/조회
-  - 포지션 조회
-  - WebSocket 실시간 데이터
-
-### 1.2 KIS (한국투자증권) 해외선물 REST/WebSocket API 연동
-- **개발자 포털**: https://apiportal.koreainvestment.com/intro
-- **GitHub**: https://github.com/koreainvestment/open-trading-api
-- **Python 라이브러리**: `python-kis` (PyPI)
-- **장점**: REST/WebSocket 기반 → Linux EC2에서 직접 구동 가능 (Windows 불필요)
-- **필요 기능**:
-  - MCL, BZ 월물 실시간 호가(bid/ask) 조회 (WebSocket `HDFFF010`)
-  - 실시간 체결가 조회 (WebSocket `HDFFF020`)
-  - 현재가 REST 조회 (`HHDFC55010000`, `HHDFC86000000`)
-  - 주문 생성/취소/조회 (REST)
-  - 잔고/증거금 조회
-- **전제조건**: KIS 계좌 개설, API 키 발급, CME 유료시세 신청 필수
-
-### 1.3 데이터 파이프라인
-- Hyperliquid: WebSocket으로 실시간 mark price, index price, funding rate 수신
-- KIS: WebSocket으로 실시간 MCL/BZ 호가(bid/ask) 수신 → `collector.update_futures_price()` 호출
-- **핵심**: Perp(Hyperliquid)와 Futures(KIS)가 **독립적 데이터 소스**에서 수신되어야 진짜 basis 측정 가능
-- 통합 데이터 저장: SQLite
-- 베이시스 계산: `basis = perp_mark_price - futures_price`
-- 펀딩레이트 누적 추적
-
----
-
-## Phase 2: 페이퍼 트레이딩 봇
-
-### 2.1 아키텍처
+현 상태: **레거시 product-keyed 경로 + 신규 pair-keyed 경로 병존**.
+Phase C5(진행 중)에서 main.py가 pair-keyed로 switch하면 레거시 경로는 deprecated.
 
 ```
-┌─────────────────┐     ┌──────────────────┐
-│  Hyperliquid WS │────▶│                  │
-│  (perp data)    │     │   Arbitrage      │
-└─────────────────┘     │   Engine         │
-                        │                  │
-┌─────────────────┐     │  - Basis Calc    │──▶ Paper Trade Logger
-│  KIS WebSocket  │────▶│  - Signal Gen    │──▶ PnL Tracker
-│  (futures data) │     │  - Risk Mgmt     │──▶ Dashboard
-└─────────────────┘     │                  │
-                        └──────────────────┘
+┌─────────────────┐     ┌──────────────────────────┐
+│ Hyperliquid WS  │────▶│                          │
+│ Lighter WS      │────▶│  ExchangeBase adapters   │
+│ Binance WS      │────▶│  (Phase D-G에서 합류)    │
+│ Bybit WS        │────▶│                          │
+│ OKX WS          │────▶│         │                │
+│ KIS WS (CME)    │────▶└─────────┼────────────────┘
+└─────────────────┘               │
+                                  ▼
+                    ┌──────────────────────────────┐
+                    │  DataCollector               │
+                    │  - register_pair             │
+                    │  - update_leg_quote          │
+                    │  - on_pair_basis callback    │
+                    └────────┬─────────────────────┘
+                             │ (pair_id, basis_bps, leg_a, leg_b)
+                             ▼
+                    ┌──────────────────────────────┐
+                    │  PaperTradingEngine          │
+                    │  - process_pair_basis_update │
+                    │  - SignalGenerator (per-pair)│
+                    │  - exec_filter + min_abs gate│
+                    │  - dispatch_pair_order       │
+                    │    (per-exchange Semaphore)  │
+                    └────────┬─────────────────────┘
+                             │
+                  ┌──────────┼──────────┐
+                  ▼          ▼          ▼
+              SQLite     Streamlit   PM2 logs
+              (v3)       Dashboard
 ```
 
-### 2.2 전략 로직
+### 주요 design 결정
 
-1. **베이시스 모니터링**: `basis = perp_price - futures_index_price`
-2. **진입 조건**:
-   - Long basis (perp > futures): Perp SHORT + Futures LONG
-   - Short basis (perp < futures): Perp LONG + Futures SHORT
-   - 진입 임계값: 과거 N시간 베이시스 평균 ± K*σ
-3. **청산 조건**:
-   - 베이시스가 평균으로 회귀 시
-   - 또는 목표 수익률 도달 시
-4. **펀딩레이트 수익**: 포지션 방향에 따라 펀딩 수취/지급 고려
-5. **롤오버 관리**: 매월 5~10 영업일 롤 기간에는 포지션 축소 또는 헤지
-
-### 2.3 리스크 관리
-
-- 최대 포지션 사이즈 제한
-- 양쪽 레그 동시 체결 보장 (한쪽만 체결 시 긴급 청산)
-- 마진 사용률 모니터링 (양 거래소)
-- 슬리피지 제한
-- 롤오버 기간 리스크 별도 관리
-- 네트워크 장애 대응 (자동 헤지/청산)
-
-### 2.4 페이퍼 트레이딩 구현
-
-- Futures 시세: KIS WebSocket 실시간 호가 (실제 CME bid/ask)
-- Perp 시세: Hyperliquid WebSocket (실제 orderbook)
-- 주문 시뮬레이션: KiwoomMock (paper trading 주문용으로 유지)
-- 시뮬레이션 로그: 모든 신호/주문/체결/PnL 기록
-- 일일 리포트 자동 생성
-
----
-
-## Phase 3: 실거래 전환
-
-### 3.1 사전 체크리스트
-
-- [ ] 페이퍼 트레이딩 최소 2주 이상 안정 운영
-- [ ] 수익성 검증 (수수료, 슬리피지, 펀딩 포함)
-- [ ] 에지 케이스 테스트 (롤오버, 급변동, 네트워크 장애)
-- [ ] Hyperliquid 메인넷 API 키 발급
-- [ ] KIS 실투자 계좌 해외선물 거래 개설
-- [ ] USDC 입금 및 해외선물 증거금 확보
-- [ ] 최소 금액으로 라이브 테스트 (1계약)
-
-### 3.2 운영 모드 전환
-
-- 환경변수로 `PAPER` / `LIVE` 모드 전환
-- 라이브 모드: 실제 API 엔드포인트 + 실계좌
-- 알림 시스템: Telegram/Discord 봇 연동 (주문 체결, 에러, PnL)
-
-### 3.3 모니터링 & 운영
-
-- Grafana 대시보드: 실시간 베이시스, 포지션, PnL, 펀딩
-- 자동 알림: 이상 감지 시 Telegram 알림
-- 일일/주간 PnL 리포트
-- 로그 중앙화 (파일 + 원격)
+- **`ExchangeBase` Protocol**: 모든 거래소 어댑터 공통 인터페이스 (connect/subscribe_quotes/place_order/get_funding_info 등). 어댑터 추가 시 main loop 수정 불필요.
+- **`ArbitragePair` first-class**: `(leg_a: ExchangeLeg, leg_b: ExchangeLeg, gate, params)` dataclass. AppConfig에서 자동 합성 또는 settings.yaml에서 명시.
+- **Orderbook-mid 기반 basis 신호**: HL `mark_price`는 oracle 추적이라 자체 orderbook과 ~20bp 괴리 가능. 모든 신호 계산은 `(bid+ask)/2` 기반.
+- **`min_abs_entry_bps` floor**: 통계 신호와 무관한 절대값 floor (현재 10bp). statistical band 통과해도 |exec_basis| < 10bp면 진입 차단.
+- **Strict CME gate**: Web3-Web3 페어도 CME 휴장 시 OFF (월-목 1h break + 주말/휴일 모두). 펀딩 시스템 비대칭 위험 회피.
+- **Per-exchange Semaphore(1)**: 동시 진입 충돌 방지. HL이 모든 페어의 leg_a라 단일 거래소 in-flight 1건 보장.
+- **Additive DB 마이그레이션**: rename/drop 없이 컬럼만 추가. 자동 마이그레이션 + 1회 백업 (`*.pre-v2.bak`).
 
 ---
 
 ## 기술 스택
 
 | 구분 | 기술 |
-|------|------|
+|---|---|
 | 언어 | Python 3.11+ |
 | Hyperliquid | `hyperliquid-python-sdk` (HIP-3 perp: trade.xyz) |
-| 해외선물 (KIS) | REST + WebSocket API (Linux 네이티브) |
-| 데이터 저장 | SQLite |
-| 스케줄링 | asyncio |
-| 모니터링 | Grafana + Prometheus |
-| 알림 | Telegram Bot API |
-| 환경 | EC2 Linux (Amazon Linux 2023) |
+| KIS | REST + WebSocket API (Linux 네이티브) |
+| 데이터 저장 | SQLite (schema v3) |
+| 비동기 | asyncio |
+| 대시보드 | Streamlit + pandas + Plotly |
+| 알림 | Telegram Bot (예정) |
+| 환경 | EC2 Linux (Amazon Linux 2023), PM2 |
 
 ---
 
 ## 디렉토리 구조
 
-**로컬 프로젝트 루트**: `/Users/myunggeunjung/rwa_arbitrage/`
 **EC2 프로젝트 루트**: `~/rwa_arbitrage/`
 
-> 참고: 상위에 중첩 폴더 없이 `rwa_arbitrage/` 가 git repo 루트이자 프로젝트 루트임.
-
 ```
-rwa_arbitrage/   ← git repo root
-├── CLAUDE.md                  # 이 파일
+rwa_arbitrage/
+├── CLAUDE.md                     # 이 파일 (live 진행 상황 추적)
 ├── config/
-│   ├── settings.yaml          # 전략 파라미터, 임계값
-│   └── secrets.yaml           # API 키 (gitignore)
+│   ├── settings.yaml             # 전략 파라미터, 페어 정의
+│   └── secrets.yaml              # API 키 (gitignore)
 ├── src/
 │   ├── exchange/
-│   │   ├── hyperliquid.py     # Hyperliquid API 래퍼 (trade.xyz perp)
-│   │   ├── kis.py             # KIS 한국투자증권 REST/WebSocket (해외선물 실시간 호가)
-│   │   └── kiwoom.py          # KiwoomMock (paper trading 주문 시뮬레이션용)
+│   │   ├── base.py               # ExchangeBase protocol + Quote/OrderResult/Position dataclass
+│   │   ├── registry.py           # ExchangeRegistry (factory)
+│   │   ├── hyperliquid.py        # HL 클라이언트 + HyperliquidExchange adapter
+│   │   ├── kis.py                # KIS 클라이언트 + KISExchange adapter
+│   │   ├── kiwoom.py             # KiwoomMock (paper-only, KIS 주문 시뮬)
+│   │   ├── binance.py            # (Phase E 예정)
+│   │   ├── bybit.py              # (Phase F 예정)
+│   │   ├── okx.py                # (Phase G 예정)
+│   │   └── lighter.py            # (Phase D 예정)
 │   ├── strategy/
-│   │   ├── basis_arb.py       # 베이시스 차익거래 로직
-│   │   └── signals.py         # 진입/청산 시그널
-│   ├── risk/
-│   │   └── manager.py         # 리스크 관리
+│   │   ├── signals.py            # SignalGenerator (pair-keyed alias 포함)
+│   │   ├── pair.py               # ArbitragePair / ExchangeLeg / PairGate / PairStrategyParams
+│   │   ├── market_hours.py       # CME 장 시간 가드
+│   │   ├── rollover.py           # 자동 월물 롤오버
+│   │   ├── funding_monitor.py    # 거래소 펀딩 주기 런타임 검증
+│   │   └── basis_arb.py
 │   ├── data/
-│   │   ├── collector.py       # 실시간 데이터 수집
-│   │   └── storage.py         # DB 저장
+│   │   ├── collector.py          # 레거시 + pair-keyed API
+│   │   └── storage.py            # SQLite (schema v3 자동 마이그레이션)
 │   ├── paper/
-│   │   └── simulator.py       # 페이퍼 트레이딩 엔진
+│   │   └── engine.py             # 레거시 + pair-keyed entry/exit + state snapshot
+│   ├── risk/
+│   │   └── manager.py
 │   └── utils/
-│       ├── logger.py          # 로깅
-│       └── notifier.py        # 알림 (Telegram)
-├── tests/
-│   ├── test_basis_calc.py
-│   ├── test_order_flow.py
-│   └── test_risk.py
-├── notebooks/
-│   └── basis_analysis.ipynb   # 베이시스 분석/백테스트
-├── data/
-│   └── historical/            # 과거 데이터
+│       ├── config.py             # AppConfig.get_pairs() synthesizer
+│       └── logger.py
+├── dashboard/
+│   ├── app.py                    # Streamlit 엔트리
+│   ├── queries.py                # 모든 SQL → pandas
+│   ├── charts.py                 # Plotly figures
+│   └── README.md                 # 설치/실행/SSH 터널 가이드
+├── scripts/
+│   ├── analyze_paper.py
+│   ├── diagnose_drift.py
+│   ├── close_zombies.py
+│   ├── migrate_storage.py
+│   └── run_backtest.py
+├── tests/                        # pytest, 270+ tests
 └── requirements.txt
 ```
-
----
-
-## 주요 고려사항
-
-### 롤오버 리스크
-- trade.xyz 퍼프 인덱스는 매월 5~10 영업일에 가중 롤오버
-- 이 기간 동안 인덱스 가격 = w1 * 근월물 + w2 * 차월물
-- 키움 쪽 월물도 동일 시점에 롤오버 필요 → 슬리피지/갭 리스크
-
-### 시간대 차이
-- Hyperliquid: 24/7 거래
-- CME 선물: 주중 거의 23시간 (일요일 오후~금요일 오후 CT)
-- 주말/공휴일에는 퍼프만 거래 가능 → 헤지 불가 구간 존재
-
-### 수수료 구조
-- Hyperliquid (trade.xyz): taker ~0.09bp (HIP-3)
-- KIS 해외선물: MCL ~$2.50/계약, BZ ~$7.50/계약
-- 펀딩레이트: 시간당 정산, 포지션 방향에 따라 수취 또는 지급
-
-### 자본 효율성
-- Hyperliquid: USDC 담보, 최대 10x 레버리지
-- CME 선물: 증거금 제도 (CL ~$6,000/계약, BZ ~$5,500/계약)
-- 양쪽 모두 증거금 확보 필요 → 자본 배분 전략 중요
 
 ---
 
 ## 마일스톤
 
 | 단계 | 목표 | 상태 |
-|------|------|------|
-| M1 | ✅ Hyperliquid API 연동 + 시세 수집 | 완료 |
-| M2 | ✅ KiwoomMock 기반 페이퍼 트레이딩 + 데이터 수집 | 완료 |
-| M3 | ✅ 베이시스 분석 + 파라미터 튜닝 | 완료 |
-| M4 | ✅ 계약 사이징 현실화 (MCL 100배럴, BZ 1000배럴) | 완료 |
-| M5 | ✅ KIS API 연동 (실시간 MCL 호가, WebSocket) | 완료 |
-| M6 | ✅ executable basis 검증 + 백테스트 그리드서치 | 완료 |
-| M7 | ✅ exit 전략 개선 (스프레드 수렴 기반 청산) | 완료 |
-| M8 | ✅ 자동 롤오버 + 좀비 포지션 정리 (2026-04-17) | 완료 |
-| M9 | 페이퍼 트레이딩 수익성 재검증 (2주+, 롤오버 버그 수정 후) | **현재 진행** |
-| M10 | KIS 주문 API 연동 → 실거래 전환 (최소 규모) | - |
-| M11 | 실거래 안정화 + 스케일업 | 지속 |
+|---|---|---|
+| M1 | Hyperliquid API 연동 + 시세 수집 | ✅ |
+| M2 | KiwoomMock 기반 페이퍼 트레이딩 + 데이터 수집 | ✅ |
+| M3 | 베이시스 분석 + 파라미터 튜닝 | ✅ |
+| M4 | 계약 사이징 현실화 (MCL 100배럴) | ✅ |
+| M5 | KIS API 연동 (실시간 MCL 호가, WebSocket) | ✅ |
+| M6 | executable basis 검증 + 백테스트 그리드서치 | ✅ |
+| M7 | exit 전략 개선 (스프레드 수렴 기반 청산) | ✅ |
+| M8 | 자동 롤오버 + 좀비 포지션 정리 | ✅ |
+| M9 | 페이퍼 트레이딩 수익성 재검증 (롤오버 픽스 후) | ✅ — 발견된 추가 버그 모두 수정 |
+| **M10** | **멀티 거래소 통합 (Web2-Web3 + Web3-Web3)** | **진행 중 (Phase C5)** |
+| M11 | KIS 주문 API 연동 → 실거래 전환 (최소 규모) | - |
+| M12 | 실거래 안정화 + 스케일업 | - |
+
+### M10 sub-phase 상세
+
+| 단계 | 작업 | 상태 |
+|---|---|---|
+| **A** | `ExchangeBase` protocol + `ArbitragePair` scaffolding + adapter 래퍼 | ✅ |
+| **A+** | `FundingIntervalMonitor` (거래소 펀딩 주기 런타임 검증) | ✅ |
+| **B** | DB schema v2 (additive 마이그레이션, pair_id 컬럼 + leg_prices 테이블) | ✅ |
+| **C1** | `AppConfig.get_pairs()` synthesizer | ✅ |
+| **C2** | `DataCollector` pair-keyed API (`register_pair`, `update_leg_quote`) | ✅ |
+| **C3** | `SignalGenerator` pair-keyed alias 메서드 | ✅ |
+| **C4a** | `PaperTradingEngine` 인프라 (registry, dispatch helper, Semaphore) | ✅ |
+| **C4b** | pair-keyed entry/exit flow (`process_pair_basis_update`) | ✅ |
+| **C5** | `main.py` 배선 — pair-keyed 경로로 switch | **현재 작업** |
+| D | Lighter 어댑터 + `wti_hl_lighter` 페어 (shadow → live) | - |
+| E | Binance 어댑터 + `wti_hl_binance` 페어 | - |
+| F | Bybit 어댑터 + `wti_hl_bybit` 페어 | - |
+| G | OKX 어댑터 + `wti_hl_okx` 페어 | - |
+| H | 5개 페어 동시 paper + per-pair risk cap + 멀티 페어 리포트 | - |
+
+### M (Monitoring) sub-phase
+
+| 단계 | 작업 | 상태 |
+|---|---|---|
+| M1 | DB schema v3 (engine_state 스냅샷 테이블) + 봇 30s dump 루프 | ✅ |
+| M2 | Streamlit 대시보드 (queries + charts + Streamlit UI) | ✅ |
+| M3 | `requirements.txt` + EC2 PM2 등록 + SSH 터널 접속 | ✅ |
 
 ---
 
-## 현재 이슈 및 방향 (2026-04-17)
+## 현재 진행 (2026-04-29)
 
-### M8 완료: 자동 롤오버 + 좀비 정리 (롤오버 버그 수정)
-- **발견**: 2주 페이퍼 트레이딩 결과 closed realized -$292.84 + funding +$176.74
-  + open unrealized -$16,130 = **총 -$16,246** 손실
-- **근본 원인**: trade.xyz HIP-3 oracle은 매월 5~10 영업일에 근월→차월 가중 롤오버.
-  2026-04 window는 4/7~4/14. KIS 구독은 `settings.yaml`에서 MCLK26(5월물)에
-  하드코딩되어, 4/14 이후 perp는 MCLM26 추종, KIS는 MCLK26 추종 → 구조적 -365bp 괴리
-- **수정 (P0)**: `kis_symbol_map: wti: MCLM26` 교체 + `scripts/close_zombies.py`로
-  마크투마켓 청산 + `scripts/diagnose_drift.py`로 drift 진단 가능
-- **수정 (P1)**: `src/strategy/rollover.py` `get_active_contract()` 가 매시간
-  활성 contract 재계산. `src/exchange/kis.py` `resubscribe()` 로 KIS 구독
-  원자적 교체. `main.py` `rollover_watch_loop` 태스크가 watch & 자동 전환.
-- **WTI/MCL 계약 구조 주의**: `front_month_offset=1`. 캘린더 4월의 front는
-  MCLK26(5월물 = May delivery). roll_end_day(BD 10) 초과 시 +1 advance → MCLM26.
+**Phase C5 — `main.py` 배선**
 
-### 다음 단계: M9 — 페이퍼 트레이딩 수익성 재검증 (2주+)
-- 좀비 정리 후 신규 2주 세션 (롤오버 자동화 상태에서)
-- 다음 roll window: 2026-05-07 ~ 2026-05-14 (MCLM26 → MCLN26)
-- 이 기간 자동 롤오버 작동 실시간 관측 필요 (watch loop 로그에서 resubscribe 확인)
-- M7 스프레드 수렴 exit (`convergence_target_bps: 3`, `max_hold_hours: 48`) 그대로 유지
+목표: main.py가 다음 항목을 신규 경로로 switch
+- `cfg.get_pairs()`로 `ArbitragePair` 리스트 합성
+- `ExchangeRegistry` 생성, `HyperliquidExchange` + `KISExchange` 어댑터 등록
+- `engine.set_exchange_registry(reg)` + `engine.register_pair(pair)`
+- `collector.register_pair(pair)` + `collector.on_pair_basis(engine.process_pair_basis_update)`
+- 레거시 `engine.process_basis_update` 콜백 제거 (또는 dual-path 옵션 유지)
 
-### 운영 환경
-- EC2 (Amazon Linux): PM2로 `rwa-arb` 프로세스 관리
+전환 후 EC2 deploy:
+- `pm2 restart rwa-arb`
+- 동일 동작 (`wti_cme_hl` 1개 페어)이지만 새 코드 경로 사용
+- engine_state + leg_prices에 pair_id 기준 데이터 누적 시작
+
+**다음 단계 (Phase D)**: Lighter 어댑터 + `wti_hl_lighter` 페어 shadow 모드.
+
+---
+
+## 최근 변경사항
+
+(역순; 자세한 commit 메시지는 `git log` 참조)
+
+### 2026-04-29
+- `f178fc5` — **M10 Phase C4b**: pair-keyed `_handle_pair_entry` / `_handle_pair_exit` + `process_pair_basis_update` 오케스트레이터. KIS는 KiwoomMock으로 paper, perp는 quote bid/ask 시뮬. 274 tests pass.
+- `0c7ae9e` — **M10 Phase C4a**: Engine pair-keyed 인프라. `register_pair` / `set_exchange_registry` / `dispatch_pair_order` (per-exchange Semaphore(1)). 265 tests pass.
+- `5d6388f` — Dashboard since_date cutoff (default 2026-04-21). zombie cleanup -$20K + 그 이전 데이터 제외. 사이드바 datepicker로 override 가능.
+- `00345ba` — **M10 Phase C3**: `SignalGenerator` pair-keyed alias 메서드 (`update_basis_for_pair` 등). dict 키만 product↔pair_id 호환.
+- `c6e3d95` — **M10 Phase C2**: `DataCollector` pair-keyed API. `register_pair` + `update_leg_quote(pair_id, leg, Quote)` + `on_pair_basis` 콜백. leg_prices 자동 저장.
+
+### 2026-04-28
+- `dc0f482` — Dashboard: jinja2 의존 제거 (Streamlit `column_config` 전환) + 헤더 카드 카운터를 DB 기반으로 (봇 재시작 영향 없음).
+- `17fbd9b` — `requirements.txt`: jinja2 추가 (이후 `dc0f482`에서 의존 자체 제거).
+- `6f4c049` — **M10 Phase M2-M3**: Streamlit 대시보드 (`dashboard/`). queries + charts + app + README. SSH 터널 접속 (127.0.0.1:8501). 230+ tests.
+- `34d56e0` — **M10 Phase M1**: schema v3 + `engine_state` 스냅샷 테이블. 봇이 30s마다 EngineState dump. 대시보드 live counter 백엔드.
+- `f40972b` — **M10 Phase C1**: `AppConfig.get_pairs()` synthesizer. legacy products → ArbitragePair 자동 합성.
+
+### 2026-04-27
+- `642699e` — **fix**: 신호 basis가 HL `mark_price` 대신 orderbook mid 사용. mark이 oracle 추적이라 자체 orderbook과 ~20bp 괴리하여 phantom 신호 다수 발생.
+
+### 2026-04-26
+- `3c579fe` — **M10 Phase B**: DB schema v2 (additive). `pair_id` 컬럼 + `leg_prices` 테이블 + `pairs` dimension. 자동 마이그레이션 + `*.pre-v2.bak` 1회 백업.
+
+### 2026-04-25
+- `3bae3fe` — **fix**: collector + engine에서 bid/ask 미수신 시 mid_price fallback 제거. 14건의 sub-10bp 진입 root cause.
+- `381506c` — **hotfix**: `min_abs_entry_bps: 10` floor 추가. 통계 신호 통과해도 |exec| < 10bp면 진입 차단.
+
+### 2026-04-22
+- `ba811b8` — **M10 Phase A+**: `FundingIntervalMonitor` — 거래소 펀딩 주기 런타임 검증 (Binance 1h→8h 같은 정책 변경 자동 감지).
+
+### 2026-04-21
+- `c669571` — **M10 Phase A**: `ExchangeBase` protocol + `ArbitragePair` scaffolding. 기존 클라이언트 무수정, adapter 래퍼만 추가. 회귀 0.
+
+### 2026-04-21 (이전)
+- `8002c02` — entry_threshold 25→20bp 인하 + entry near-miss 카운터.
+- `0898f23` — M9 prep: CME market-hours gate.
+
+### 2026-04-17 이전
+- M8 자동 롤오버 (active contract 매시간 재계산, KIS resubscribe).
+- close_zombies.py로 8건 좀비 포지션 청산 (-$20,459, 1회성).
+- 그 이전 M1-M7 마일스톤 완료.
+
+---
+
+## 운영 가이드
+
+### EC2 배포 (모든 commit 후)
+
+```bash
+ssh -i ~/.ssh/your-key.pem ec2-user@<EC2_IP>
+cd ~/rwa_arbitrage
+git pull origin claude/check-trading-results-AVTDv
+pip install -r requirements.txt --user      # 새 의존성 있을 시
+pm2 restart rwa-arb
+pm2 restart rwa-arb-dashboard               # 대시보드도 함께
+pm2 logs rwa-arb --lines 50 --nostream
+```
+
+### 대시보드 SSH 터널 접속
+
+```bash
+# ~/.ssh/config 등록 (1회)
+Host rwa-ec2
+  HostName <EC2_IP>
+  User ec2-user
+  IdentityFile ~/.ssh/your-key.pem
+  LocalForward 8501 localhost:8501
+
+# 접속
+ssh rwa-ec2
+# 브라우저: http://localhost:8501
+```
+
+### DB 백업/마이그레이션
+
+```bash
+# 자동 마이그레이션은 Storage.connect() 시 작동. 명시적 검증:
+python3 scripts/migrate_storage.py --report
+
+# 자동 백업 위치
+ls -la data/arbitrage.db*
+# data/arbitrage.db
+# data/arbitrage.db.pre-v2.bak    (v1→v2 마이그레이션 직전)
+```
+
+### 운영 체크 한 줄 명령
+
+```bash
+# 봇 상태
+pm2 logs rwa-arb --lines 30 --nostream | tail -30
+
+# DB 카운트
+python3 -c "
+import sqlite3
+con = sqlite3.connect('data/arbitrage.db'); con.row_factory = sqlite3.Row
+print('schema:', con.execute(\"SELECT value FROM schema_meta WHERE key='version'\").fetchone()[0])
+print('positions:', con.execute('SELECT COUNT(*) FROM positions').fetchone()[0])
+print('basis_spread:', con.execute('SELECT COUNT(*) FROM basis_spread').fetchone()[0])
+print('engine_state:', con.execute('SELECT COUNT(*) FROM engine_state').fetchone()[0])
+"
+
+# 페이퍼 결과 분석
+python3 scripts/analyze_paper.py --db data/arbitrage.db
+```
+
+### 환경 일정
+
 - 매일 UTC 00:00 (KST 09:00) PM2 cron restart → KIS 토큰 자동 갱신
 - KIS CME/NYMEX 유료시세: 24시간 토큰 유효, 1일 1회 발급 원칙
-- WTI(MCL) 전용 (Brent는 ICE 시세 미신청 + 계약 단위 비현실적)
+- 다음 CME 롤 window: 2026-05-07 ~ 2026-05-14 (MCLM26 → MCLN26)
+
+---
+
+## 위험 관리
+
+- **HL 단일 leg 집중**: 5개 페어 모두 leg_a가 HL → outage 시 동시 영향. aggregate exposure cap + WS 60s 끊김 시 emergency close.
+- **펀딩 비대칭**: 1h(HL/Lighter) vs 4h(Binance/Bybit/OKX). 단기 hold(`max_hold_hours <= 12`) + 주말 OFF로 완화.
+- **USDC vs USDT peg**: HL/Lighter는 USDC, 나머지는 USDT. de-peg 이벤트 모니터링 후 50bp 초과 시 Web3-Web3 페어 flatten 옵션.
+- **신규 거래소 listing 안정성**: Binance/Bybit CLUSDT는 런칭 1개월 미만. 진입 전 orderbook depth 체크 (`bid_qty + ask_qty >= 5×position_size`).
+- **인증 방식 4종 신규**: Binance HMAC, Bybit HMAC v5, OKX 3-header, Lighter signer. 각 어댑터 자체 처리 + Phase D-G 페이퍼는 read-only 키만.
+- **DB write 부하**: 5 페어 × 1Hz = 기존 3-5배. WAL 모드 + 1초 배치 INSERT.
+- **CME 일일 1h 휴장 (월-목 16:00-17:00 CT)**: Strict gate 사용 → 이 시간 Web3-Web3 페어도 OFF. 데드 시간 비율 확인 후 필요 시 `CME_LONG_CLOSURE_ONLY` 게이트로 전환.
+
+---
+
+## 주요 발견 & 의사결정 기록
+
+### 2026-04-21~04-27 페이퍼 분석 결과
+30 trade, 7일 운영. 핵심 발견:
+- **mid_basis vs exec_basis gap**: HL `mark_price`는 oracle 추적이라 HL 자체 orderbook과 ~20bp 괴리 가능 → "phantom 신호" 다수 발생. Fix: 신호 계산을 orderbook mid로 전환.
+- **bid/ask mid-fallback bug**: collector + engine이 호가 미수신 시 mid_price로 fallback → exec_filter 우회. Fix: 0 전달 + mid fallback 제거.
+- **Entry spread bucket 분포**:
+  - <10bp: 14건, 14% WR, 손실
+  - 10-20bp: 10건, 90% WR, 소익
+  - 20-50bp: 6건, 100% WR, 명확한 익
+  → `min_abs_entry_bps: 10` floor 추가로 sub-edge 진입 차단.
+
+### 거래소 perp 가용성 (2026-04-21 검증)
+사용자 확인 (당초 OKX/lighter는 미상장으로 추정했으나 사용자 정정으로 5개 모두 상장 확인):
+- Lighter `app.lighter.xyz/trade/WTI`
+- OKX `CL-USDT-SWAP` (funding 4h, 8h 아님 — 사용자 정정)
+
+### Phase 진입 순서 (funding asymmetry 최소화)
+1. Lighter (1h vs 1h, USDC-USDC) — 가장 안전
+2. Binance (4h vs 1h, USDT-USDC) — 유동성 최대
+3. Bybit (4h vs 1h, USDT-USDC)
+4. OKX (4h vs 1h, USDT-USDC)
