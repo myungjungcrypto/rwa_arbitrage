@@ -133,7 +133,8 @@ async def _setup_kis(config, collector, kiwoom=None):
             )
         target_symbol = active_symbol
 
-        def make_callback(pname):
+        def make_callback(pname, kis_sym):
+            legacy_sym = config.products[pname].futures_symbol
             def on_kis_quote(quote):
                 collector.update_futures_price(
                     product_name=pname,
@@ -144,14 +145,20 @@ async def _setup_kis(config, collector, kiwoom=None):
                     volume=quote.volume,
                 )
                 if kiwoom:
-                    futures_symbol = config.products[pname].futures_symbol
+                    # 양 경로 호환: legacy product-keyed는 "MCL", pair-keyed는
+                    # 실제 KIS 코드(예: "MCLM26"). 두 키 모두 base_price 등록.
                     kiwoom.set_base_price(
-                        futures_symbol, quote.price,
+                        legacy_sym, quote.price,
                         bid=quote.bid, ask=quote.ask,
                     )
+                    if kis_sym and kis_sym != legacy_sym:
+                        kiwoom.set_base_price(
+                            kis_sym, quote.price,
+                            bid=quote.bid, ask=quote.ask,
+                        )
             return on_kis_quote
 
-        cb = make_callback(product_name)
+        cb = make_callback(product_name, target_symbol)
         price_divisor = float(config.products[product_name].contract_size)
 
         await client.subscribe(target_symbol, cb, price_divisor=price_divisor)
