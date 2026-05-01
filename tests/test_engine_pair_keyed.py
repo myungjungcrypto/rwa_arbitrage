@@ -555,3 +555,44 @@ def test_calculate_pair_contracts_uses_leg_b_contract_size(engine):
     # max_position_contracts cap 적용 (config 기본 max=2)
     n_high = engine._calculate_pair_contracts(p, leg_b_price=10.0)
     assert n_high <= engine.config.risk.max_position_contracts
+
+
+# ──────────────────────────────────────────────
+# Phase D: pair.enabled=False shadow gate
+# ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_shadow_pair_blocks_entry(engine):
+    """enabled=False 페어는 진입 차단 — basis stats만 누적."""
+    p = _pair("wti_hl_lighter")
+    p.enabled = False         # shadow
+    engine.register_pair(p)
+    _bootstrap_warmup(engine, "wti_hl_lighter")
+
+    # 30bp 깨끗한 long_basis 시그널
+    await engine.process_pair_basis_update(
+        "wti_hl_lighter", 30.0,
+        _q("hl", "xyz:CL", 80.24, 80.23, 80.25),
+        _q("lighter", "WTI", 80.00, 79.99, 80.01),
+    )
+    # signal은 발생하지만 enabled=False라 진입 차단
+    assert engine._state.total_entries == 0
+    assert "wti_hl_lighter" not in engine._open_trades_by_pair
+    # signals counter는 증가 (basis update 처리됨)
+    assert engine._state.total_signals >= 1
+
+
+@pytest.mark.asyncio
+async def test_enabled_pair_still_enters_normally(engine):
+    """enabled=True 페어는 정상 진입."""
+    p = _pair("wti_cme_hl")
+    p.enabled = True
+    engine.register_pair(p)
+    _bootstrap_warmup(engine, "wti_cme_hl")
+    await engine.process_pair_basis_update(
+        "wti_cme_hl", 30.0,
+        _q("hl", "xyz:CL", 80.24, 80.23, 80.25),
+        _q("kis", "MCLM26", 80.00, 79.99, 80.01),
+    )
+    assert engine._state.total_entries == 1

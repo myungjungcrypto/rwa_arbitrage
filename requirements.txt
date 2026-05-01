@@ -9,3 +9,7 @@ pandas>=2.0
 plotly>=5.18
 streamlit-autorefresh>=1.0
 jinja2>=3.0           # pandas DataFrame.style.format() 의존성
+
+# Exchange adapters
+# Lighter (Phase D) — optional. lighter.enabled=false 환경에서는 미설치 OK.
+lighter-sdk>=1.0      # https://pypi.org/project/lighter-sdk/

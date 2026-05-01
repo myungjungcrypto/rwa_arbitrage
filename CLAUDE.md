@@ -181,7 +181,7 @@ rwa_arbitrage/
 | **C4a** | `PaperTradingEngine` 인프라 (registry, dispatch helper, Semaphore) | ✅ |
 | **C4b** | pair-keyed entry/exit flow (`process_pair_basis_update`) | ✅ |
 | **C5** | `main.py` 배선 — pair-keyed 경로로 switch | ✅ |
-| **D** | Lighter 어댑터 + `wti_hl_lighter` 페어 (shadow → live) | **현재 작업** |
+| **D** | Lighter 어댑터 + `wti_hl_lighter` 페어 (shadow → live) | **scaffolding 완료, EC2 shadow 검증 단계** |
 | E | Binance 어댑터 + `wti_hl_binance` 페어 | - |
 | F | Bybit 어댑터 + `wti_hl_bybit` 페어 | - |
 | G | OKX 어댑터 + `wti_hl_okx` 페어 | - |
@@ -197,29 +197,42 @@ rwa_arbitrage/
 
 ---
 
-## 현재 진행 (2026-04-29)
+## 현재 진행 (2026-05-01)
 
-**Phase D — Lighter 어댑터 + 첫 Web3-Web3 페어**
+**Phase D — Lighter 어댑터 합류 (shadow 검증 단계)**
 
-C5에서 main.py가 pair-keyed 경로로 전환 완료. 이제 Hyperliquid + KIS 외에
-새 거래소를 어댑터로 합류시키며 멀티 페어로 확장 시작.
+scaffolding 완료. EC2 운영에서 24h shadow 데이터 누적 후 `enabled: true` flip.
 
-D 단계 작업:
-- `src/exchange/lighter.py` 신규 — `LighterExchange(ExchangeBase)` 어댑터
-  - REST + WS 클라이언트 (또는 lighter SDK 사용)
-  - WTI 심볼 호가/체결 구독 → `Quote` 변환 → `update_leg_quote` push
-  - `get_funding_info` 구현 (Lighter 1h funding 검증)
-- `config/settings.yaml`에 `pairs:` 블록 신규: `wti_hl_lighter` (initially `enabled: false` shadow)
-- main.py: registry에 `LighterExchange` 등록, lighter symbol 구독 시작
-- shadow 24h → 분포 분석 → `enabled: true` flip → paper 진입 시작
+**완료 (Phase D 1/2)**:
+- `src/exchange/lighter.py` — `LighterExchange(ExchangeBase)` 어댑터.
+  lighter-sdk(`pip install lighter-sdk`) optional 의존, mock 주입 지원.
+- `LighterConfig` + `extra_pairs` settings.yaml 블록 — Web3-Web3 페어 명시 등록 경로.
+- engine `_handle_pair_entry`에 `pair.enabled` shadow gate (False면 진입 차단, basis stats만 누적).
+- settings.yaml: `wti_hl_lighter` 페어 (`enabled: false`, leg_a HL `xyz:CL`, leg_b Lighter `WTI`, threshold 12bp).
+- main.py: `cfg.lighter.enabled` 시 `LighterExchange.connect()` + `discover_markets()` + WS 구독.
+  HL Quote는 모든 HL-leg_a 페어로 fan-out (lighter 페어 leg_a까지 동기 push).
+  Lighter Quote는 어댑터가 직접 `collector.update_leg_quote(pair_id, "b", quote)` 호출.
 
-**다음 단계 (Phase E)**: Binance 어댑터 + `wti_hl_binance` 페어.
+**EC2 활성화 절차** (다음 단계):
+1. `pip install lighter-sdk --user`
+2. `config/settings.yaml`에서 `lighter.enabled: true` flip
+3. `pm2 restart rwa-arb`
+4. 로그에 `Lighter markets: N symbols discovered` + `[LIGHTER] subscribed wti_hl_lighter leg_b → WTI` 확인
+5. 24h dashboard에서 `wti_hl_lighter` basis 분포 관측 (mean/std/range)
+6. distribution sane이면 `pairs[].enabled: true` flip → paper 진입 시작
+
+**Phase E (다음)**: Binance 어댑터 + `wti_hl_binance` 페어.
 
 ---
 
 ## 최근 변경사항
 
 (역순; 자세한 commit 메시지는 `git log` 참조)
+
+### 2026-05-01
+- **M10 Phase D scaffolding**: Lighter 어댑터 + shadow 페어 인프라.
+  - `514b85e` — `LighterExchange(ExchangeBase)` adapter (lighter-sdk optional, factory injection for tests). 18 tests.
+  - 후속 commit — `LighterConfig` + `pairs:` YAML 블록 + `pair.enabled` shadow gate + main.py wiring (HL Quote fan-out to all HL-hub pairs). 311 tests pass.
 
 ### 2026-04-29
 - `6f9abdb` — **M10 Phase C5**: `main.py` 배선 완료. legacy `on_basis` 콜백이 Quote 빌더 bridge로 변환, `engine.process_pair_basis_update`(async) 가 pair callback으로 등록. ExchangeRegistry 구성 + `HyperliquidExchange` / `KISExchange` 어댑터 등록. 동시 진입/청산 race 방어 (atomic check-after-gather, atomic pop). 280 tests pass.

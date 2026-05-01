@@ -974,6 +974,12 @@ class PaperTradingEngine:
             return
 
         pair = self._registered_pairs[pair_id]
+
+        # Shadow mode 가드 — pair.enabled=False면 진입 차단 (basis stats만 누적).
+        # 신규 거래소 합류 시 분포 검증 단계용.
+        if not pair.enabled:
+            return
+
         direction = "long_basis" if signal.type == SignalType.ENTRY_LONG_BASIS else "short_basis"
 
         # 워밍업 체크

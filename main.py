@@ -27,6 +27,7 @@ from src.exchange.base import Quote
 from src.exchange.hyperliquid import HyperliquidExchange
 from src.exchange.kis import KISAuth, KISExchange, KISFuturesClient
 from src.exchange.kiwoom import create_kiwoom_client
+from src.exchange.lighter import LighterExchange
 from src.exchange.registry import ExchangeRegistry
 from src.strategy.pair import LegRole
 from src.strategy.rollover import get_active_contract, us_market_holidays
@@ -335,14 +336,74 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     registry.register(HyperliquidExchange(rest=collector.hl_client, ws=collector.hl_ws))
     if kis_client is not None:
         registry.register(KISExchange(client=kis_client))
+
+    # ── Phase D: Lighter 어댑터 (활성화 시) ──
+    lighter_adapter: LighterExchange | None = None
+    if config.lighter.enabled:
+        lighter_adapter = LighterExchange(
+            base_url=config.lighter.base_url,
+            ws_url=config.lighter.ws_url,
+        )
+        ok = await lighter_adapter.connect()
+        if ok:
+            registry.register(lighter_adapter)
+            logger.info("Lighter adapter registered (Phase D)")
+            try:
+                discovered = await lighter_adapter.discover_markets()
+                logger.info(f"Lighter markets: {len(discovered)} symbols discovered")
+            except Exception as e:
+                logger.warning(f"Lighter discover_markets failed: {e}")
+        else:
+            logger.warning("Lighter connect failed; skipping registration")
+            lighter_adapter = None
+
     engine.set_exchange_registry(registry)
     for pair in pairs:
         engine.register_pair(pair)
         collector.register_pair(pair)
+        logger.info(
+            f"[PAIR] {pair.id} enabled={pair.enabled} "
+            f"leg_a={pair.leg_a.exchange}/{pair.leg_a.symbol} "
+            f"leg_b={pair.leg_b.exchange}/{pair.leg_b.symbol}"
+        )
+
+    # Lighter 페어가 등록됐고 adapter도 connect됐으면 leg_b 심볼 구독 시도.
+    # Quote 도착하면 collector.update_leg_quote 호출 — 일반 페어 callback 흐름과 동일.
+    if lighter_adapter is not None:
+        for pair in pairs:
+            if pair.leg_b.exchange != "lighter":
+                continue
+
+            # symbol 매핑 확인 — discover_markets에서 못 찾았으면 명시 등록 (수동 fallback)
+            if lighter_adapter.get_market_id(pair.leg_b.symbol) is None:
+                logger.warning(
+                    f"[LIGHTER] market_id for {pair.leg_b.symbol} not auto-discovered; "
+                    "skipping subscribe (manual set_market_id required)"
+                )
+                continue
+
+            def _make_lighter_cb(pair_id: str):
+                def _cb(q: Quote) -> None:
+                    collector.update_leg_quote(pair_id, "b", q)
+                return _cb
+
+            try:
+                await lighter_adapter.subscribe_quotes(
+                    pair.leg_b.symbol, _make_lighter_cb(pair.id),
+                )
+                logger.info(f"[LIGHTER] subscribed {pair.id} leg_b → {pair.leg_b.symbol}")
+            except Exception as e:
+                logger.error(f"[LIGHTER] subscribe failed for {pair.id}: {e}")
     pair_by_product: dict[str, "object"] = {
         product: collector.get_pair(LEGACY_PRODUCT_PAIR_MAP.get(product, product))
         for product in config.products
     }
+
+    # HL leg_a를 공유하는 모든 페어 — bridge가 HL Quote를 fan-out할 대상
+    hl_hub_pairs_by_perp_symbol: dict[str, list] = {}
+    for pair in pairs:
+        if pair.leg_a.exchange == "hyperliquid":
+            hl_hub_pairs_by_perp_symbol.setdefault(pair.leg_a.symbol, []).append(pair)
 
     # DB에서 최근 basis 데이터 부트스트랩 (재시작 시 window 즉시 복원)
     # legacy 'wti' 키와 pair_id 'wti_cme_hl' 키 둘 다에 주입 → 양 경로 모두 stats 보유.
@@ -362,6 +423,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     #    legacy collector callback에서 받은 product/price/bid/ask를 Quote로 변환해
     #    collector.update_leg_quote 로 push. update_leg_quote가 양 leg 도착 시
     #    on_pair_basis 콜백을 fire → engine.process_pair_basis_update (async).
+    #    leg_a (HL Quote)는 같은 perp_symbol을 leg_a로 쓰는 모든 페어에 fan-out.
     def on_basis(product, perp_price, futures_price, basis_bps,
                  perp_best_bid=0.0, perp_best_ask=0.0,
                  futures_bid=0.0, futures_ask=0.0):
@@ -393,6 +455,12 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         )
         collector.update_leg_quote(pair.id, "a", leg_a_q)
         collector.update_leg_quote(pair.id, "b", leg_b_q)
+
+        # HL leg_a를 공유하는 다른 페어(예: wti_hl_lighter)에도 leg_a 동일 push
+        for other_pair in hl_hub_pairs_by_perp_symbol.get(leg_a_q.symbol, []):
+            if other_pair.id == pair.id:
+                continue
+            collector.update_leg_quote(other_pair.id, "a", leg_a_q)
 
     collector.on_basis_update(on_basis)
     collector.on_pair_basis(engine.process_pair_basis_update)

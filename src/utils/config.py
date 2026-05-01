@@ -49,6 +49,16 @@ class KISConfig:
 
 
 @dataclass
+class LighterConfig:
+    """Lighter (zkLighter / app.lighter.xyz) 어댑터 설정 — Phase D."""
+    enabled: bool = False        # 활성화 여부 (off면 main.py가 어댑터 wire 안 함)
+    base_url: str = "https://mainnet.zklighter.elliot.ai"
+    ws_url: str = "wss://mainnet.zklighter.elliot.ai/stream"
+    api_key: str = ""             # 페이퍼 단계는 빈 문자열 (read-only public REST/WS)
+    api_secret: str = ""
+
+
+@dataclass
 class StrategyConfig:
     basis_window_hours: int = 24
     basis_std_multiplier: float = 2.0
@@ -93,8 +103,10 @@ class AppConfig:
     hyperliquid: HyperliquidConfig = field(default_factory=HyperliquidConfig)
     kiwoom: KiwoomConfig = field(default_factory=KiwoomConfig)
     kis: KISConfig = field(default_factory=KISConfig)
+    lighter: LighterConfig = field(default_factory=LighterConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    extra_pairs: list = field(default_factory=list)   # settings.yaml `pairs:` 블록 → ArbitragePair list
     db_path: str = "data/arbitrage.db"
     log_level: str = "INFO"
     log_file: str = "logs/arbitrage.log"
@@ -158,6 +170,9 @@ class AppConfig:
                 params=params,
             )
             pairs.append(pair)
+        # settings.yaml `pairs:` 블록에서 추가된 explicit pair 합산 (Phase D~G에서
+        # Web3-Web3 페어가 여기 등록됨)
+        pairs.extend(self.extra_pairs)
         return pairs
 
     def get_pair(self, pair_id: str) -> "object | None":
@@ -235,11 +250,25 @@ def load_config(
         cme_realtime=kis_settings.get("cme_realtime", False),
     )
 
+    # Lighter (Phase D)
+    lighter_settings = settings.get("lighter", {})
+    lighter_secrets = secrets.get("lighter", {})
+    lighter_config = LighterConfig(
+        enabled=lighter_settings.get("enabled", False),
+        base_url=lighter_settings.get("base_url", "https://mainnet.zklighter.elliot.ai"),
+        ws_url=lighter_settings.get("ws_url", "wss://mainnet.zklighter.elliot.ai/stream"),
+        api_key=lighter_secrets.get("api_key", ""),
+        api_secret=lighter_secrets.get("api_secret", ""),
+    )
+
     # 전략/리스크 설정
     strat = settings.get("strategy", {})
     risk = settings.get("risk", {})
     db = settings.get("database", {})
     log = settings.get("logging", {})
+
+    # Explicit pairs[] block — Web3-Web3 페어 명시 등록
+    extra_pairs = _parse_extra_pairs(settings.get("pairs", []))
 
     return AppConfig(
         mode=settings.get("mode", "PAPER"),
@@ -248,9 +277,71 @@ def load_config(
         hyperliquid=hl_config,
         kiwoom=kw_config,
         kis=kis_config,
+        lighter=lighter_config,
         strategy=StrategyConfig(**{k: v for k, v in strat.items() if k in StrategyConfig.__dataclass_fields__}),
         risk=RiskConfig(**{k: v for k, v in risk.items() if k in RiskConfig.__dataclass_fields__}),
+        extra_pairs=extra_pairs,
         db_path=db.get("path", "data/arbitrage.db"),
         log_level=log.get("level", "INFO"),
         log_file=log.get("file", "logs/arbitrage.log"),
+    )
+
+
+def _parse_extra_pairs(pairs_block: list) -> list:
+    """settings.yaml `pairs:` 블록 → ArbitragePair 리스트.
+
+    예:
+      pairs:
+        - id: wti_hl_lighter
+          enabled: false       # shadow
+          gate: cme_hours
+          leg_a: {exchange: hyperliquid, symbol: 'xyz:CL', role: perp,
+                  taker_fee_bps: 0.9, funding_interval_hours: 1.0,
+                  margin_asset: USDC}
+          leg_b: {exchange: lighter, symbol: WTI, role: perp,
+                  taker_fee_bps: 0.0, funding_interval_hours: 1.0,
+                  margin_asset: USDC}
+          params:
+            entry_threshold_bps: 12
+            convergence_target_bps: 3
+            max_hold_hours: 12
+    """
+    from src.strategy.pair import (
+        ArbitragePair, ExchangeLeg, LegRole, PairGate, PairStrategyParams,
+    )
+    if not pairs_block:
+        return []
+    out = []
+    for entry in pairs_block:
+        if not isinstance(entry, dict):
+            continue
+        pair_id = entry.get("id")
+        if not pair_id:
+            continue
+        out.append(ArbitragePair(
+            id=pair_id,
+            enabled=bool(entry.get("enabled", False)),
+            strategy=entry.get("strategy", "basis_convergence"),
+            gate=PairGate(entry.get("gate", PairGate.CME_HOURS.value)),
+            leg_a=_parse_leg(entry.get("leg_a", {})),
+            leg_b=_parse_leg(entry.get("leg_b", {})),
+            params=PairStrategyParams(
+                **{k: v for k, v in (entry.get("params") or {}).items()
+                   if k in PairStrategyParams.__dataclass_fields__}
+            ),
+        ))
+    return out
+
+
+def _parse_leg(leg_dict: dict):
+    from src.strategy.pair import ExchangeLeg, LegRole
+    return ExchangeLeg(
+        exchange=leg_dict.get("exchange", ""),
+        symbol=leg_dict.get("symbol", ""),
+        role=LegRole(leg_dict.get("role", LegRole.PERP.value)),
+        contract_size=float(leg_dict.get("contract_size", 1.0)),
+        fee_per_contract_usd=float(leg_dict.get("fee_per_contract_usd", 0.0)),
+        taker_fee_bps=float(leg_dict.get("taker_fee_bps", 0.0)),
+        funding_interval_hours=float(leg_dict.get("funding_interval_hours", 0.0)),
+        margin_asset=leg_dict.get("margin_asset", ""),
     )

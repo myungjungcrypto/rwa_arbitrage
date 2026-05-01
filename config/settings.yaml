@@ -88,6 +88,38 @@ database:
   type: "sqlite"
   path: "data/arbitrage.db"
 
+# Lighter (Phase D — Web3-Web3 첫 페어)
+lighter:
+  enabled: false                # main.py가 어댑터 wire 여부. shadow 시작 시 true로 flip.
+  base_url: "https://mainnet.zklighter.elliot.ai"
+  ws_url: "wss://mainnet.zklighter.elliot.ai/stream"
+
+# 명시 페어 — Web2-Web3 페어(wti_cme_hl)는 products+kis_symbol_map에서 자동 합성.
+# 아래는 Web3-Web3 페어 추가용. Phase D에서 wti_hl_lighter shadow로 시작.
+pairs:
+  - id: wti_hl_lighter
+    enabled: false              # shadow → 24h 분포 분석 후 true flip
+    strategy: basis_convergence
+    gate: cme_hours             # Strict: CME 휴장 시 OFF (펀딩 비대칭 위험 회피)
+    leg_a:
+      exchange: hyperliquid
+      symbol: "xyz:CL"
+      role: perp
+      taker_fee_bps: 0.9
+      funding_interval_hours: 1.0
+      margin_asset: USDC
+    leg_b:
+      exchange: lighter
+      symbol: "WTI"
+      role: perp
+      taker_fee_bps: 0.0        # Lighter taker fee 실측 후 갱신
+      funding_interval_hours: 1.0
+      margin_asset: USDC
+    params:
+      entry_threshold_bps: 12   # Web3-Web3 페어는 CME 페어보다 좁은 임계 (수수료 적음)
+      convergence_target_bps: 3
+      max_hold_hours: 12        # 단기 hold (펀딩 누적 위험 최소화)
+
 # 알림
 notification:
   telegram:
