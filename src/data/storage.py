@@ -762,7 +762,7 @@ class Storage:
         realized_pnl: float = 0,
         funding_pnl: float = 0,
     ):
-        """가장 최근 오픈 포지션을 클로즈."""
+        """가장 최근 오픈 포지션을 클로즈 (legacy product-keyed)."""
         ts = time.time()
         self.conn.execute(
             """UPDATE positions
@@ -773,6 +773,26 @@ class Storage:
                    ORDER BY id DESC LIMIT 1
                )""",
             (realized_pnl, funding_pnl, ts, product),
+        )
+        self.conn.commit()
+
+    def close_position_by_pair(
+        self,
+        pair_id: str,
+        realized_pnl: float = 0,
+        funding_pnl: float = 0,
+    ):
+        """가장 최근 오픈 포지션을 pair_id로 클로즈 (Phase C4b 신규)."""
+        ts = time.time()
+        self.conn.execute(
+            """UPDATE positions
+               SET status = 'closed', realized_pnl = ?, funding_pnl = ?, closed_at = ?
+               WHERE id = (
+                   SELECT id FROM positions
+                   WHERE pair_id = ? AND status = 'open'
+                   ORDER BY id DESC LIMIT 1
+               )""",
+            (realized_pnl, funding_pnl, ts, pair_id),
         )
         self.conn.commit()
 

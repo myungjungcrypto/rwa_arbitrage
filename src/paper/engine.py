@@ -907,6 +907,359 @@ class PaperTradingEngine:
             return (leg_a.ask - leg_b.bid) / leg_b.bid * 10_000
         raise ValueError(f"direction must be 'long_basis' or 'short_basis', got {direction!r}")
 
+    # ──────────────────────────────────────────────
+    # Phase C4b: pair-keyed entry/exit 흐름
+    # ──────────────────────────────────────────────
+
+    async def process_pair_basis_update(
+        self,
+        pair_id: str,
+        basis_bps: float,
+        leg_a: Quote,
+        leg_b: Quote,
+        funding_rate: float | None = None,
+        current_time: float | None = None,
+    ) -> Optional[Signal]:
+        """Pair-keyed 메인 entry point. collector.on_pair_basis 콜백에 등록.
+
+        흐름:
+          1. quote 캐시
+          2. SignalGenerator pair-keyed update
+          3. ENTRY/EXIT 시그널이면 해당 핸들러 dispatch
+        반환: 생성된 Signal (콜백/디버깅용).
+        """
+        if pair_id not in self._registered_pairs:
+            logger.warning(f"[{pair_id}] basis update on unregistered pair — ignored")
+            return None
+
+        # 1. 캐시
+        self.cache_pair_quote(pair_id, "a", leg_a)
+        self.cache_pair_quote(pair_id, "b", leg_b)
+
+        # funding_rate 미지정 시 leg_a 우선 (perp leg)
+        funding = funding_rate if funding_rate is not None else leg_a.funding_rate
+
+        # 2. signal generator update
+        self._state.total_signals += 1
+        signal = self.signal_gen.update_basis_for_pair(
+            pair_id, basis_bps, funding_rate=funding,
+            leg_a_bid=leg_a.bid, leg_a_ask=leg_a.ask,
+            leg_b_bid=leg_b.bid, leg_b_ask=leg_b.ask,
+            current_time=current_time,
+        )
+
+        # 시그널 콜백 (NONE 제외)
+        if signal.type != SignalType.NONE:
+            for cb in self._on_signal_callbacks:
+                try:
+                    cb(signal)
+                except Exception as e:
+                    logger.error(f"signal callback error: {e}")
+
+        # 3. dispatch
+        if signal.type in (SignalType.ENTRY_LONG_BASIS, SignalType.ENTRY_SHORT_BASIS):
+            self._state.entry_signals_generated += 1
+            await self._handle_pair_entry(pair_id, signal, leg_a, leg_b)
+        elif signal.type in (SignalType.EXIT, SignalType.EMERGENCY_CLOSE):
+            await self._handle_pair_exit(pair_id, signal, leg_a, leg_b)
+        return signal
+
+    async def _handle_pair_entry(
+        self, pair_id: str, signal: Signal, leg_a: Quote, leg_b: Quote
+    ) -> None:
+        """진입 처리 (pair-keyed). 레거시 _handle_entry와 미러 — 회귀 위험 없도록
+        flow 동일. 차이: kiwoom 대신 dispatch_pair_order 사용 (KIS 어댑터 placeholder),
+        sizing은 pair.leg_b.contract_size 직접 참조."""
+        if pair_id in self._open_trades_by_pair:
+            return
+
+        pair = self._registered_pairs[pair_id]
+        direction = "long_basis" if signal.type == SignalType.ENTRY_LONG_BASIS else "short_basis"
+
+        # 워밍업 체크
+        history = self.signal_gen._basis_history.get(pair_id)
+        if history and len(history) < self.MIN_WARMUP_POINTS:
+            self._state.entry_warmup_skip += 1
+            logger.warning(
+                f"[{pair_id}] ENTRY_SKIP warmup: {len(history)}/{self.MIN_WARMUP_POINTS}"
+            )
+            return
+
+        # exec_filter
+        exec_basis = self.compute_pair_exec_basis(direction, leg_a, leg_b)
+        threshold = pair.params.entry_threshold_bps
+        if direction == "short_basis" and exec_basis > -threshold:
+            self._state.entry_exec_filter_skip += 1
+            logger.warning(
+                f"[{pair_id}] ENTRY_SKIP exec_filter: exec={exec_basis:.1f}bp > -{threshold}bp"
+            )
+            return
+        if direction == "long_basis" and exec_basis < threshold:
+            self._state.entry_exec_filter_skip += 1
+            logger.warning(
+                f"[{pair_id}] ENTRY_SKIP exec_filter: exec={exec_basis:.1f}bp < +{threshold}bp"
+            )
+            return
+
+        # min_abs_entry_bps floor (절대값 가드)
+        min_abs = self.config.strategy.min_abs_entry_bps
+        if min_abs > 0 and abs(exec_basis) < min_abs:
+            self._state.entry_min_abs_skip += 1
+            logger.warning(
+                f"[{pair_id}] ENTRY_SKIP min_abs: |exec|={abs(exec_basis):.1f}bp "
+                f"< min_abs={min_abs:.1f}bp"
+            )
+            return
+
+        # 사이징 — leg_b 기준 notional × max_position_usd cap
+        leg_b_price = leg_b.mid_price or (leg_b.bid + leg_b.ask) / 2
+        contracts = self._calculate_pair_contracts(pair, leg_b_price)
+        if contracts < 1:
+            logger.warning(f"[{pair_id}] contracts < 1, skipping entry")
+            return
+
+        # leg_b의 contract_size 단위로 leg_a units 환산 (CME MCL=100배럴 등)
+        leg_a_size = contracts * pair.leg_b.contract_size
+        leg_b_size = float(contracts)
+
+        # 리스크 체크 (legacy 인터페이스 — product='wti' 매핑)
+        size_usd = leg_b_price * leg_a_size
+        legacy_product = pair_id.split("_", 1)[0]
+        risk_check = self.risk_mgr.check_entry(
+            product=legacy_product,
+            size_usd=size_usd,
+            perp_margin_usage_pct=self._get_perp_margin_usage(),
+            futures_margin_usage_pct=self.kiwoom.get_margin_info().get("usage_pct", 0),
+            current_basis_bps=signal.basis_bps,
+            is_rollover_period=self.risk_mgr.is_rollover_period(),
+        )
+        if not risk_check.allowed:
+            self._state.rejected_by_risk += 1
+            logger.warning(f"[{pair_id}] Entry REJECTED by risk: {risk_check.reason}")
+            return
+
+        # ── 양 leg 동시 발주 (paper: kiwoom for KIS, simulate for perp) ──
+        leg_a_side = "sell" if direction == "long_basis" else "buy"
+        leg_b_side = "buy" if direction == "long_basis" else "sell"
+
+        async def _fill_a() -> tuple[float, str]:
+            return await self._fill_pair_leg(pair, "a", leg_a_side, leg_a_size, leg_a)
+
+        async def _fill_b() -> tuple[float, str]:
+            return await self._fill_pair_leg(pair, "b", leg_b_side, leg_b_size, leg_b)
+
+        (a_price, a_oid), (b_price, b_oid) = await asyncio.gather(_fill_a(), _fill_b())
+        if a_price <= 0 or b_price <= 0:
+            self._state.failed_orders += 1
+            logger.error(
+                f"[{pair_id}] one or both legs failed to fill "
+                f"(a={a_price}, b={b_price}); skipping entry"
+            )
+            return
+
+        # ── 기록 ──
+        self._trade_counter += 1
+        trade = TradeRecord(
+            trade_id=self._trade_counter,
+            product=legacy_product,
+            direction=direction,
+            entry_time=time.time(),
+            entry_basis_bps=signal.basis_bps,
+            perp_entry_price=a_price,
+            futures_entry_price=b_price,
+            perp_side="short" if direction == "long_basis" else "long",
+            futures_side="long" if direction == "long_basis" else "short",
+            size_contracts=contracts,
+            perp_units=leg_a_size,
+            status="open",
+        )
+        self._open_trades_by_pair[pair_id] = trade
+        self._state.total_entries += 1
+        self._state.open_positions += 1
+
+        self.signal_gen.open_position_for_pair(pair_id, signal, size=contracts)
+        pos = self.signal_gen.get_position_for_pair(pair_id)
+        pos.entry_exec_basis_bps = exec_basis
+
+        # DB
+        self.storage.save_order(
+            product=legacy_product, leg="perp", side=leg_a_side,
+            size=leg_a_size, price=a_price, filled_price=a_price,
+            filled_size=leg_a_size, status="filled", is_paper=True,
+            pair_id=pair_id, exchange=pair.leg_a.exchange,
+        )
+        self.storage.save_order(
+            product=legacy_product, leg="futures", side=leg_b_side,
+            size=leg_b_size, price=b_price, filled_price=b_price,
+            filled_size=leg_b_size, order_id=b_oid, status="filled",
+            is_paper=True, pair_id=pair_id, exchange=pair.leg_b.exchange,
+        )
+        self.storage.save_position(
+            product=legacy_product,
+            perp_size=leg_a_size if trade.perp_side == "long" else -leg_a_size,
+            perp_entry=a_price,
+            futures_size=leg_b_size if trade.futures_side == "long" else -leg_b_size,
+            futures_entry=b_price,
+            pair_id=pair_id,
+        )
+
+        logger.info(
+            f"[{pair_id}] ▶ ENTRY {direction} | basis={signal.basis_bps:+.1f}bp | "
+            f"leg_a {leg_a_side} {leg_a_size}@{a_price:.2f} | "
+            f"leg_b {leg_b_side} {leg_b_size}@{b_price:.2f} | "
+            f"exec={exec_basis:+.1f}bp"
+        )
+        for cb in self._on_trade_callbacks:
+            try:
+                cb(trade, "open")
+            except Exception as e:
+                logger.error(f"Trade callback error: {e}")
+
+    async def _handle_pair_exit(
+        self, pair_id: str, signal: Signal, leg_a: Quote, leg_b: Quote
+    ) -> None:
+        """청산 처리 (pair-keyed)."""
+        trade = self._open_trades_by_pair.get(pair_id)
+        if not trade:
+            logger.warning(f"[{pair_id}] EXIT signal but no open trade")
+            return
+
+        pair = self._registered_pairs[pair_id]
+        leg_a_close_side = "buy" if trade.perp_side == "short" else "sell"
+        leg_b_close_side = "sell" if trade.futures_side == "long" else "buy"
+
+        leg_a_size = trade.perp_units
+        leg_b_size = float(trade.size_contracts)
+
+        async def _fill_a():
+            return await self._fill_pair_leg(pair, "a", leg_a_close_side, leg_a_size, leg_a)
+
+        async def _fill_b():
+            return await self._fill_pair_leg(pair, "b", leg_b_close_side, leg_b_size, leg_b)
+
+        (a_exit, _), (b_exit, b_exit_oid) = await asyncio.gather(_fill_a(), _fill_b())
+        if a_exit <= 0 or b_exit <= 0:
+            self._state.failed_orders += 1
+            logger.error(
+                f"[{pair_id}] EXIT fill failed (a={a_exit}, b={b_exit}); will retry"
+            )
+            return
+
+        pnl = self._calculate_pnl(trade, a_exit, b_exit)
+
+        trade.exit_time = time.time()
+        trade.exit_basis_bps = signal.basis_bps
+        trade.perp_exit_price = a_exit
+        trade.futures_exit_price = b_exit
+        trade.exit_reason = signal.reason
+        trade.basis_pnl_bps = pnl["basis_pnl_bps"]
+        trade.perp_fees_usd = pnl["perp_fees_usd"]
+        trade.futures_fees_usd = pnl["futures_fees_usd"]
+        trade.net_pnl_usd = pnl["net_pnl_usd"]
+        trade.status = "closed"
+
+        self._state.total_exits += 1
+        self._state.open_positions -= 1
+        self._state.closed_trades += 1
+        self._state.cumulative_pnl_usd += pnl["net_pnl_usd"]
+        self.risk_mgr.record_pnl(pnl["net_pnl_usd"])
+        self.signal_gen.close_position_for_pair(pair_id)
+
+        legacy_product = trade.product
+        del self._open_trades_by_pair[pair_id]
+        self._closed_trades.append(trade)
+
+        self.storage.save_order(
+            product=legacy_product, leg="perp", side=leg_a_close_side,
+            size=leg_a_size, price=a_exit, filled_price=a_exit,
+            filled_size=leg_a_size, status="filled", is_paper=True,
+            pair_id=pair_id, exchange=pair.leg_a.exchange,
+        )
+        self.storage.save_order(
+            product=legacy_product, leg="futures", side=leg_b_close_side,
+            size=leg_b_size, price=b_exit, filled_price=b_exit,
+            filled_size=leg_b_size, order_id=b_exit_oid, status="filled",
+            is_paper=True, pair_id=pair_id, exchange=pair.leg_b.exchange,
+        )
+        self.storage.close_position_by_pair(
+            pair_id=pair_id,
+            realized_pnl=pnl["net_pnl_usd"],
+            funding_pnl=pnl["funding_pnl_usd"],
+        )
+        self.storage.update_daily_pnl(
+            product=legacy_product,
+            trading_pnl=pnl["trading_pnl_usd"],
+            funding_pnl=pnl["funding_pnl_usd"],
+            fees=pnl["total_fees_usd"],
+            pair_id=pair_id,
+        )
+
+        hold_hours = (trade.exit_time - trade.entry_time) / 3600
+        emoji = "✅" if pnl["net_pnl_usd"] >= 0 else "❌"
+        logger.info(
+            f"[{pair_id}] {emoji} EXIT {trade.direction} | "
+            f"basis: {trade.entry_basis_bps:+.1f} → {signal.basis_bps:+.1f}bp | "
+            f"pnl=${pnl['net_pnl_usd']:+.2f} | hold={hold_hours:.1f}h | {signal.reason}"
+        )
+        for cb in self._on_trade_callbacks:
+            try:
+                cb(trade, "close")
+            except Exception as e:
+                logger.error(f"Trade callback error: {e}")
+
+    async def _fill_pair_leg(
+        self,
+        pair: ArbitragePair,
+        leg: str,
+        side: str,
+        size: float,
+        leg_quote: Quote,
+    ) -> tuple[float, str]:
+        """페어 leg에 paper-fill 주문. (filled_price, order_id) 반환.
+
+        - leg.exchange == 'kis': legacy KiwoomMock 사용 (paper 한정).
+        - 그 외 (HL/Binance/Bybit/OKX/Lighter): 캐시된 bid/ask로 시뮬레이션 fill.
+          (실거래는 Phase I에서 dispatch_pair_order 통해 실 주문)
+
+        실패 시 (0.0, "") 반환.
+        """
+        leg_cfg = pair.leg(leg)
+        if leg_cfg.exchange == "kis":
+            futures_symbol = leg_cfg.symbol
+            kw_order = self.kiwoom.place_order(
+                symbol=futures_symbol, side=side, quantity=int(size),
+            )
+            if not kw_order.success:
+                return 0.0, ""
+            return kw_order.filled_price, kw_order.order_no
+
+        # perp 시뮬: buy → ask, sell → bid. 누락 시 mid fallback.
+        if side == "buy":
+            fill = leg_quote.ask if leg_quote.ask > 0 else leg_quote.mid_price
+        else:
+            fill = leg_quote.bid if leg_quote.bid > 0 else leg_quote.mid_price
+        if fill <= 0:
+            return 0.0, ""
+        return fill, f"PAPER-{int(time.time()*1000)}"
+
+    def _calculate_pair_contracts(
+        self, pair: ArbitragePair, leg_b_price: float
+    ) -> int:
+        """페어 leg_b 기준 계약수 결정.
+
+        max_position_usd cap + max_position_contracts cap 적용.
+        leg_b가 perp(contract_size=1)이면 1배럴/USDC 단위 size로 동작.
+        """
+        if leg_b_price <= 0:
+            return 0
+        cs = pair.leg_b.contract_size or 1.0
+        notional_per_contract = leg_b_price * cs
+        if notional_per_contract <= 0:
+            return 1
+        max_size_usd = self.config.risk.max_position_usd
+        max_contracts = int(max_size_usd / notional_per_contract)
+        return max(1, min(max_contracts, self.config.risk.max_position_contracts))
+
     async def dispatch_pair_order(
         self,
         pair_id: str,

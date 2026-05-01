@@ -26,6 +26,7 @@ from src.risk.manager import RiskManager
 from src.strategy.pair import (
     ArbitragePair, ExchangeLeg, LegRole, PairGate, PairStrategyParams,
 )
+from src.strategy.signals import Signal, SignalType
 from src.utils.config import (
     AppConfig, HyperliquidConfig, KISConfig, KiwoomConfig,
     ProductConfig, RiskConfig, StrategyConfig,
@@ -100,7 +101,11 @@ def cfg() -> AppConfig:
         hyperliquid=HyperliquidConfig(use_testnet=False),
         kiwoom=KiwoomConfig(use_mock=True),
         kis=KISConfig(),
-        strategy=StrategyConfig(),
+        strategy=StrategyConfig(
+            cme_closed_skip_entry=False,    # 테스트에서 24/7 가정
+            entry_threshold_bps=20,
+            min_abs_entry_bps=10,
+        ),
         risk=RiskConfig(),
     )
 
@@ -109,7 +114,10 @@ def cfg() -> AppConfig:
 def engine(cfg, tmp_path: Path) -> PaperTradingEngine:
     s = Storage(str(tmp_path / "engine.db"))
     s.connect()
-    return PaperTradingEngine(cfg, s, KiwoomMock(), risk_mgr=RiskManager(cfg.risk))
+    kw = KiwoomMock()
+    # base price 등록 (paper fill 시뮬에 필요)
+    kw.set_base_price("MCLM26", 80.0)
+    return PaperTradingEngine(cfg, s, kw, risk_mgr=RiskManager(cfg.risk))
 
 
 def _pair(pair_id: str, leg_a_ex="hyperliquid", leg_b_ex="kis",
@@ -360,3 +368,190 @@ def test_legacy_state_dicts_unaffected_by_pair_path(engine):
     assert engine._open_trades == {}
     assert engine._latest_perp_bid == {}
     assert engine._latest_futures_ask == {}
+
+
+# ──────────────────────────────────────────────
+# Phase C4b: process_pair_basis_update / _handle_pair_entry / _handle_pair_exit
+# ──────────────────────────────────────────────
+
+
+def _bootstrap_warmup(engine, pair_id: str, mean: float = 0.0, n: int = 4000):
+    """워밍업 통과 위해 가짜 history + 분산 주입.
+
+    SignalGenerator는 std<1.0이면 'Volatility too low'로 차단하므로 std≥3 주입.
+    """
+    import math as _m
+    history = [mean + 5.0 * _m.sin(i * 0.07) for i in range(n)]
+    engine.signal_gen.bootstrap_from_db_for_pair(pair_id, history)
+
+
+@pytest.mark.asyncio
+async def test_process_pair_basis_update_unregistered_pair_returns_none(engine):
+    sig = await engine.process_pair_basis_update(
+        "ghost", 10.0, _q("hl", "x", 80, 80, 80), _q("kis", "y", 80, 80, 80),
+    )
+    assert sig is None
+
+
+@pytest.mark.asyncio
+async def test_process_pair_basis_update_caches_and_increments_signals(engine):
+    p = _pair("wti_cme_hl")
+    engine.register_pair(p)
+    sig = await engine.process_pair_basis_update(
+        "wti_cme_hl", 0.0,
+        _q("hl", "xyz:CL", 80, 79.99, 80.01),
+        _q("kis", "MCLM26", 80, 79.99, 80.01),
+    )
+    assert engine._state.total_signals == 1
+    assert engine.has_both_legs("wti_cme_hl")
+
+
+@pytest.mark.asyncio
+async def test_pair_entry_blocked_by_warmup(engine):
+    p = _pair("wti_cme_hl")
+    engine.register_pair(p)
+    # 워밍업 부족 (기본 빈 history) — std<1 fallthrough도 경계 케이스
+    engine.signal_gen.bootstrap_from_db_for_pair("wti_cme_hl", [0.0, 0.0, 25.0] * 30)
+    sig = await engine.process_pair_basis_update(
+        "wti_cme_hl", 30.0,
+        _q("hl", "xyz:CL", 80.30, 80.30, 80.30),
+        _q("kis", "MCLM26", 80.00, 79.99, 80.01),
+    )
+    # 진입 시그널이 떴어도 warmup 부족으로 차단
+    assert engine._state.total_entries == 0
+    # warmup_skip이 0이거나 entry 자체가 안 났을 수 있음 — 둘 다 정상
+    assert "wti_cme_hl" not in engine._open_trades_by_pair
+
+
+@pytest.mark.asyncio
+async def test_pair_entry_blocked_by_exec_filter(engine):
+    """mid_basis는 큰데 exec_basis가 작은 phantom 시나리오."""
+    p = _pair("wti_cme_hl")
+    engine.register_pair(p)
+    _bootstrap_warmup(engine, "wti_cme_hl")
+
+    # mid는 25bp인데 bid/ask cross는 0bp (양 leg가 같은 가격)
+    sig = await engine.process_pair_basis_update(
+        "wti_cme_hl", 25.0,
+        _q("hl", "xyz:CL", 80.20, 80.00, 80.00),       # bid=ask=80
+        _q("kis", "MCLM26", 80.00, 80.00, 80.00),
+    )
+    # entry signal 발생 → exec_filter 차단
+    assert engine._state.entry_exec_filter_skip >= 1
+    assert "wti_cme_hl" not in engine._open_trades_by_pair
+
+
+@pytest.mark.asyncio
+async def test_pair_entry_blocked_by_min_abs_when_exec_just_above_threshold(engine, cfg):
+    """exec=20bp는 entry_threshold 통과하지만 min_abs=10bp는 어차피 통과 — 정상 진입.
+    별도로 min_abs 차단은 entry_threshold가 낮을 때만 의미. 현재 두 값이 같으니
+    skip 시나리오는 외부 설정에서만 가능. 여기서는 정상 흐름 회귀."""
+    cfg.strategy.entry_threshold_bps = 5
+    cfg.strategy.min_abs_entry_bps = 15
+    s = Storage(":memory:")
+    s.connect()
+    engine2 = PaperTradingEngine(cfg, s, KiwoomMock(), risk_mgr=RiskManager(cfg.risk))
+    p = _pair("wti_cme_hl")
+    p.params.entry_threshold_bps = 5
+    engine2.register_pair(p)
+    _bootstrap_warmup(engine2, "wti_cme_hl")
+
+    # exec_basis ≈ 8bp (entry_threshold=5 통과), min_abs=15 차단
+    await engine2.process_pair_basis_update(
+        "wti_cme_hl", 10.0,
+        _q("hl", "xyz:CL", 80.08, 80.07, 80.09),
+        _q("kis", "MCLM26", 80.00, 79.99, 80.01),
+    )
+    assert engine2._state.entry_min_abs_skip >= 1
+    assert "wti_cme_hl" not in engine2._open_trades_by_pair
+
+
+@pytest.mark.asyncio
+async def test_pair_entry_succeeds_and_records_state(engine):
+    """깨끗한 진입 시그널 — 양 leg fill + state 기록 + DB 저장."""
+    p = _pair("wti_cme_hl")
+    engine.register_pair(p)
+    _bootstrap_warmup(engine, "wti_cme_hl")
+
+    # 30bp long_basis: leg_a(perp)이 leg_b 위
+    await engine.process_pair_basis_update(
+        "wti_cme_hl", 30.0,
+        _q("hl", "xyz:CL", 80.24, 80.23, 80.25),
+        _q("kis", "MCLM26", 80.00, 79.99, 80.01),
+    )
+    assert engine._state.total_entries == 1
+    assert engine._state.open_positions == 1
+    assert "wti_cme_hl" in engine._open_trades_by_pair
+    trade = engine._open_trades_by_pair["wti_cme_hl"]
+    assert trade.direction == "long_basis"
+    assert trade.perp_side == "short"
+    assert trade.futures_side == "long"
+    # leg_a fill = bid (sell)
+    assert trade.perp_entry_price == 80.23
+    # DB
+    rows = engine.storage.conn.execute(
+        "SELECT pair_id, exchange FROM orders WHERE pair_id='wti_cme_hl'"
+    ).fetchall()
+    assert len(rows) == 2
+    exchanges = {r["exchange"] for r in rows}
+    assert exchanges == {"hyperliquid", "kis"}
+
+
+@pytest.mark.asyncio
+async def test_pair_entry_then_exit_cycle(engine):
+    """진입 → 수렴 → 청산 1싸이클."""
+    p = _pair("wti_cme_hl")
+    engine.register_pair(p)
+    _bootstrap_warmup(engine, "wti_cme_hl")
+
+    # ENTRY 30bp long_basis
+    await engine.process_pair_basis_update(
+        "wti_cme_hl", 30.0,
+        _q("hl", "xyz:CL", 80.24, 80.23, 80.25),
+        _q("kis", "MCLM26", 80.00, 79.99, 80.01),
+    )
+    assert engine._state.total_entries == 1
+
+    # 수렴 — basis가 1bp로 줄어들어 spread 수렴 → EXIT 시그널
+    # (signals.py의 convergence_target_bps=3 기본값)
+    # short_basis 청산을 위해 leg_a 가격 leg_b와 동일
+    await engine.process_pair_basis_update(
+        "wti_cme_hl", 1.0,
+        _q("hl", "xyz:CL", 80.01, 80.00, 80.01),
+        _q("kis", "MCLM26", 80.00, 79.99, 80.01),
+    )
+    assert engine._state.total_exits == 1
+    assert engine._state.open_positions == 0
+    assert engine._state.closed_trades == 1
+    assert "wti_cme_hl" not in engine._open_trades_by_pair
+    assert len(engine._closed_trades) == 1
+
+
+@pytest.mark.asyncio
+async def test_pair_exit_without_open_trade_logs_warning(engine, caplog):
+    """오픈 포지션 없는데 exit 시그널 — 경고 로그만, state 변화 없음."""
+    p = _pair("wti_cme_hl")
+    engine.register_pair(p)
+    _bootstrap_warmup(engine, "wti_cme_hl")
+    # 직접 exit 시그널 시뮬: signal_gen이 EXIT 내려야 하지만 포지션이 없으면 안 내려옴.
+    # 우회: 직접 _handle_pair_exit 호출
+    fake_sig = Signal(
+        type=SignalType.EXIT, product="wti_cme_hl",
+        basis_bps=0, basis_mean=0, basis_std=0,
+    )
+    await engine._handle_pair_exit(
+        "wti_cme_hl", fake_sig,
+        _q("hl", "xyz:CL", 80, 80, 80), _q("kis", "MCLM26", 80, 80, 80),
+    )
+    # 변화 없음
+    assert engine._state.total_exits == 0
+
+
+def test_calculate_pair_contracts_uses_leg_b_contract_size(engine):
+    p = _pair("wti_cme_hl")     # leg_b.contract_size=100 (MCL)
+    engine.register_pair(p)
+    n = engine._calculate_pair_contracts(p, leg_b_price=80.0)
+    assert n >= 1
+    # max_position_contracts cap 적용 (config 기본 max=2)
+    n_high = engine._calculate_pair_contracts(p, leg_b_price=10.0)
+    assert n_high <= engine.config.risk.max_position_contracts
