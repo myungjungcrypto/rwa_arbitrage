@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -326,3 +327,116 @@ def test_alltime_stats_unknown_pair_returns_zeros(db_path):
     assert s["open_n"] == 0
     assert s["closed_net"] == 0
     con.close()
+
+
+# ──────────────────────────────────────────────
+# since_date filter — 2026-04-21 cutoff (zombie cleanup 이전 제외)
+# ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def db_with_pre_cutoff_data(tmp_path: Path) -> str:
+    """4-21 이전 zombie 거래 + 4-21 이후 정상 거래 + basis 데이터."""
+    p = str(tmp_path / "cutoff.db")
+    s = Storage(p)
+    s.connect()
+    base = time.time()
+
+    # 4-20 zombie cleanup 거래 (closed_at = 2026-04-20)
+    pre_ts = datetime(2026, 4, 20, 12, 0).timestamp()
+    s.conn.execute(
+        """INSERT INTO positions (product, pair_id,
+              perp_size, perp_entry, futures_size, futures_entry,
+              realized_pnl, funding_pnl, status, opened_at, closed_at)
+            VALUES ('wti','wti_cme_hl', -200, 80.0, 200, 80.0,
+                    -2500.0, 0.0, 'closed', ?, ?)""",
+        (pre_ts - 86400 * 5, pre_ts),
+    )
+
+    # 4-21 이후 정상 거래
+    post_ts = datetime(2026, 4, 21, 17, 0).timestamp()
+    s.conn.execute(
+        """INSERT INTO positions (product, pair_id,
+              perp_size, perp_entry, futures_size, futures_entry,
+              realized_pnl, funding_pnl, status, opened_at, closed_at)
+            VALUES ('wti','wti_cme_hl', -200, 80.20, 200, 80.0,
+                    +50.0, 0.0, 'closed', ?, ?)""",
+        (post_ts, post_ts + 60),
+    )
+
+    # daily_pnl
+    s.conn.execute(
+        "INSERT INTO daily_pnl (date, product, trading_pnl, funding_pnl, fees, net_pnl, num_trades) "
+        "VALUES ('2026-04-20', 'wti', -2500.0, 0, 0, -2500.0, 1)"
+    )
+    s.conn.execute(
+        "INSERT INTO daily_pnl (date, product, trading_pnl, funding_pnl, fees, net_pnl, num_trades) "
+        "VALUES ('2026-04-21', 'wti', 50.0, 0, 13.0, 37.0, 1)"
+    )
+
+    # basis_spread (cutoff 전후)
+    s.save_basis(product="wti", perp_price=80, futures_price=80,
+                 funding_rate=0, ts=pre_ts)
+    s.save_basis(product="wti", perp_price=80.1, futures_price=80,
+                 funding_rate=0, ts=post_ts)
+    s.save_basis(product="wti", perp_price=80.2, futures_price=80,
+                 funding_rate=0, ts=time.time() - 600)
+
+    s.conn.commit()
+    s.close()
+    return p
+
+
+def test_alltime_stats_filters_zombie_data_with_since_date(db_with_pre_cutoff_data):
+    con = queries.open_connection(db_with_pre_cutoff_data)
+
+    # cutoff 없으면 zombie -2500 포함
+    s_all = queries.load_alltime_stats(con, "wti_cme_hl", since_date=None)
+    assert s_all["closed_n"] == 2
+    assert s_all["closed_net"] == -2450.0
+
+    # cutoff 적용 시 정상 +50만
+    s_cut = queries.load_alltime_stats(con, "wti_cme_hl",
+                                        since_date="2026-04-21")
+    assert s_cut["closed_n"] == 1
+    assert s_cut["closed_net"] == 50.0
+    con.close()
+
+
+def test_closed_trades_filters_with_since_date(db_with_pre_cutoff_data):
+    con = queries.open_connection(db_with_pre_cutoff_data)
+    df_all = queries.load_closed_trades(con, "wti_cme_hl", limit=10, since_date=None)
+    df_cut = queries.load_closed_trades(con, "wti_cme_hl", limit=10,
+                                          since_date="2026-04-21")
+    assert len(df_all) == 2
+    assert len(df_cut) == 1
+    assert df_cut.iloc[0]["realized_pnl"] == 50.0
+    con.close()
+
+
+def test_daily_pnl_filters_with_since_date(db_with_pre_cutoff_data):
+    con = queries.open_connection(db_with_pre_cutoff_data)
+    df_all = queries.load_daily_pnl(con, "wti_cme_hl", days=30, since_date=None)
+    df_cut = queries.load_daily_pnl(con, "wti_cme_hl", days=30,
+                                      since_date="2026-04-21")
+    # cutoff 없으면 4-20, 4-21 둘 다
+    assert len(df_all) == 2
+    # cutoff 적용 시 4-21만
+    assert len(df_cut) == 1
+    assert df_cut["net"].sum() == 37.0
+    con.close()
+
+
+def test_basis_series_max_window_or_cutoff(db_with_pre_cutoff_data):
+    """hours 윈도우와 cutoff 둘 중 더 가까운(=많이 잘리는) 것 적용."""
+    con = queries.open_connection(db_with_pre_cutoff_data)
+    # hours가 매우 큼 (1년) → cutoff가 binding
+    df_cut = queries.load_basis_series(con, "wti_cme_hl", hours=8760,
+                                          since_date="2026-04-21")
+    # 2026-04-20 row 제외, 2026-04-21 + 최근 row 포함
+    assert all(df_cut["ts"] >= datetime(2026, 4, 21).timestamp())
+    con.close()
+
+
+def test_default_since_date_constant():
+    assert queries.DEFAULT_SINCE_DATE.isoformat() == "2026-04-21"

@@ -54,15 +54,15 @@ def _state_history(db_path: str, pair_id: str, hours: float):
 
 
 @st.cache_data(ttl=DEFAULT_REFRESH_S)
-def _daily_pnl(db_path: str, pair_id: str | None, days: int):
+def _daily_pnl(db_path: str, pair_id: str | None, days: int, since_iso: str | None):
     con = _con(db_path)
-    return queries.load_daily_pnl(con, pair_id, days=days)
+    return queries.load_daily_pnl(con, pair_id, days=days, since_date=since_iso)
 
 
 @st.cache_data(ttl=DEFAULT_REFRESH_S)
-def _closed_trades(db_path: str, pair_id: str | None, limit: int):
+def _closed_trades(db_path: str, pair_id: str | None, limit: int, since_iso: str | None):
     con = _con(db_path)
-    return queries.load_closed_trades(con, pair_id, limit=limit)
+    return queries.load_closed_trades(con, pair_id, limit=limit, since_date=since_iso)
 
 
 @st.cache_data(ttl=DEFAULT_REFRESH_S)
@@ -72,9 +72,9 @@ def _open_positions(db_path: str):
 
 
 @st.cache_data(ttl=DEFAULT_REFRESH_S)
-def _basis_series(db_path: str, pair_id: str | None, hours: float):
+def _basis_series(db_path: str, pair_id: str | None, hours: float, since_iso: str | None):
     con = _con(db_path)
-    return queries.load_basis_series(con, pair_id, hours=hours)
+    return queries.load_basis_series(con, pair_id, hours=hours, since_date=since_iso)
 
 
 @st.cache_data(ttl=60)
@@ -90,9 +90,9 @@ def _registered_pairs(db_path: str):
 
 
 @st.cache_data(ttl=DEFAULT_REFRESH_S)
-def _alltime_stats(db_path: str, pair_id: str | None):
+def _alltime_stats(db_path: str, pair_id: str | None, since_iso: str | None):
     con = _con(db_path)
-    return queries.load_alltime_stats(con, pair_id)
+    return queries.load_alltime_stats(con, pair_id, since_date=since_iso)
 
 
 # ──────────────────────────────────────────────
@@ -135,6 +135,27 @@ def main():
         days_pnl = st.slider("Daily PnL: 최근 N일", min_value=7, max_value=90, value=30)
         n_trades = st.slider("Trade history: 최근 N건", min_value=20, max_value=500, value=100)
 
+        st.divider()
+        # 의미있는 데이터 cutoff — zombie cleanup(2026-04-20) 이후
+        from datetime import date as _date
+        use_cutoff = st.checkbox(
+            "Cutoff 적용 (zombie 청산 이후만)",
+            value=True,
+            help="2026-04-20 close_zombies.py 일회성 -$20K 이벤트 + 그 이전의 "
+                 "롤오버 버그 영향 데이터를 분석에서 제외",
+        )
+        if use_cutoff:
+            cutoff_date = st.date_input(
+                "Since",
+                value=queries.DEFAULT_SINCE_DATE,
+                min_value=_date(2026, 1, 1),
+                max_value=_date.today(),
+            )
+            since_iso: str | None = cutoff_date.isoformat()
+        else:
+            since_iso = None
+        st.divider()
+
         auto_refresh = st.checkbox("자동 새로고침 (10초)", value=True)
         if auto_refresh:
             try:
@@ -164,7 +185,7 @@ def main():
 
     # 메트릭은 DB 기반 (engine_state 카운터는 봇 프로세스 재시작 시 리셋되므로
     # "전체 기간" 표기는 positions 테이블에서 직접 집계)
-    stats = _alltime_stats(db_path, pair_id)
+    stats = _alltime_stats(db_path, pair_id, since_iso)
     cols[1].metric("Open positions", stats["open_n"])
     cols[2].metric("Closed trades", stats["closed_n"])
     cols[3].metric("Cumulative PnL", f"${stats['closed_net']:+.2f}")
@@ -194,8 +215,8 @@ def main():
 
     # ── Basis chart ──
     st.subheader("📈 Basis chart")
-    basis_df = _basis_series(db_path, pair_id, hours)
-    closed_for_chart = _closed_trades(db_path, pair_id, limit=500)
+    basis_df = _basis_series(db_path, pair_id, hours, since_iso)
+    closed_for_chart = _closed_trades(db_path, pair_id, limit=500, since_iso=since_iso)
     open_for_chart = _open_positions(db_path)
     if not basis_df.empty:
         fig = charts.basis_chart(
@@ -234,7 +255,7 @@ def main():
 
     # ── Trade history ──
     st.subheader(f"📜 Trade history (최근 {n_trades}건)")
-    closed_df = _closed_trades(db_path, pair_id, limit=n_trades)
+    closed_df = _closed_trades(db_path, pair_id, limit=n_trades, since_iso=since_iso)
     if closed_df.empty:
         st.info("완료된 거래 없음")
     else:
@@ -288,7 +309,7 @@ def main():
     col_left, col_right = st.columns([2, 1])
     with col_left:
         st.subheader(f"💰 Daily PnL (최근 {days_pnl}일)")
-        daily_df = _daily_pnl(db_path, pair_id, days_pnl)
+        daily_df = _daily_pnl(db_path, pair_id, days_pnl, since_iso)
         if daily_df.empty:
             st.info("데이터 없음")
         else:

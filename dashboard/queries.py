@@ -4,17 +4,36 @@
 read-only — DB 변경 없음. Streamlit 캐시는 호출자가 처리.
 
 Phase M2.1.
+
+since_ts/since_date 필터: 의미있는 데이터만 보기 위한 cutoff.
+2026-04-20 zombie cleanup 등 일회성 이벤트로 인한 표본 오염을 분석에서 제거할 때 사용.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from datetime import date, datetime
 from typing import Optional
 
 import pandas as pd
 
 
 DEFAULT_DB_PATH = "data/arbitrage.db"
+
+# 의미있는 페이퍼 데이터 시작점 — 롤오버 픽스 + zombie cleanup 이후
+# (2026-04-20 close_zombies.py 청산일자 익일).
+DEFAULT_SINCE_DATE = date(2026, 4, 21)
+
+
+def _date_to_ts(d: date | datetime | str | None) -> Optional[float]:
+    """date/str → unix epoch (포함 — 그날 00:00:00 KST). None 그대로 통과."""
+    if d is None:
+        return None
+    if isinstance(d, str):
+        d = datetime.strptime(d, "%Y-%m-%d").date()
+    if isinstance(d, datetime):
+        return d.timestamp()
+    return datetime(d.year, d.month, d.day).timestamp()
 
 
 # ──────────────────────────────────────────────
@@ -86,42 +105,58 @@ def list_registered_pairs(con: sqlite3.Connection) -> list[dict]:
 
 
 def load_daily_pnl(
-    con: sqlite3.Connection, pair_id: Optional[str] = None, days: int = 30
+    con: sqlite3.Connection,
+    pair_id: Optional[str] = None,
+    days: int = 30,
+    since_date: date | datetime | str | None = None,
 ) -> pd.DataFrame:
     """일별 PnL — pair_id 지정 시 필터, 미지정 시 전체 product 합산.
 
     Schema: legacy daily_pnl(date, product, trading/funding/fees/net_pnl, num_trades)
     + v2 추가 컬럼 pair_id.
     """
+    since_str = None
+    if since_date is not None:
+        if isinstance(since_date, datetime):
+            since_str = since_date.date().isoformat()
+        elif isinstance(since_date, date):
+            since_str = since_date.isoformat()
+        else:
+            since_str = str(since_date)
+
     if pair_id:
-        sql = """SELECT date,
-                        SUM(trading_pnl) AS trading,
-                        SUM(funding_pnl) AS funding,
-                        SUM(fees) AS fees,
-                        SUM(net_pnl) AS net,
-                        SUM(num_trades) AS n
-                   FROM daily_pnl
-                  WHERE (pair_id = ? OR (pair_id IS NULL AND product = ?))
-                  GROUP BY date
-                  ORDER BY date DESC
-                  LIMIT ?"""
-        # legacy 'wti' product backfill 호환: pair_id 또는 product 매칭
         legacy_product = pair_id.split("_", 1)[0]
-        df = pd.read_sql_query(sql, con, params=(pair_id, legacy_product, days))
+        where_extra = " AND date >= ?" if since_str else ""
+        sql = f"""SELECT date,
+                         SUM(trading_pnl) AS trading,
+                         SUM(funding_pnl) AS funding,
+                         SUM(fees) AS fees,
+                         SUM(net_pnl) AS net,
+                         SUM(num_trades) AS n
+                    FROM daily_pnl
+                   WHERE (pair_id = ? OR (pair_id IS NULL AND product = ?)){where_extra}
+                   GROUP BY date
+                   ORDER BY date DESC
+                   LIMIT ?"""
+        params: tuple = (pair_id, legacy_product)
+        if since_str:
+            params = params + (since_str,)
+        params = params + (days,)
+        df = pd.read_sql_query(sql, con, params=params)
     else:
-        df = pd.read_sql_query(
-            """SELECT date,
-                      SUM(trading_pnl) AS trading,
-                      SUM(funding_pnl) AS funding,
-                      SUM(fees) AS fees,
-                      SUM(net_pnl) AS net,
-                      SUM(num_trades) AS n
-                 FROM daily_pnl
-                 GROUP BY date
-                 ORDER BY date DESC
-                 LIMIT ?""",
-            con, params=(days,),
-        )
+        where_extra = " WHERE date >= ?" if since_str else ""
+        sql = f"""SELECT date,
+                         SUM(trading_pnl) AS trading,
+                         SUM(funding_pnl) AS funding,
+                         SUM(fees) AS fees,
+                         SUM(net_pnl) AS net,
+                         SUM(num_trades) AS n
+                    FROM daily_pnl{where_extra}
+                    GROUP BY date
+                    ORDER BY date DESC
+                    LIMIT ?"""
+        params = ((since_str,) if since_str else ()) + (days,)
+        df = pd.read_sql_query(sql, con, params=params)
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values("date")
@@ -135,33 +170,42 @@ def load_daily_pnl(
 
 
 def load_closed_trades(
-    con: sqlite3.Connection, pair_id: Optional[str] = None, limit: int = 200
+    con: sqlite3.Connection,
+    pair_id: Optional[str] = None,
+    limit: int = 200,
+    since_date: date | datetime | str | None = None,
 ) -> pd.DataFrame:
     """완료된 거래 목록. analyze_paper.load_closed_trades 동치."""
+    since_ts = _date_to_ts(since_date)
+    extra = " AND closed_at >= ?" if since_ts is not None else ""
+
     if pair_id:
         legacy_product = pair_id.split("_", 1)[0]
-        sql = """SELECT id, product, pair_id,
-                        perp_size, perp_entry, futures_size, futures_entry,
-                        realized_pnl, funding_pnl,
-                        opened_at, closed_at
-                   FROM positions
-                  WHERE status='closed'
-                    AND (pair_id = ? OR (pair_id IS NULL AND product = ?))
-                  ORDER BY closed_at DESC
-                  LIMIT ?"""
-        df = pd.read_sql_query(sql, con, params=(pair_id, legacy_product, limit))
+        sql = f"""SELECT id, product, pair_id,
+                         perp_size, perp_entry, futures_size, futures_entry,
+                         realized_pnl, funding_pnl,
+                         opened_at, closed_at
+                    FROM positions
+                   WHERE status='closed'
+                     AND (pair_id = ? OR (pair_id IS NULL AND product = ?)){extra}
+                   ORDER BY closed_at DESC
+                   LIMIT ?"""
+        params: tuple = (pair_id, legacy_product)
+        if since_ts is not None:
+            params = params + (since_ts,)
+        params = params + (limit,)
+        df = pd.read_sql_query(sql, con, params=params)
     else:
-        df = pd.read_sql_query(
-            """SELECT id, product, pair_id,
-                      perp_size, perp_entry, futures_size, futures_entry,
-                      realized_pnl, funding_pnl,
-                      opened_at, closed_at
-                 FROM positions
-                WHERE status='closed'
-                ORDER BY closed_at DESC
-                LIMIT ?""",
-            con, params=(limit,),
-        )
+        sql = f"""SELECT id, product, pair_id,
+                         perp_size, perp_entry, futures_size, futures_entry,
+                         realized_pnl, funding_pnl,
+                         opened_at, closed_at
+                    FROM positions
+                   WHERE status='closed'{extra}
+                   ORDER BY closed_at DESC
+                   LIMIT ?"""
+        params = ((since_ts,) if since_ts is not None else ()) + (limit,)
+        df = pd.read_sql_query(sql, con, params=params)
     if df.empty:
         return df
 
@@ -206,27 +250,48 @@ def load_open_positions(con: sqlite3.Connection) -> pd.DataFrame:
 
 
 def load_basis_series(
-    con: sqlite3.Connection, pair_id: Optional[str] = None, hours: float = 24
+    con: sqlite3.Connection,
+    pair_id: Optional[str] = None,
+    hours: float = 24,
+    since_date: date | datetime | str | None = None,
 ) -> pd.DataFrame:
-    """basis_spread 최근 N시간 (basis chart용)."""
+    """basis_spread 최근 N시간 (basis chart용).
+
+    since_date 지정 시 hours 윈도우와 둘 중 더 가까운(=많이 잘리는) 것 적용.
+    예: hours=24 + since_date=2026-04-21 → max(now-24h, 2026-04-21).
+    """
+    since_ts = _date_to_ts(since_date)
     if pair_id:
         legacy_product = pair_id.split("_", 1)[0]
-        df = pd.read_sql_query(
-            """SELECT ts, perp_price, futures_price, basis_bps, funding_rate
-                 FROM basis_spread
-                WHERE (pair_id = ? OR (pair_id IS NULL AND product = ?))
-                  AND ts >= strftime('%s','now') - ? * 3600
-                ORDER BY ts ASC""",
-            con, params=(pair_id, legacy_product, hours),
-        )
+        if since_ts is not None:
+            sql = """SELECT ts, perp_price, futures_price, basis_bps, funding_rate
+                       FROM basis_spread
+                      WHERE (pair_id = ? OR (pair_id IS NULL AND product = ?))
+                        AND ts >= MAX(strftime('%s','now') - ? * 3600, ?)
+                      ORDER BY ts ASC"""
+            params: tuple = (pair_id, legacy_product, hours, since_ts)
+        else:
+            sql = """SELECT ts, perp_price, futures_price, basis_bps, funding_rate
+                       FROM basis_spread
+                      WHERE (pair_id = ? OR (pair_id IS NULL AND product = ?))
+                        AND ts >= strftime('%s','now') - ? * 3600
+                      ORDER BY ts ASC"""
+            params = (pair_id, legacy_product, hours)
+        df = pd.read_sql_query(sql, con, params=params)
     else:
-        df = pd.read_sql_query(
-            """SELECT ts, perp_price, futures_price, basis_bps, funding_rate
-                 FROM basis_spread
-                WHERE ts >= strftime('%s','now') - ? * 3600
-                ORDER BY ts ASC""",
-            con, params=(hours,),
-        )
+        if since_ts is not None:
+            sql = """SELECT ts, perp_price, futures_price, basis_bps, funding_rate
+                       FROM basis_spread
+                      WHERE ts >= MAX(strftime('%s','now') - ? * 3600, ?)
+                      ORDER BY ts ASC"""
+            params = (hours, since_ts)
+        else:
+            sql = """SELECT ts, perp_price, futures_price, basis_bps, funding_rate
+                       FROM basis_spread
+                      WHERE ts >= strftime('%s','now') - ? * 3600
+                      ORDER BY ts ASC"""
+            params = (hours,)
+        df = pd.read_sql_query(sql, con, params=params)
     if not df.empty:
         df["ts_dt"] = pd.to_datetime(df["ts"], unit="s")
     return df
@@ -336,33 +401,45 @@ def state_freshness_seconds(state_latest: Optional[dict]) -> Optional[float]:
     return _t.time() - state_latest["ts"]
 
 
-def load_alltime_stats(con: sqlite3.Connection, pair_id: Optional[str] = None) -> dict:
+def load_alltime_stats(
+    con: sqlite3.Connection,
+    pair_id: Optional[str] = None,
+    since_date: date | datetime | str | None = None,
+) -> dict:
     """positions 테이블에서 누적 통계.
 
     engine_state 카운터는 봇 프로세스 메모리 기준(재시작 시 리셋) →
     "전체 기간" 표기는 이 DB 기반 stats 사용.
+
+    since_date 지정 시 closed_at >= since_date인 거래만 집계
+    (open positions는 시점 무관, 전체 카운트).
     """
+    since_ts = _date_to_ts(since_date)
+    closed_extra = " AND closed_at >= ?" if since_ts is not None else ""
+
     if pair_id:
         legacy_product = pair_id.split("_", 1)[0]
         where = "AND (pair_id = ? OR (pair_id IS NULL AND product = ?))"
-        params: tuple = (pair_id, legacy_product)
+        base_params: tuple = (pair_id, legacy_product)
     else:
         where = ""
-        params = ()
+        base_params = ()
+
+    closed_params = base_params + ((since_ts,) if since_ts is not None else ())
     closed_row = con.execute(
         f"""SELECT COUNT(*) AS n,
                    COALESCE(SUM(realized_pnl), 0) AS realized,
                    COALESCE(SUM(funding_pnl), 0) AS funding
               FROM positions
-             WHERE status='closed' {where}""",
-        params,
+             WHERE status='closed' {where}{closed_extra}""",
+        closed_params,
     ).fetchone()
     open_row = con.execute(
         f"""SELECT COUNT(*) AS n,
                    COALESCE(SUM(unrealized_pnl), 0) AS unrealized
               FROM positions
              WHERE status='open' {where}""",
-        params,
+        base_params,
     ).fetchone()
     return {
         "closed_n": closed_row["n"],
