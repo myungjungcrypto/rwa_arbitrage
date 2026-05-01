@@ -1057,6 +1057,11 @@ class PaperTradingEngine:
             )
             return
 
+        # 동시 진입 race 방어 — gather 동안 다른 coroutine이 이미 진입했는지 재확인
+        if pair_id in self._open_trades_by_pair:
+            logger.info(f"[{pair_id}] ENTRY race — already opened by concurrent task")
+            return
+
         # ── 기록 ──
         self._trade_counter += 1
         trade = TradeRecord(
@@ -1145,6 +1150,12 @@ class PaperTradingEngine:
             )
             return
 
+        # 동시 청산 race 방어 — gather 동안 다른 coroutine이 이미 청산했는지 atomic pop
+        trade = self._open_trades_by_pair.pop(pair_id, None)
+        if trade is None:
+            logger.info(f"[{pair_id}] EXIT race — already closed by concurrent task")
+            return
+
         pnl = self._calculate_pnl(trade, a_exit, b_exit)
 
         trade.exit_time = time.time()
@@ -1166,7 +1177,6 @@ class PaperTradingEngine:
         self.signal_gen.close_position_for_pair(pair_id)
 
         legacy_product = trade.product
-        del self._open_trades_by_pair[pair_id]
         self._closed_trades.append(trade)
 
         self.storage.save_order(

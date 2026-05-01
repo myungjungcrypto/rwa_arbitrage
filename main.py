@@ -21,10 +21,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.utils.config import load_config
 from src.utils.logger import setup_logger, get_logger
 from src.utils.notifier import TelegramNotifier
-from src.data.storage import Storage
+from src.data.storage import LEGACY_PRODUCT_PAIR_MAP, Storage
 from src.data.collector import DataCollector
+from src.exchange.base import Quote
+from src.exchange.hyperliquid import HyperliquidExchange
+from src.exchange.kis import KISAuth, KISExchange, KISFuturesClient
 from src.exchange.kiwoom import create_kiwoom_client
-from src.exchange.kis import KISAuth, KISFuturesClient
+from src.exchange.registry import ExchangeRegistry
+from src.strategy.pair import LegRole
 from src.strategy.rollover import get_active_contract, us_market_holidays
 
 
@@ -323,37 +327,75 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         kiwoom=kiwoom,
     )
 
+    # ── Phase C5: pair-keyed 경로 wiring ──
+    # ArbitragePair 합성 + ExchangeRegistry + 어댑터 등록 + 페어 등록
+    pairs = config.get_pairs()
+    registry = ExchangeRegistry()
+    # HL adapter는 collector가 이미 들고 있는 client + ws를 재사용 (구독 중복 방지)
+    registry.register(HyperliquidExchange(rest=collector.hl_client, ws=collector.hl_ws))
+    if kis_client is not None:
+        registry.register(KISExchange(client=kis_client))
+    engine.set_exchange_registry(registry)
+    for pair in pairs:
+        engine.register_pair(pair)
+        collector.register_pair(pair)
+    pair_by_product: dict[str, "object"] = {
+        product: collector.get_pair(LEGACY_PRODUCT_PAIR_MAP.get(product, product))
+        for product in config.products
+    }
+
     # DB에서 최근 basis 데이터 부트스트랩 (재시작 시 window 즉시 복원)
+    # legacy 'wti' 키와 pair_id 'wti_cme_hl' 키 둘 다에 주입 → 양 경로 모두 stats 보유.
     for product_name in config.products:
         history = storage.get_basis_history(product_name, hours=config.strategy.basis_window_hours)
         if history:
             engine.signal_gen.bootstrap_from_db(product_name, history)
+            pair_id = LEGACY_PRODUCT_PAIR_MAP.get(product_name)
+            if pair_id:
+                engine.signal_gen.bootstrap_from_db_for_pair(pair_id, history)
         else:
             logger.info(f"[{product_name.upper()}] No basis history in DB — starting fresh")
 
     # ── 콜백 연결 ──
 
-    # 1) 베이시스 업데이트 → 엔진에 전달
+    # 1) 베이시스 업데이트 → pair-keyed 경로로 bridge
+    #    legacy collector callback에서 받은 product/price/bid/ask를 Quote로 변환해
+    #    collector.update_leg_quote 로 push. update_leg_quote가 양 leg 도착 시
+    #    on_pair_basis 콜백을 fire → engine.process_pair_basis_update (async).
     def on_basis(product, perp_price, futures_price, basis_bps,
                  perp_best_bid=0.0, perp_best_ask=0.0,
                  futures_bid=0.0, futures_ask=0.0):
-        # 펀딩레이트 가져오기
+        pair = pair_by_product.get(product)
+        if pair is None:
+            return
+
         md = collector.latest_perp.get(product)
         funding_rate = md.funding_rate if md else 0.0
+        index_price = md.index_price if md else 0.0
+        predicted_funding = md.predicted_funding_rate if md else 0.0
 
-        engine.process_basis_update(
-            product=product,
-            perp_price=perp_price,
-            futures_price=futures_price,
-            basis_bps=basis_bps,
+        leg_a_q = Quote(
+            exchange=pair.leg_a.exchange,
+            symbol=pair.leg_a.symbol,
+            mid_price=perp_price,
+            bid=perp_best_bid, ask=perp_best_ask,
+            index_price=index_price,
             funding_rate=funding_rate,
-            perp_best_bid=perp_best_bid,
-            perp_best_ask=perp_best_ask,
-            futures_bid=futures_bid,
-            futures_ask=futures_ask,
+            funding_interval_hours=pair.leg_a.funding_interval_hours,
+            predicted_funding_rate=predicted_funding,
         )
+        leg_b_q = Quote(
+            exchange=pair.leg_b.exchange,
+            symbol=pair.leg_b.symbol,
+            mid_price=futures_price,
+            bid=futures_bid, ask=futures_ask,
+            contract_month=(pair.leg_b.symbol if pair.leg_b.role == LegRole.DATED_FUTURES else ""),
+        )
+        collector.update_leg_quote(pair.id, "a", leg_a_q)
+        collector.update_leg_quote(pair.id, "b", leg_b_q)
 
     collector.on_basis_update(on_basis)
+    collector.on_pair_basis(engine.process_pair_basis_update)
 
     # 2) 트레이드 이벤트 → 로그 + 알림
     def on_trade(trade, event):
