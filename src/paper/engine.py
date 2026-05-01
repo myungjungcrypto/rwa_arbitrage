@@ -20,7 +20,10 @@ from dataclasses import dataclass, field, asdict
 from datetime import date
 from typing import Optional, Callable
 
+from src.exchange.base import OrderResult as BaseOrderResult, Quote
+from src.exchange.registry import ExchangeRegistry
 from src.strategy.signals import SignalGenerator, Signal, SignalType, PositionState
+from src.strategy.pair import ArbitragePair, LegRole
 from src.risk.manager import RiskManager, RiskCheck
 from src.data.storage import Storage, LEGACY_PRODUCT_PAIR_MAP
 from src.exchange.kiwoom import KiwoomBase, FuturesOrder
@@ -109,6 +112,7 @@ class PaperTradingEngine:
         kiwoom: KiwoomBase,
         signal_gen: SignalGenerator | None = None,
         risk_mgr: RiskManager | None = None,
+        registry: ExchangeRegistry | None = None,
     ):
         self.config = config
         self.storage = storage
@@ -129,13 +133,13 @@ class PaperTradingEngine:
         )
         self.risk_mgr = risk_mgr or RiskManager(config.risk)
 
-        # 상태 추적
+        # 상태 추적 (legacy product-keyed)
         self._open_trades: dict[str, TradeRecord] = {}  # product -> open trade
         self._closed_trades: list[TradeRecord] = []
         self._trade_counter = 0
         self._state = EngineState()
 
-        # 최신 가격 캐시
+        # 최신 가격 캐시 (legacy product-keyed)
         self._latest_perp_prices: dict[str, float] = {}   # product -> mark_price
         self._latest_index_prices: dict[str, float] = {}   # product -> index_price
         self._latest_futures_prices: dict[str, float] = {}  # product -> futures_price (mid)
@@ -143,6 +147,14 @@ class PaperTradingEngine:
         self._latest_perp_ask: dict[str, float] = {}       # product -> best ask
         self._latest_futures_bid: dict[str, float] = {}    # product -> futures best bid
         self._latest_futures_ask: dict[str, float] = {}    # product -> futures best ask
+
+        # ── Phase C4a: pair-keyed 인프라 (Phase C5에서 main.py가 wire) ──
+        self._registry: Optional[ExchangeRegistry] = registry
+        self._registered_pairs: dict[str, ArbitragePair] = {}
+        self._open_trades_by_pair: dict[str, TradeRecord] = {}     # pair_id -> open trade
+        self._latest_pair_quote: dict[tuple[str, str], Quote] = {}  # (pair_id, leg) -> Quote
+        # 각 거래소당 동시 in-flight 주문 1건 보장 (HL이 5개 페어의 leg_a라 충돌 위험)
+        self._exchange_semaphores: dict[str, asyncio.Semaphore] = {}
 
         # 최소 워밍업 데이터 수 (이 이하면 거래 안 함)
         self.MIN_WARMUP_POINTS = 3600  # 약 1시간 분량
@@ -822,3 +834,131 @@ class PaperTradingEngine:
                 )
 
         return "\n".join(lines)
+
+    # ──────────────────────────────────────────────
+    # Phase C4a: pair-keyed 인프라 (registration / quote 캐시 / dispatch helper)
+    # main.py(C5)가 ExchangeRegistry 주입 후 페어 등록 + collector 콜백 wire.
+    # 실제 entry/exit 흐름은 C4b에서 추가.
+    # ──────────────────────────────────────────────
+
+    def set_exchange_registry(self, registry: ExchangeRegistry) -> None:
+        """ExchangeRegistry 주입. main.py가 어댑터 등록 후 호출."""
+        self._registry = registry
+
+    def register_pair(self, pair: ArbitragePair) -> None:
+        """추적 대상 페어 등록. 이미 등록된 pair_id면 덮어씀."""
+        self._registered_pairs[pair.id] = pair
+        # 거래소별 세마포어 lazy-create (페어가 사용하는 양 leg 모두)
+        for leg in (pair.leg_a, pair.leg_b):
+            if leg.exchange not in self._exchange_semaphores:
+                self._exchange_semaphores[leg.exchange] = asyncio.Semaphore(1)
+        logger.info(
+            f"[ENGINE] pair registered: {pair.id} "
+            f"({pair.leg_a.exchange}/{pair.leg_a.symbol} ↔ "
+            f"{pair.leg_b.exchange}/{pair.leg_b.symbol})"
+        )
+
+    def get_registered_pair(self, pair_id: str) -> Optional[ArbitragePair]:
+        return self._registered_pairs.get(pair_id)
+
+    @property
+    def registered_pairs(self) -> dict[str, ArbitragePair]:
+        return dict(self._registered_pairs)
+
+    def get_pair_open_trade(self, pair_id: str) -> Optional[TradeRecord]:
+        return self._open_trades_by_pair.get(pair_id)
+
+    def get_pair_open_trades(self) -> dict[str, TradeRecord]:
+        return self._open_trades_by_pair.copy()
+
+    def cache_pair_quote(self, pair_id: str, leg: str, quote: Quote) -> None:
+        """페어 leg별 최신 Quote 캐시. collector callback 또는 외부 어댑터에서 호출."""
+        if leg not in ("a", "b"):
+            raise ValueError(f"leg must be 'a' or 'b', got {leg!r}")
+        self._latest_pair_quote[(pair_id, leg)] = quote
+
+    def latest_pair_quote(self, pair_id: str, leg: str) -> Optional[Quote]:
+        return self._latest_pair_quote.get((pair_id, leg))
+
+    def has_both_legs(self, pair_id: str) -> bool:
+        return ((pair_id, "a") in self._latest_pair_quote
+                and (pair_id, "b") in self._latest_pair_quote)
+
+    @staticmethod
+    def compute_pair_exec_basis(
+        direction: str, leg_a: Quote, leg_b: Quote
+    ) -> float:
+        """exec_basis (체결 가능 spread, bp).
+
+        long_basis 진입: leg_a 매도(bid) + leg_b 매수(ask)
+                          → exec = (a.bid - b.ask) / b.ask × 10000
+        short_basis 진입: leg_a 매수(ask) + leg_b 매도(bid)
+                          → exec = (a.ask - b.bid) / b.bid × 10000
+
+        bid/ask 누락 시 0 반환 (호출자가 차단 결정).
+        """
+        if direction == "long_basis":
+            if leg_a.bid <= 0 or leg_b.ask <= 0:
+                return 0.0
+            return (leg_a.bid - leg_b.ask) / leg_b.ask * 10_000
+        if direction == "short_basis":
+            if leg_a.ask <= 0 or leg_b.bid <= 0:
+                return 0.0
+            return (leg_a.ask - leg_b.bid) / leg_b.bid * 10_000
+        raise ValueError(f"direction must be 'long_basis' or 'short_basis', got {direction!r}")
+
+    async def dispatch_pair_order(
+        self,
+        pair_id: str,
+        leg: str,
+        side: str,                           # "buy" | "sell"
+        size: float,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+    ) -> BaseOrderResult:
+        """페어 leg에 주문 발사. ExchangeRegistry → ExchangeBase.place_order.
+
+        거래소별 Semaphore(1)로 in-flight 1건 보장 (HL은 5개 페어의 leg_a라
+        동시 진입 시 충돌 위험).
+        """
+        if self._registry is None:
+            raise RuntimeError("ExchangeRegistry not set; call set_exchange_registry first")
+        pair = self._registered_pairs.get(pair_id)
+        if pair is None:
+            raise KeyError(f"pair {pair_id!r} not registered")
+        leg_cfg = pair.leg(leg)
+
+        if not self._registry.has(leg_cfg.exchange):
+            return BaseOrderResult(
+                success=False, exchange=leg_cfg.exchange, symbol=leg_cfg.symbol,
+                error=f"exchange {leg_cfg.exchange!r} not in registry",
+            )
+        adapter = self._registry.get(leg_cfg.exchange)
+        sem = self._exchange_semaphores.setdefault(
+            leg_cfg.exchange, asyncio.Semaphore(1)
+        )
+        async with sem:
+            try:
+                return await adapter.place_order(
+                    symbol=leg_cfg.symbol,
+                    side=side,                    # type: ignore[arg-type]
+                    size=size,
+                    order_type=order_type,        # type: ignore[arg-type]
+                    limit_price=limit_price,
+                    reduce_only=reduce_only,
+                    client_order_id=client_order_id,
+                )
+            except NotImplementedError as e:
+                # KIS 등 페이퍼 단계 미구현 어댑터
+                return BaseOrderResult(
+                    success=False, exchange=leg_cfg.exchange, symbol=leg_cfg.symbol,
+                    error=f"NotImplementedError: {e}",
+                )
+            except Exception as e:
+                logger.error(f"[{pair_id}/{leg}] place_order error: {e}")
+                return BaseOrderResult(
+                    success=False, exchange=leg_cfg.exchange, symbol=leg_cfg.symbol,
+                    error=str(e),
+                )
