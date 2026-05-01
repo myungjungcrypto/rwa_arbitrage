@@ -203,7 +203,9 @@ async def test_subscribe_quotes_uses_factory_and_invokes_callback_on_update():
         received.append(q)
 
     await ex.subscribe_quotes("WTI", cb)
-    assert captured["host"].startswith("wss://")
+    # SDK는 scheme 없는 host만 받음
+    assert "wss://" not in captured["host"]
+    assert "/" not in captured["host"]    # path도 없음
     assert captured["order_book_ids"] == [7]
 
     # WsClient가 보낸 update 시뮬
@@ -246,3 +248,48 @@ async def test_get_funding_info_no_client_returns_none():
     ex.set_market_id("WTI", 0)
     info = await ex.get_funding_info("WTI")
     assert info is None
+
+
+# ──────────────────────────────────────────────
+# WS host extraction — SDK WsClient는 scheme 없는 도메인만 받음
+# ──────────────────────────────────────────────
+
+
+def test_extract_ws_host_strips_wss_scheme_and_path():
+    ex = LighterExchange(ws_url="wss://mainnet.zklighter.elliot.ai/stream")
+    assert ex._extract_ws_host() == "mainnet.zklighter.elliot.ai"
+
+
+def test_extract_ws_host_strips_https_scheme():
+    ex = LighterExchange(ws_url="https://mainnet.zklighter.elliot.ai")
+    assert ex._extract_ws_host() == "mainnet.zklighter.elliot.ai"
+
+
+def test_extract_ws_host_already_bare_domain():
+    ex = LighterExchange(ws_url="mainnet.zklighter.elliot.ai")
+    assert ex._extract_ws_host() == "mainnet.zklighter.elliot.ai"
+
+
+def test_extract_ws_host_falls_back_to_base_url():
+    ex = LighterExchange(base_url="https://mainnet.zklighter.elliot.ai", ws_url="")
+    assert ex._extract_ws_host() == "mainnet.zklighter.elliot.ai"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_quotes_passes_bare_host_to_factory():
+    """SDK WsClient는 scheme 없는 host를 받음. factory에 전달되는 값이 'wss://...'가
+    아니라 도메인만이어야 함."""
+    captured: dict[str, Any] = {}
+
+    def FakeWsClient(host, order_book_ids, on_order_book_update):
+        captured["host"] = host
+
+    ex = LighterExchange(
+        ws_url="wss://mainnet.zklighter.elliot.ai/stream",
+        ws_client_factory=FakeWsClient,
+    )
+    ex.set_market_id("WTI", 7)
+
+    async def cb(q): pass
+    await ex.subscribe_quotes("WTI", cb)
+    assert captured["host"] == "mainnet.zklighter.elliot.ai"

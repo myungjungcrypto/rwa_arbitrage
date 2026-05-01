@@ -96,6 +96,24 @@ class LighterExchange:
     def get_market_id(self, symbol: str) -> Optional[int]:
         return self._market_ids.get(symbol)
 
+    def _extract_ws_host(self) -> str:
+        """SDK WsClient 형식에 맞춰 도메인만 추출.
+
+        SDK 내부: `wss://{host}{path}` (path 기본 "/stream").
+        우리가 받은 self.ws_url이 'wss://mainnet.zklighter.elliot.ai/stream'이든
+        'mainnet.zklighter.elliot.ai'든 동일하게 'mainnet.zklighter.elliot.ai'
+        반환 (path는 SDK가 추가).
+        """
+        url = self.ws_url or self.base_url or ""
+        for scheme in ("wss://", "ws://", "https://", "http://"):
+            if url.startswith(scheme):
+                url = url[len(scheme):]
+                break
+        # path 부분 제거 (SDK가 /stream 추가하므로 우리는 host만)
+        if "/" in url:
+            url = url.split("/", 1)[0]
+        return url
+
     async def discover_markets(self) -> dict[str, int]:
         """REST `/api/v1/orderBooks`로 active market 메타 일괄 조회.
 
@@ -199,15 +217,19 @@ class LighterExchange:
                     logger.error(f"[LIGHTER] callback error [{sym}]: {e}")
 
         market_ids = list(self._market_ids.values())
+        # SDK WsClient는 host에 scheme 없는 도메인만 받고 자체적으로
+        # `wss://{host}{path}` (path 기본 "/stream") 으로 URL 구성. 우리가 받은
+        # ws_url이 "wss://..." 풀 URL이면 scheme/path 제거 후 host만 추출.
+        ws_host = self._extract_ws_host()
         if self._ws_client_factory is not None:
             self._ws_client = self._ws_client_factory(
-                host=self.ws_url,
+                host=ws_host,
                 order_book_ids=market_ids,
                 on_order_book_update=_on_order_book_update,
             )
         elif _lighter_sdk is not None and hasattr(_lighter_sdk, "WsClient"):
             self._ws_client = _lighter_sdk.WsClient(
-                host=self.ws_url,
+                host=ws_host,
                 order_book_ids=market_ids,
                 on_order_book_update=_on_order_book_update,
             )
