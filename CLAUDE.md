@@ -180,8 +180,8 @@ rwa_arbitrage/
 | **C3** | `SignalGenerator` pair-keyed alias 메서드 | ✅ |
 | **C4a** | `PaperTradingEngine` 인프라 (registry, dispatch helper, Semaphore) | ✅ |
 | **C4b** | pair-keyed entry/exit flow (`process_pair_basis_update`) | ✅ |
-| **C5** | `main.py` 배선 — pair-keyed 경로로 switch | **현재 작업** |
-| D | Lighter 어댑터 + `wti_hl_lighter` 페어 (shadow → live) | - |
+| **C5** | `main.py` 배선 — pair-keyed 경로로 switch | ✅ |
+| **D** | Lighter 어댑터 + `wti_hl_lighter` 페어 (shadow → live) | **현재 작업** |
 | E | Binance 어댑터 + `wti_hl_binance` 페어 | - |
 | F | Bybit 어댑터 + `wti_hl_bybit` 페어 | - |
 | G | OKX 어댑터 + `wti_hl_okx` 페어 | - |
@@ -199,21 +199,21 @@ rwa_arbitrage/
 
 ## 현재 진행 (2026-04-29)
 
-**Phase C5 — `main.py` 배선**
+**Phase D — Lighter 어댑터 + 첫 Web3-Web3 페어**
 
-목표: main.py가 다음 항목을 신규 경로로 switch
-- `cfg.get_pairs()`로 `ArbitragePair` 리스트 합성
-- `ExchangeRegistry` 생성, `HyperliquidExchange` + `KISExchange` 어댑터 등록
-- `engine.set_exchange_registry(reg)` + `engine.register_pair(pair)`
-- `collector.register_pair(pair)` + `collector.on_pair_basis(engine.process_pair_basis_update)`
-- 레거시 `engine.process_basis_update` 콜백 제거 (또는 dual-path 옵션 유지)
+C5에서 main.py가 pair-keyed 경로로 전환 완료. 이제 Hyperliquid + KIS 외에
+새 거래소를 어댑터로 합류시키며 멀티 페어로 확장 시작.
 
-전환 후 EC2 deploy:
-- `pm2 restart rwa-arb`
-- 동일 동작 (`wti_cme_hl` 1개 페어)이지만 새 코드 경로 사용
-- engine_state + leg_prices에 pair_id 기준 데이터 누적 시작
+D 단계 작업:
+- `src/exchange/lighter.py` 신규 — `LighterExchange(ExchangeBase)` 어댑터
+  - REST + WS 클라이언트 (또는 lighter SDK 사용)
+  - WTI 심볼 호가/체결 구독 → `Quote` 변환 → `update_leg_quote` push
+  - `get_funding_info` 구현 (Lighter 1h funding 검증)
+- `config/settings.yaml`에 `pairs:` 블록 신규: `wti_hl_lighter` (initially `enabled: false` shadow)
+- main.py: registry에 `LighterExchange` 등록, lighter symbol 구독 시작
+- shadow 24h → 분포 분석 → `enabled: true` flip → paper 진입 시작
 
-**다음 단계 (Phase D)**: Lighter 어댑터 + `wti_hl_lighter` 페어 shadow 모드.
+**다음 단계 (Phase E)**: Binance 어댑터 + `wti_hl_binance` 페어.
 
 ---
 
@@ -222,6 +222,8 @@ rwa_arbitrage/
 (역순; 자세한 commit 메시지는 `git log` 참조)
 
 ### 2026-04-29
+- `6f9abdb` — **M10 Phase C5**: `main.py` 배선 완료. legacy `on_basis` 콜백이 Quote 빌더 bridge로 변환, `engine.process_pair_basis_update`(async) 가 pair callback으로 등록. ExchangeRegistry 구성 + `HyperliquidExchange` / `KISExchange` 어댑터 등록. 동시 진입/청산 race 방어 (atomic check-after-gather, atomic pop). 280 tests pass.
+- `894ff25` — **docs**: CLAUDE.md를 GitHub 진행 추적용 living document로 재작성.
 - `f178fc5` — **M10 Phase C4b**: pair-keyed `_handle_pair_entry` / `_handle_pair_exit` + `process_pair_basis_update` 오케스트레이터. KIS는 KiwoomMock으로 paper, perp는 quote bid/ask 시뮬. 274 tests pass.
 - `0c7ae9e` — **M10 Phase C4a**: Engine pair-keyed 인프라. `register_pair` / `set_exchange_registry` / `dispatch_pair_order` (per-exchange Semaphore(1)). 265 tests pass.
 - `5d6388f` — Dashboard since_date cutoff (default 2026-04-21). zombie cleanup -$20K + 그 이전 데이터 제외. 사이드바 datepicker로 override 가능.
