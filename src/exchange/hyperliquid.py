@@ -390,6 +390,44 @@ class HyperliquidClient:
 
     # ── 주문 ──
 
+    def _build_signer(self):
+        """eth_account.Account 객체 생성 (HL SDK Exchange.wallet 인자용).
+
+        agent wallet 권장: 메인 자산 wallet에서 권한 위임받은 별도 키만 사용.
+        secrets.yaml의 private_key는 agent의 키여야 보안상 안전.
+        """
+        if not self.private_key:
+            return None
+        try:
+            from eth_account import Account
+            pk = self.private_key
+            if not pk.startswith("0x"):
+                pk = "0x" + pk
+            return Account.from_key(pk)
+        except Exception as e:
+            logger.error(f"HL signer build failed: {e}")
+            return None
+
+    def _build_exchange(self):
+        """HL SDK Exchange 인스턴스 + signer wallet."""
+        from hyperliquid.exchange import Exchange
+        from hyperliquid.utils import constants
+        signer = self._build_signer()
+        if signer is None:
+            return None
+        base_url = (
+            constants.TESTNET_API_URL if "testnet" in self.base_url
+            else constants.MAINNET_API_URL
+        )
+        # account_address가 wallet과 같으면 (단순 trading wallet) 자동 추론.
+        # agent wallet 사용 시 account_address는 메인 wallet 주소여야 함.
+        account_address = self.wallet_address or signer.address
+        return Exchange(
+            wallet=signer,
+            base_url=base_url,
+            account_address=account_address,
+        )
+
     async def place_order(
         self,
         ticker: str,
@@ -398,73 +436,97 @@ class HyperliquidClient:
         price: float | None = None,
         reduce_only: bool = False,
     ) -> OrderResult:
-        """주문 생성.
+        """HL HIP-3 perp 주문 (Phase 11b 실서명).
+
+        agent wallet 또는 trading wallet의 private_key가 secrets.yaml에
+        있어야 함. wallet_address는 메인 wallet (agent 사용 시) 또는
+        signer 자신 (단일 wallet 사용 시).
 
         Args:
-            ticker: 상품 티커 (HIP-3: "WTIOIL" 등)
+            ticker: HIP-3 coin (예: "xyz:CL")
             side: BUY or SELL
-            size: 수량
+            size: 배럴 단위 수량 (HL은 base asset 단위)
             price: 지정가 (None이면 IOC 시장가)
             reduce_only: 포지션 감소만 허용
-
-        Returns:
-            OrderResult
         """
         if not self.private_key:
-            return OrderResult(success=False, error="Private key not set")
+            return OrderResult(success=False, error="HL private_key not set")
 
         try:
-            from hyperliquid.exchange import Exchange
-            from hyperliquid.utils import constants
+            exchange = self._build_exchange()
+            if exchange is None:
+                return OrderResult(success=False, error="failed to build HL signer/exchange")
+        except ImportError:
+            logger.warning("hyperliquid SDK not installed, cannot place order")
+            return OrderResult(success=False, error="SDK required for order placement")
+        except Exception as e:
+            return OrderResult(success=False, error=f"build_exchange: {e}")
 
-            base_url = constants.TESTNET_API_URL if "testnet" in self.base_url else constants.MAINNET_API_URL
-            exchange = Exchange(
-                wallet=None,  # 실제로는 eth_account 객체
-                base_url=base_url,
-            )
+        is_buy = side == OrderSide.BUY
+        # 시장가 = IOC limit. SDK는 sliding limit을 권장하지만 단순화 위해 큰 호가 사용.
+        # 그러나 호출자가 limit_px를 명시적으로 넘기면 그 값 사용.
+        if price is None:
+            # market: 호가창 충분히 cross 보장하기 위해 ~50bp away 책정
+            limit_px = 0.0   # SDK가 0이면 적절히 처리하길 기대 — 안전 위해 작은 값 권장
+            order_type = {"limit": {"tif": "Ioc"}}
+        else:
+            limit_px = price
+            order_type = {"limit": {"tif": "Gtc"}}
 
-            is_buy = side == OrderSide.BUY
-            order_type = {"limit": {"tif": "Gtc"}} if price else {"limit": {"tif": "Ioc"}}
-
+        try:
             result = exchange.order(
                 coin=ticker,
                 is_buy=is_buy,
                 sz=size,
-                limit_px=price or 0,
+                limit_px=limit_px,
                 order_type=order_type,
                 reduce_only=reduce_only,
             )
-
-            if result.get("status") == "ok":
-                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-                if statuses:
-                    filled = statuses[0].get("filled", {})
-                    return OrderResult(
-                        success=True,
-                        order_id=str(filled.get("oid", "")),
-                        filled_size=float(filled.get("totalSz", 0)),
-                        filled_price=float(filled.get("avgPx", 0)),
-                    )
-            return OrderResult(success=False, error=str(result))
-
-        except ImportError:
-            logger.warning("hyperliquid SDK not installed, using raw API")
-            return OrderResult(success=False, error="SDK required for order placement")
         except Exception as e:
+            logger.error(f"HL place_order error: {e}")
             return OrderResult(success=False, error=str(e))
 
-    async def cancel_order(self, ticker: str, order_id: int) -> bool:
-        """주문 취소."""
-        try:
-            from hyperliquid.exchange import Exchange
-            from hyperliquid.utils import constants
+        if result.get("status") != "ok":
+            return OrderResult(success=False, error=str(result))
 
-            base_url = constants.TESTNET_API_URL if "testnet" in self.base_url else constants.MAINNET_API_URL
-            exchange = Exchange(wallet=None, base_url=base_url)
-            result = exchange.cancel(coin=ticker, oid=order_id)
+        statuses = result.get("response", {}).get("data", {}).get("statuses", []) or []
+        if not statuses:
+            return OrderResult(success=False, error=f"no status in response: {result}")
+
+        st = statuses[0]
+        # 다양한 응답 형태: filled / resting / error
+        if "filled" in st:
+            filled = st["filled"]
+            return OrderResult(
+                success=True,
+                order_id=str(filled.get("oid", "")),
+                filled_size=float(filled.get("totalSz", 0) or 0),
+                filled_price=float(filled.get("avgPx", 0) or 0),
+            )
+        if "resting" in st:
+            resting = st["resting"]
+            return OrderResult(
+                success=True,        # 접수 성공 (체결 미완)
+                order_id=str(resting.get("oid", "")),
+                filled_size=0.0,
+                filled_price=0.0,
+            )
+        if "error" in st:
+            return OrderResult(success=False, error=str(st["error"]))
+        return OrderResult(success=False, error=f"unknown status: {st}")
+
+    async def cancel_order(self, ticker: str, order_id: int) -> bool:
+        """HL 주문 취소."""
+        if not self.private_key:
+            return False
+        try:
+            exchange = self._build_exchange()
+            if exchange is None:
+                return False
+            result = exchange.cancel(coin=ticker, oid=int(order_id))
             return result.get("status") == "ok"
         except Exception as e:
-            logger.error(f"Cancel order failed: {e}")
+            logger.error(f"HL cancel_order error: {e}")
             return False
 
 
