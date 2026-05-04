@@ -80,15 +80,32 @@ class KISAuth:
         app_secret: str,
         base_url: str = "https://openapi.koreainvestment.com:9443",
         is_paper: bool = False,
+        account_number: str = "",
     ):
         self.app_key = app_key
         self.app_secret = app_secret
         self.base_url = base_url
         if is_paper:
             self.base_url = "https://openapivts.koreainvestment.com:29443"
+        self.is_paper = is_paper
+        self.account_number = account_number    # "12345678-08" 또는 "1234567808"
         self._access_token: str = ""
         self._token_expires: float = 0.0
         self._approval_key: str = ""
+
+    @property
+    def account_cano_prdt(self) -> tuple[str, str]:
+        """계좌번호를 CANO(8자리) + ACNT_PRDT_CD(2자리)로 분리. 하이픈 제거.
+
+        해외선물 계좌: 일반적으로 ACNT_PRDT_CD='08'.
+        """
+        s = (self.account_number or "").replace("-", "").strip()
+        if len(s) < 10:
+            raise ValueError(
+                f"KIS account_number must be 10 chars (CANO+ACNT_PRDT_CD). "
+                f"Got {len(s)} chars: {self.account_number!r}"
+            )
+        return s[:8], s[8:10]
 
     async def get_access_token(self) -> str:
         """REST API용 access_token 발급 (24시간 유효)."""
@@ -653,19 +670,201 @@ class KISExchange:
         reduce_only: bool = False,
         client_order_id: Optional[str] = None,
     ) -> _base.OrderResult:
-        raise NotImplementedError(
-            "KIS REST 주문 API는 M10에서 합류 예정. 페이퍼 단계는 KiwoomMock 사용."
-        )
+        """KIS 해외선물 실주문 (Phase 11a).
+
+        POST /uapi/overseas-futureoption/v1/trading/order
+        tr_id: OTFM3001U(실전), VTFM3001U(모의) — auth.is_paper로 분기
+
+        Mapping:
+          side='buy'   → SLL_BUY_DVSN_CD='02'
+          side='sell'  → SLL_BUY_DVSN_CD='01'
+          order_type='market' → PRIC_DVSN_CD='2', FM_LIMIT_ORD_PRIC='0'
+          order_type='limit'  → PRIC_DVSN_CD='1', FM_LIMIT_ORD_PRIC=str(limit_price)
+        """
+        auth = self._client.auth
+        try:
+            cano, acnt_prdt = auth.account_cano_prdt
+        except ValueError as e:
+            return _base.OrderResult(
+                success=False, exchange=self.name, symbol=symbol,
+                error=f"account config error: {e}",
+            )
+
+        sll_buy = "02" if side == "buy" else "01"
+        if order_type == "market":
+            pric_dvsn = "2"
+            fm_limit = "0"
+        else:
+            pric_dvsn = "1"
+            fm_limit = f"{limit_price}" if limit_price else "0"
+
+        body = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt,
+            "OVRS_FUTR_FX_PDNO": symbol,
+            "SLL_BUY_DVSN_CD": sll_buy,
+            "PRIC_DVSN_CD": pric_dvsn,
+            "FM_LIMIT_ORD_PRIC": fm_limit,
+            "FM_STOP_ORD_PRIC": "0",
+            "FM_ORD_QTY": str(int(size)),
+            "CCLD_CNDT_CD": "6",        # EOD 지정가
+            "FM_LQD_USTL_CCLD_DT": "",
+            "FM_LQD_USTL_CCNO": "",
+            "CPLX_ORD_DVSN_CD": "0",
+            "ECIS_RSVN_ORD_YN": "N",
+            "FM_HDGE_ORD_SCRN_YN": "N",
+        }
+
+        tr_id = "VTFM3001U" if auth.is_paper else "OTFM3001U"
+        try:
+            await auth.get_access_token()
+            headers = auth.get_rest_headers(tr_id)
+            url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/order"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=body) as resp:
+                    data = await resp.json()
+        except Exception as e:
+            logger.error(f"[KIS] place_order network error: {e}")
+            return _base.OrderResult(
+                success=False, exchange=self.name, symbol=symbol,
+                error=f"network: {e}",
+            )
+
+        rt_cd = str(data.get("rt_cd", ""))
+        msg = data.get("msg1", "")
+        if rt_cd == "0":
+            output = data.get("output", {}) or {}
+            order_id = (output.get("ODNO") or output.get("KRX_FWDG_ORD_ORGNO") or "")
+            logger.warning(
+                f"[KIS] ORDER OK {symbol} {side} {int(size)} order_id={order_id} ({msg})"
+            )
+            return _base.OrderResult(
+                success=True, exchange=self.name, symbol=symbol,
+                order_id=order_id,
+                filled_size=size,
+                # 시장가는 응답에 fill price 없음. 후속 inquire-balance 또는 체결 통보
+                # WebSocket으로 확인 필요. 여기선 0으로 두고 호출자가 실시간 시세
+                # 또는 잔고 조회로 보정.
+                filled_price=float(limit_price) if limit_price else 0.0,
+                error="",
+            )
+        else:
+            logger.error(f"[KIS] ORDER FAILED {symbol} rt_cd={rt_cd} msg={msg}")
+            return _base.OrderResult(
+                success=False, exchange=self.name, symbol=symbol,
+                error=f"rt_cd={rt_cd} msg={msg}",
+            )
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        raise NotImplementedError("KIS 주문 취소는 M10에서 합류 예정.")
+        """KIS 해외선물 주문 취소.
+
+        POST /uapi/overseas-futureoption/v1/trading/order-rvsecncl
+        tr_id: OTFM3003U(실전 취소), VTFM3003U(모의 취소).
+        """
+        if not order_id:
+            return False
+        auth = self._client.auth
+        try:
+            cano, acnt_prdt = auth.account_cano_prdt
+        except ValueError:
+            return False
+
+        from datetime import datetime as _dt
+        # 오늘 날짜로 가정 — 익일 이후 미체결분은 자동 만료/별도 처리 필요
+        ord_dt = _dt.now().strftime("%Y%m%d")
+        body = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt,
+            "ORGN_ORD_DT": ord_dt,
+            "ORGN_ODNO": order_id,
+            "FM_LIMIT_ORD_PRIC": "0",
+            "FM_STOP_ORD_PRIC": "0",
+            "FM_LQD_LMT_ORD_PRIC": "0",
+            "FM_LQD_STOP_ORD_PRIC": "0",
+            "FM_HDGE_ORD_SCRN_YN": "N",
+            "FM_MKPR_CVSN_YN": "N",
+        }
+        tr_id = "VTFM3003U" if auth.is_paper else "OTFM3003U"
+        try:
+            await auth.get_access_token()
+            headers = auth.get_rest_headers(tr_id)
+            url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/order-rvsecncl"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=body) as resp:
+                    data = await resp.json()
+        except Exception as e:
+            logger.error(f"[KIS] cancel_order network error: {e}")
+            return False
+
+        rt_cd = str(data.get("rt_cd", ""))
+        if rt_cd == "0":
+            logger.warning(f"[KIS] CANCEL OK order_id={order_id} ({data.get('msg1','')})")
+            return True
+        logger.error(f"[KIS] CANCEL FAILED order_id={order_id} rt_cd={rt_cd} msg={data.get('msg1','')}")
+        return False
 
     async def get_positions(self) -> list[_base.Position]:
-        # KIS 잔고 조회 REST 미구현 — 페이퍼 단계는 빈 리스트
-        return []
+        """KIS 해외선물 잔고/포지션 조회.
+
+        POST /uapi/overseas-futureoption/v1/trading/inquire-unpd
+        tr_id: OTFM1412R (실전), VTFM1412R (모의)
+        FUOP_DVSN: '01' (선물만)
+        """
+        auth = self._client.auth
+        try:
+            cano, acnt_prdt = auth.account_cano_prdt
+        except ValueError:
+            return []
+
+        body = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt,
+            "FUOP_DVSN": "01",          # 선물
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        tr_id = "VTFM1412R" if auth.is_paper else "OTFM1412R"
+        try:
+            await auth.get_access_token()
+            headers = auth.get_rest_headers(tr_id)
+            url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/inquire-unpd"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=body) as resp:
+                    data = await resp.json()
+        except Exception as e:
+            logger.error(f"[KIS] get_positions error: {e}")
+            return []
+
+        if str(data.get("rt_cd", "")) != "0":
+            return []
+
+        out: list[_base.Position] = []
+        for row in (data.get("output1") or data.get("output") or []) or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                # 미결제 수량 (양수=long, 음수=short — KIS는 양수+SLL_BUY 분리)
+                qty = float(row.get("CCLD_QTY", 0) or row.get("FM_OBJ_QTY", 0) or 0)
+                if qty == 0:
+                    continue
+                sll_buy = str(row.get("SLL_BUY_DVSN_CD", "02"))   # 02=매수, 01=매도
+                signed_qty = qty if sll_buy == "02" else -qty
+                out.append(_base.Position(
+                    exchange=self.name,
+                    symbol=row.get("OVRS_FUTR_FX_PDNO", ""),
+                    size=signed_qty,
+                    entry_price=float(row.get("AVG_BUY_UNPR", row.get("FM_AVG_PRIC", 0)) or 0),
+                    mark_price=float(row.get("PURCHASE_AVG_PRICE", 0) or 0),
+                    unrealized_pnl=float(row.get("FM_TOT_EVLU_PFLS_AMT", 0) or 0),
+                    margin_used=float(row.get("FM_OBJ_AMT", 0) or 0),
+                    leverage=1.0,
+                ))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"[KIS] position parse error: {e} (row={row})")
+        return out
 
     async def get_account_value(self) -> float:
-        return 0.0
+        return 0.0   # 별도 잔고 조회 endpoint(예: inquire-deposit) 필요
 
     async def get_funding_info(self, symbol: str) -> Optional[_base.FundingInfo]:
         """KIS는 dated_futures venue → funding 개념 없음. 항상 None."""

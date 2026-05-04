@@ -98,6 +98,7 @@ async def _setup_kis(config, collector, kiwoom=None):
         app_secret=config.kis.app_secret,
         base_url=config.kis.base_url,
         is_paper=config.kis.is_paper,
+        account_number=config.kis.account_number,
     )
 
     client = KISFuturesClient(
