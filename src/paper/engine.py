@@ -1059,8 +1059,14 @@ class PaperTradingEngine:
             self._state.failed_orders += 1
             logger.error(
                 f"[{pair_id}] one or both legs failed to fill "
-                f"(a={a_price}, b={b_price}); skipping entry"
+                f"(a={a_price} oid={a_oid}, b={b_price} oid={b_oid}); skipping entry"
             )
+            # LIVE 모드: 한쪽만 체결됐으면 즉시 반대 fill로 unwind (단방향 노출 방지)
+            if (self.config.mode or "").upper() == "LIVE":
+                await self._emergency_unwind_partial_entry(
+                    pair, leg_a_side, leg_a_size, a_price, a_oid,
+                    leg_b_side, leg_b_size, b_price, b_oid,
+                )
             return
 
         # 동시 진입 race 방어 — gather 동안 다른 coroutine이 이미 진입했는지 재확인
@@ -1231,15 +1237,50 @@ class PaperTradingEngine:
         size: float,
         leg_quote: Quote,
     ) -> tuple[float, str]:
-        """페어 leg에 paper-fill 주문. (filled_price, order_id) 반환.
+        """페어 leg에 fill 발생시킴. (filled_price, order_id) 반환.
 
-        - leg.exchange == 'kis': legacy KiwoomMock 사용 (paper 한정).
-        - 그 외 (HL/Binance/Bybit/OKX/Lighter): 캐시된 bid/ask로 시뮬레이션 fill.
-          (실거래는 Phase I에서 dispatch_pair_order 통해 실 주문)
+        모드 분기:
+          mode='PAPER' (기본):
+            - KIS leg: KiwoomMock 시뮬 fill
+            - 기타 perp leg: 캐시된 bid/ask로 시뮬 fill
+          mode='LIVE':
+            - 모든 leg: ExchangeRegistry 통해 실 어댑터 place_order 호출
+            - 실패/체결 미완 시 (0.0, "") 반환 → 호출자가 unwind 처리
 
         실패 시 (0.0, "") 반환.
         """
         leg_cfg = pair.leg(leg)
+        is_live = (self.config.mode or "").upper() == "LIVE"
+
+        # ── LIVE 모드: 실 어댑터 dispatch ──
+        if is_live:
+            try:
+                result = await self.dispatch_pair_order(
+                    pair_id=pair.id, leg=leg, side=side, size=size,
+                    order_type="market",
+                )
+            except Exception as e:
+                logger.error(f"[{pair.id}/{leg}] LIVE dispatch raised: {e}")
+                return 0.0, ""
+            if not result.success:
+                logger.error(
+                    f"[{pair.id}/{leg}] LIVE order FAILED on {leg_cfg.exchange}: {result.error}"
+                )
+                return 0.0, ""
+            # filled_price가 0이면(미체결 resting / KIS 시장가 응답 누락) leg_quote 추정 사용
+            filled_price = result.filled_price
+            if filled_price <= 0:
+                if side == "buy":
+                    filled_price = leg_quote.ask or leg_quote.mid_price
+                else:
+                    filled_price = leg_quote.bid or leg_quote.mid_price
+            logger.warning(
+                f"[{pair.id}/{leg}] LIVE FILL {leg_cfg.exchange}/{leg_cfg.symbol} "
+                f"{side} {size} @ {filled_price:.4f} order_id={result.order_id}"
+            )
+            return filled_price, result.order_id
+
+        # ── PAPER 모드: 시뮬 fill ──
         if leg_cfg.exchange == "kis":
             futures_symbol = leg_cfg.symbol
             kw_order = self.kiwoom.place_order(
@@ -1257,6 +1298,58 @@ class PaperTradingEngine:
         if fill <= 0:
             return 0.0, ""
         return fill, f"PAPER-{int(time.time()*1000)}"
+
+    async def _emergency_unwind_partial_entry(
+        self,
+        pair: ArbitragePair,
+        leg_a_side: str, leg_a_size: float, a_price: float, a_oid: str,
+        leg_b_side: str, leg_b_size: float, b_price: float, b_oid: str,
+    ) -> None:
+        """LIVE 모드 한쪽 leg only 체결 시 반대 fill로 즉시 unwind.
+
+        leg_a 체결됨 + leg_b 실패 → leg_a 반대 방향으로 시장가 close.
+        그 반대도 동일. 중복 unwind 방지를 위해 필요한 leg만 호출.
+        """
+        if a_price > 0 and b_price <= 0:
+            # leg_b 실패. leg_a를 반대 방향으로 close.
+            opp_side = "sell" if leg_a_side == "buy" else "buy"
+            logger.warning(
+                f"[{pair.id}] EMERGENCY UNWIND leg_a ({leg_a_side}→{opp_side} {leg_a_size})"
+            )
+            try:
+                r = await self.dispatch_pair_order(
+                    pair_id=pair.id, leg="a", side=opp_side, size=leg_a_size,
+                    order_type="market", reduce_only=True,
+                )
+                if r.success:
+                    logger.warning(f"[{pair.id}] emergency unwind leg_a OK oid={r.order_id}")
+                else:
+                    logger.error(
+                        f"[{pair.id}] EMERGENCY UNWIND leg_a FAILED: {r.error} — "
+                        f"manual intervention required (open leg_a oid={a_oid})"
+                    )
+            except Exception as e:
+                logger.error(f"[{pair.id}] emergency unwind leg_a raised: {e}")
+        elif b_price > 0 and a_price <= 0:
+            opp_side = "sell" if leg_b_side == "buy" else "buy"
+            logger.warning(
+                f"[{pair.id}] EMERGENCY UNWIND leg_b ({leg_b_side}→{opp_side} {leg_b_size})"
+            )
+            try:
+                r = await self.dispatch_pair_order(
+                    pair_id=pair.id, leg="b", side=opp_side, size=leg_b_size,
+                    order_type="market", reduce_only=True,
+                )
+                if r.success:
+                    logger.warning(f"[{pair.id}] emergency unwind leg_b OK oid={r.order_id}")
+                else:
+                    logger.error(
+                        f"[{pair.id}] EMERGENCY UNWIND leg_b FAILED: {r.error} — "
+                        f"manual intervention required (open leg_b oid={b_oid})"
+                    )
+            except Exception as e:
+                logger.error(f"[{pair.id}] emergency unwind leg_b raised: {e}")
+        # 둘 다 실패 → unwind 불필요
 
     def _calculate_pair_contracts(
         self, pair: ArbitragePair, leg_b_price: float
