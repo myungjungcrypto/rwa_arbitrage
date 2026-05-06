@@ -37,19 +37,25 @@ async def main() -> int:
     print(f"[Config] CANO={cano} ACNT_PRDT_CD={acnt_prdt} is_paper={kis.is_paper}")
 
     await auth.get_access_token()
-    tr_id = "VTFM3115R" if kis.is_paper else "OTFM3115R"
-    headers = auth.get_rest_headers(tr_id)
     inqr_dt = datetime.now(timezone.utc).strftime("%Y%m%d")
 
-    # 다양한 currency 시도 (USD / KRW)
-    for crcy in ("USD", "KRW"):
+    # 다양한 tr_id × currency 조합 시도 (KIS docs상 가장 가능성 높은 순)
+    candidates = [
+        ("OTFM1411R", "USD"),
+        ("OTFM1411R", "KRW"),
+        ("OTFM3115R", "USD"),    # 이전 시도
+    ]
+    for tr_id, crcy in candidates:
+        if kis.is_paper:
+            tr_id = tr_id.replace("OTFM", "VTFM")
+        headers = auth.get_rest_headers(tr_id)
         params = {
             "CANO": cano, "ACNT_PRDT_CD": acnt_prdt,
             "OVRS_EXCG_CD": "CME", "CRCY_CD": crcy,
             "INQR_DT": inqr_dt,
         }
         url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/inquire-deposit"
-        print(f"\n--- CRCY_CD={crcy}, tr_id={tr_id}, INQR_DT={inqr_dt} ---")
+        print(f"\n--- tr_id={tr_id}, CRCY_CD={crcy}, INQR_DT={inqr_dt} ---")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers, params=params) as r:

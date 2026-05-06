@@ -879,7 +879,8 @@ class KISExchange:
         cano, acnt_prdt = auth.account_cano_prdt
         if not cano:
             raise RuntimeError("KIS account_number not set")
-        tr_id = "VTFM3115R" if auth.is_paper else "OTFM3115R"
+        # OTFM1411R: 해외선물옵션 예수금현황 (output2에 통화별 잔고 list)
+        tr_id = "VTFM1411R" if auth.is_paper else "OTFM1411R"
         await auth.get_access_token()   # 토큰 ensure
         headers = auth.get_rest_headers(tr_id)
         # KIS 일부 endpoint는 INQR_DT(YYYYMMDD) 필수 — 누락 시 rt_cd=7
@@ -900,13 +901,27 @@ class KISExchange:
             raise RuntimeError(
                 f"rt_cd={data.get('rt_cd')} msg={data.get('msg1','').strip()[:80]}"
             )
+        # OTFM1411R 응답:
+        #   output1 (dict)            — 종합 잔고 (KRW 환산)
+        #   output2 (list[dict])      — 통화별 잔고 row (USD/JPY/EUR/...)
+        # USD row의 'frcr_dncl_amt' (외화 예수금) 우선, 없으면 output1 합계.
+        out2 = data.get("output2") or []
+        if isinstance(out2, list):
+            for row in out2:
+                if not isinstance(row, dict): continue
+                if (row.get("crcy_cd") or "").upper() == "USD":
+                    for key in ("frcr_dncl_amt", "frcr_evlu_amt", "frcr_use_psbl_amt"):
+                        v = row.get(key)
+                        if v:
+                            try: return float(v)
+                            except (TypeError, ValueError): continue
         out1 = data.get("output1") or {}
-        for key in ("frcr_dncl_amt_smtl", "tot_dncl_amt", "frcr_dncl_amt"):
-            if key in out1 and out1[key]:
-                try:
-                    return float(out1[key])
-                except (TypeError, ValueError):
-                    continue
+        if isinstance(out1, dict):
+            for key in ("frcr_dncl_amt_smtl", "tot_dncl_amt", "frcr_dncl_amt"):
+                v = out1.get(key)
+                if v:
+                    try: return float(v)
+                    except (TypeError, ValueError): continue
         return 0.0
 
     async def get_funding_info(self, symbol: str) -> Optional[_base.FundingInfo]:
