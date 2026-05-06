@@ -606,7 +606,7 @@ class KISExchange:
 
     name = "kis"
     venue_type = _base.VenueType.DATED_FUTURES.value
-    margin_asset = "KRW_equiv"
+    margin_asset = "USD"   # 해외선물 외화예수금 (USD 환산); 표시용 단위
 
     def __init__(self, client: KISFuturesClient):
         self._client = client
@@ -901,24 +901,15 @@ class KISExchange:
             raise RuntimeError(
                 f"rt_cd={data.get('rt_cd')} msg={data.get('msg1','').strip()[:80]}"
             )
-        # OTFM1411R 응답:
-        #   output1 (dict)            — 종합 잔고 (KRW 환산)
-        #   output2 (list[dict])      — 통화별 잔고 row (USD/JPY/EUR/...)
-        # USD row의 'frcr_dncl_amt' (외화 예수금) 우선, 없으면 output1 합계.
-        out2 = data.get("output2") or []
-        if isinstance(out2, list):
-            for row in out2:
-                if not isinstance(row, dict): continue
-                if (row.get("crcy_cd") or "").upper() == "USD":
-                    for key in ("frcr_dncl_amt", "frcr_evlu_amt", "frcr_use_psbl_amt"):
-                        v = row.get(key)
-                        if v:
-                            try: return float(v)
-                            except (TypeError, ValueError): continue
-        out1 = data.get("output1") or {}
-        if isinstance(out1, dict):
-            for key in ("frcr_dncl_amt_smtl", "tot_dncl_amt", "frcr_dncl_amt"):
-                v = out1.get(key)
+        # OTFM1411R 응답: data['output'] (단수 dict, 25 keys).
+        # 우선순위: 총자산평가금액 → 주문가능금액 → 익일예수금.
+        # fm_tot_asst_evlu_amt 가 가장 의미있는 잔고 (예수금 + 평가손익).
+        out = data.get("output") or {}
+        if isinstance(out, dict):
+            for key in ("fm_tot_asst_evlu_amt", "fm_ord_psbl_amt",
+                        "fm_nxdy_dncl_amt", "fm_drwg_psbl_amt",
+                        "fm_dnca_rmnd"):
+                v = out.get(key)
                 if v:
                     try: return float(v)
                     except (TypeError, ValueError): continue
