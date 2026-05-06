@@ -111,16 +111,25 @@ class RiskManager:
         return self.config.rollover_start_day <= bd <= self.config.rollover_end_day
 
     def is_rollover_blackout(self, current_date: date | None = None) -> bool:
-        """롤 window 시작 N영업일 전부터 BD 마지막까지 신규 진입 전면 차단 + flatten.
+        """롤 weight divergence 시작 N영업일 전부터 BD 마지막까지 신규 진입 전면 차단.
 
         rollover_block_entry_days=0이면 비활성 (False 항상).
-        rollover_block_entry_days=1이면 BD (start - 1)부터 BD end 까지 True.
+
+        주의 — get_roll_weights 공식 `(bd - start) / span`은 BD start_day에서
+        w_next=0 (= 100% 전월물 유지), BD start_day+1에서 처음 0.2로 전환.
+        즉 **실제 divergence 시작일 = roll_start_day + 1**.
+        따라서:
+          divergence_first_day = roll_start_day + 1   (예: 6)
+          blackout_start = divergence_first_day - rollover_block_entry_days
+        block_days=1 → BD 5부터 (BD 6 divergence 1일 전)
+        block_days=2 → BD 4부터 (BD 6 divergence 2일 전)
         """
         block_days = self.config.rollover_block_entry_days
         if block_days <= 0:
             return False
         bd = self._business_day(current_date)
-        blackout_start = self.config.rollover_start_day - block_days
+        divergence_first_day = self.config.rollover_start_day + 1
+        blackout_start = divergence_first_day - block_days
         return blackout_start <= bd <= self.config.rollover_end_day
 
     @staticmethod

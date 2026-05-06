@@ -118,23 +118,32 @@ def test_blackout_disabled_when_block_days_zero():
     assert rm.is_rollover_blackout(date(2026, 5, 7)) is False   # 롤 window인데 blackout 비활성
 
 
-def test_blackout_starts_one_day_before_roll_window():
-    """rollover_block_entry_days=1 + start_day=5 → BD 4부터 BD 10까지 True."""
+def test_blackout_starts_one_day_before_divergence():
+    """rollover_block_entry_days=1 + start_day=5.
+
+    Divergence first day = start_day + 1 = BD 6 (get_roll_weights 공식상
+    BD 5는 weight 0이라 여전히 100% 전월물).
+    blackout=1일 전이면 BD 5부터 차단.
+    """
     rm = RiskManager(RiskConfig(rollover_block_entry_days=1,
                                 rollover_start_day=5, rollover_end_day=10))
-    # 2026-05 첫 영업일 = 5/1 (금) → 5/4(월)=BD2, 5/5(화)=BD3, 5/6(수)=BD4 (blackout 시작)
-    assert rm.is_rollover_blackout(date(2026, 5, 5)) is False    # BD3
-    assert rm.is_rollover_blackout(date(2026, 5, 6)) is True     # BD4 (blackout)
-    assert rm.is_rollover_blackout(date(2026, 5, 7)) is True     # BD5 (롤 시작)
-    assert rm.is_rollover_blackout(date(2026, 5, 14)) is True    # BD10 (롤 끝)
+    # 2026-05 BD: 5/1(금)=BD1, 5/4(월)=BD2, 5/5(화)=BD3, 5/6(수)=BD4,
+    #             5/7(목)=BD5, 5/8(금)=BD6, ..., 5/14(목)=BD10, 5/15(금)=BD11
+    assert rm.is_rollover_blackout(date(2026, 5, 6)) is False    # BD4
+    assert rm.is_rollover_blackout(date(2026, 5, 7)) is True     # BD5 (1일 전)
+    assert rm.is_rollover_blackout(date(2026, 5, 8)) is True     # BD6 (divergence 시작)
+    assert rm.is_rollover_blackout(date(2026, 5, 14)) is True    # BD10 (마지막)
     assert rm.is_rollover_blackout(date(2026, 5, 15)) is False   # BD11 (post-roll)
 
 
-def test_blackout_two_days_before():
+def test_blackout_two_days_before_divergence():
+    """block_days=2 → BD 4부터 (BD 6 divergence 2일 전)."""
     rm = RiskManager(RiskConfig(rollover_block_entry_days=2,
                                 rollover_start_day=5, rollover_end_day=10))
-    assert rm.is_rollover_blackout(date(2026, 5, 5)) is True    # BD3 (start - 2)
-    assert rm.is_rollover_blackout(date(2026, 5, 4)) is False   # BD2
+    assert rm.is_rollover_blackout(date(2026, 5, 5)) is False   # BD3
+    assert rm.is_rollover_blackout(date(2026, 5, 6)) is True    # BD4 (2일 전)
+    assert rm.is_rollover_blackout(date(2026, 5, 7)) is True    # BD5
+    assert rm.is_rollover_blackout(date(2026, 5, 8)) is True    # BD6
 
 
 # ──────────────────────────────────────────────

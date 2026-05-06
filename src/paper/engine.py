@@ -1361,11 +1361,13 @@ class PaperTradingEngine:
         # KIS leg가 dated_futures인 페어에만 적용 (Web3-Web3 페어는 무관).
         if pair.leg_b.role == LegRole.DATED_FUTURES and self.risk_mgr.is_rollover_blackout():
             self._state.rejected_by_risk += 1
+            divergence_day = self.config.risk.rollover_start_day + 1
+            blackout_from = divergence_day - self.config.risk.rollover_block_entry_days
             logger.warning(
                 f"[{pair_id}] ENTRY_BLOCKED rollover_blackout — "
                 f"BD={self.risk_mgr._business_day()} "
-                f"(block from BD {self.config.risk.rollover_start_day - self.config.risk.rollover_block_entry_days} "
-                f"to {self.config.risk.rollover_end_day})"
+                f"(blackout BD {blackout_from}–{self.config.risk.rollover_end_day}, "
+                f"divergence first day = BD {divergence_day})"
             )
             if self._notifier is not None:
                 try:

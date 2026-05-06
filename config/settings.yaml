@@ -92,8 +92,9 @@ risk:
   ws_stale_auto_flatten: true   # true면 stale 감지 시 모든 오픈 포지션 즉시 청산
 
   # Rollover blackout — KIS leg dated_futures 페어 한정.
-  # 롤 window 시작(BD 5) N영업일 전부터 신규 진입 차단 + 보유 포지션 flatten.
-  # 1이면 BD 4부터 차단 (롤 시작 1일 전), 0이면 비활성.
+  # 실제 oracle weight divergence 시작일 = rollover_start_day + 1 (BD 6, get_roll_weights
+  # 공식상 BD 5는 weight 0). blackout은 divergence 시작 N영업일 전부터 BD end까지.
+  # 1이면 BD 5부터 (BD 6 divergence 1일 전), 2면 BD 4부터, 0이면 비활성.
   rollover_block_entry_days: 1
 
   # Contract alignment — HL oracle index ↔ KIS mid_price 일치성 모니터.
