@@ -109,6 +109,13 @@ binance:
   rest_url: "https://fapi.binance.com"
   ws_url: "wss://fstream.binance.com/ws"
 
+# Bybit v5 linear (Phase F)
+# 페이퍼 shadow는 public REST/WS. live는 Phase I에서 HMAC v5 키 추가.
+bybit:
+  enabled: false
+  rest_url: "https://api.bybit.com"
+  ws_url: "wss://stream.bybit.com/v5/public/linear"
+
 # 명시 페어 — Web2-Web3 페어(wti_cme_hl)는 products+kis_symbol_map에서 자동 합성.
 # 아래는 Web3-Web3 페어 추가용. Phase D에서 wti_hl_lighter shadow로 시작.
 pairs:
@@ -155,6 +162,29 @@ pairs:
       margin_asset: USDT
     params:
       entry_threshold_bps: 15   # 1h vs 4h 펀딩 비대칭 + USDC/USDT peg 버퍼
+      convergence_target_bps: 3
+      max_hold_hours: 12
+
+  - id: wti_hl_bybit
+    enabled: false              # Phase F shadow → 24h 분포 분석 후 true flip
+    strategy: basis_convergence
+    gate: cme_hours
+    leg_a:
+      exchange: hyperliquid
+      symbol: "xyz:CL"
+      role: perp
+      taker_fee_bps: 0.9
+      funding_interval_hours: 1.0
+      margin_asset: USDC
+    leg_b:
+      exchange: bybit
+      symbol: "CLUSDT"          # Bybit linear perp (2026-03-27 런칭, 50x)
+      role: perp
+      taker_fee_bps: 5.5        # Bybit USDT perp taker ~0.055% (실측 후 보정)
+      funding_interval_hours: 4.0
+      margin_asset: USDT
+    params:
+      entry_threshold_bps: 15   # Binance와 동일 (4h funding asymmetry 같음)
       convergence_target_bps: 3
       max_hold_hours: 12
 

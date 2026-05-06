@@ -73,6 +73,19 @@ class BinanceConfig:
 
 
 @dataclass
+class BybitConfig:
+    """Bybit v5 linear 어댑터 설정 — Phase F.
+
+    페이퍼 shadow는 인증 불필요. live는 Phase I에서 HMAC v5 키 추가.
+    """
+    enabled: bool = False
+    rest_url: str = "https://api.bybit.com"
+    ws_url: str = "wss://stream.bybit.com/v5/public/linear"
+    api_key: str = ""
+    api_secret: str = ""
+
+
+@dataclass
 class TelegramConfig:
     """Telegram 알림 설정 (Phase 11d).
 
@@ -141,6 +154,7 @@ class AppConfig:
     kis: KISConfig = field(default_factory=KISConfig)
     lighter: LighterConfig = field(default_factory=LighterConfig)
     binance: BinanceConfig = field(default_factory=BinanceConfig)
+    bybit: BybitConfig = field(default_factory=BybitConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -319,6 +333,17 @@ def load_config(
         api_secret=bn_secrets.get("api_secret", ""),
     )
 
+    # Bybit (Phase F)
+    by_settings = settings.get("bybit", {})
+    by_secrets = secrets.get("bybit", {})
+    bybit_config = BybitConfig(
+        enabled=by_settings.get("enabled", False),
+        rest_url=by_settings.get("rest_url", "https://api.bybit.com"),
+        ws_url=by_settings.get("ws_url", "wss://stream.bybit.com/v5/public/linear"),
+        api_key=by_secrets.get("api_key", ""),
+        api_secret=by_secrets.get("api_secret", ""),
+    )
+
     # 전략/리스크 설정
     strat = settings.get("strategy", {})
     risk = settings.get("risk", {})
@@ -337,6 +362,7 @@ def load_config(
         kis=kis_config,
         lighter=lighter_config,
         binance=binance_config,
+        bybit=bybit_config,
         telegram=telegram_config,
         strategy=StrategyConfig(**{k: v for k, v in strat.items() if k in StrategyConfig.__dataclass_fields__}),
         risk=RiskConfig(**{k: v for k, v in risk.items() if k in RiskConfig.__dataclass_fields__}),

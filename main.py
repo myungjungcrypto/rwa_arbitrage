@@ -29,6 +29,7 @@ from src.exchange.kis import KISAuth, KISExchange, KISFuturesClient
 from src.exchange.kiwoom import create_kiwoom_client
 from src.exchange.lighter import LighterExchange
 from src.exchange.binance import BinanceExchange
+from src.exchange.bybit import BybitExchange
 from src.exchange.registry import ExchangeRegistry
 from src.strategy.pair import LegRole
 from src.strategy.rollover import get_active_contract, us_market_holidays
@@ -398,6 +399,32 @@ async def run_paper(config_path: str = "config/settings.yaml"):
             logger.warning("Binance connect failed; skipping registration")
             binance_adapter = None
 
+    # ── Phase F: Bybit 어댑터 (활성화 시) ──
+    bybit_adapter: BybitExchange | None = None
+    if config.bybit.enabled:
+        bybit_adapter = BybitExchange(
+            rest_url=config.bybit.rest_url,
+            ws_url=config.bybit.ws_url,
+        )
+        ok = await bybit_adapter.connect()
+        if ok:
+            registry.register(bybit_adapter)
+            logger.info("Bybit adapter registered (Phase F)")
+            for pair in pairs:
+                if pair.leg_b.exchange != "bybit":
+                    continue
+                try:
+                    found = await bybit_adapter.discover_symbol(pair.leg_b.symbol)
+                    if not found:
+                        logger.warning(
+                            f"[BYBIT] {pair.leg_b.symbol} not in instruments-info"
+                        )
+                except Exception as e:
+                    logger.warning(f"Bybit discover_symbol failed: {e}")
+        else:
+            logger.warning("Bybit connect failed; skipping registration")
+            bybit_adapter = None
+
     engine.set_exchange_registry(registry)
     engine.set_notifier(notifier)
     for pair in pairs:
@@ -455,6 +482,25 @@ async def run_paper(config_path: str = "config/settings.yaml"):
                 logger.info(f"[BINANCE] subscribed {pair.id} leg_b → {pair.leg_b.symbol}")
             except Exception as e:
                 logger.error(f"[BINANCE] subscribe failed for {pair.id}: {e}")
+
+    # Bybit 페어 leg_b WS 구독
+    if bybit_adapter is not None:
+        for pair in pairs:
+            if pair.leg_b.exchange != "bybit":
+                continue
+
+            def _make_bybit_cb(pair_id: str):
+                def _cb(q: Quote) -> None:
+                    collector.update_leg_quote(pair_id, "b", q)
+                return _cb
+
+            try:
+                await bybit_adapter.subscribe_quotes(
+                    pair.leg_b.symbol, _make_bybit_cb(pair.id),
+                )
+                logger.info(f"[BYBIT] subscribed {pair.id} leg_b → {pair.leg_b.symbol}")
+            except Exception as e:
+                logger.error(f"[BYBIT] subscribe failed for {pair.id}: {e}")
 
     pair_by_product: dict[str, "object"] = {
         product: collector.get_pair(LEGACY_PRODUCT_PAIR_MAP.get(product, product))
