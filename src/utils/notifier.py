@@ -44,9 +44,19 @@ class TelegramNotifier:
         self._rate_limit: float = 1.0  # seconds
 
         if self.enabled:
-            logger.info("Telegram notifier enabled")
+            logger.info(
+                f"Telegram notifier ENABLED (chat_id={chat_id})"
+            )
+        elif enabled and not (bot_token and chat_id):
+            # 사용자 의도(enabled=true)와 설정(token/chat_id missing) 불일치 →
+            # 실거래 LIVE에서 위험한 silent failure. WARNING으로 즉시 가시화.
+            logger.warning(
+                "Telegram notifier requested (enabled=true) but DISABLED — "
+                f"bot_token_set={bool(bot_token)} chat_id_set={bool(chat_id)}. "
+                "Check config/secrets.yaml `telegram.bot_token` / `chat_id`."
+            )
         else:
-            logger.debug("Telegram notifier disabled")
+            logger.info("Telegram notifier disabled (enabled=false)")
 
     async def send(self, message: str, parse_mode: str = "HTML"):
         """비동기 메시지 전송."""
