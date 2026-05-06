@@ -110,7 +110,8 @@ async def main() -> int:
     con.close()
 
     # 4) CME 시장 시간 + 판정
-    cme_now = is_cme_open()
+    from datetime import datetime, timezone
+    cme_now = is_cme_open(datetime.now(timezone.utc))
     print(f"\n[4] CME 시장 상태: {'OPEN' if cme_now else 'CLOSED'}")
     print()
 
