@@ -318,8 +318,13 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     logger.info(f"Starting RWA Arbitrage Bot (mode: PAPER TRADING)")
     logger.info(f"Products: {list(config.products.keys())}")
 
-    # Telegram 알림 (설정에 있으면 활성화)
-    notifier = TelegramNotifier(enabled=False)
+    # Telegram 알림 (Phase 11d) — secrets.yaml의 token/chat_id 있으면 자동 활성화.
+    notifier = TelegramNotifier(
+        bot_token=config.telegram.bot_token,
+        chat_id=config.telegram.chat_id,
+        enabled=config.telegram.enabled,
+    )
+    engine_notifier_ref = notifier
 
     # 데이터 수집기
     collector = DataCollector(config, storage)
@@ -366,6 +371,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
             lighter_adapter = None
 
     engine.set_exchange_registry(registry)
+    engine.set_notifier(notifier)
     for pair in pairs:
         engine.register_pair(pair)
         collector.register_pair(pair)
@@ -563,6 +569,21 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         engine.state_snapshot_loop(interval_seconds=30, stop_event=stop_event)
     )
 
+    # Phase 11d — LIVE 모드 WS freshness 워치독 (PAPER에서는 즉시 self-exit)
+    watchdog_task = asyncio.create_task(
+        engine.quote_freshness_watchdog(interval_seconds=15, stop_event=stop_event)
+    )
+
+    # 부팅 알림
+    if notifier.enabled:
+        try:
+            await notifier.send(
+                f"🟢 <b>Bot started</b>\n"
+                f"mode={config.mode} | pairs={len(pairs)}"
+            )
+        except Exception as e:
+            logger.warning(f"startup notify error: {e}")
+
     logger.info("Paper trading engine started — waiting for signals...")
     await stop_event.wait()
 
@@ -571,10 +592,19 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     status_task.cancel()
     funding_task.cancel()
 
-    for task in [collect_task, status_task, funding_task, rollover_task]:
+    state_snapshot_task.cancel()
+    watchdog_task.cancel()
+    for task in [collect_task, status_task, funding_task, rollover_task,
+                 state_snapshot_task, watchdog_task]:
         try:
             await task
         except asyncio.CancelledError:
+            pass
+
+    if notifier.enabled:
+        try:
+            await notifier.send("🔴 <b>Bot stopped</b>")
+        except Exception:
             pass
 
     await collector.stop()

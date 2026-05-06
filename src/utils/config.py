@@ -59,6 +59,18 @@ class LighterConfig:
 
 
 @dataclass
+class TelegramConfig:
+    """Telegram 알림 설정 (Phase 11d).
+
+    bot_token + chat_id 모두 secrets.yaml에 위치 권장.
+    enabled=True여도 token/chat_id 빈 값이면 notifier가 자동 비활성화.
+    """
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+
+
+@dataclass
 class StrategyConfig:
     basis_window_hours: int = 24
     basis_std_multiplier: float = 2.0
@@ -94,6 +106,16 @@ class RiskConfig:
     rollover_end_day: int = 10
     rollover_position_reduce_pct: float = 50
 
+    # Phase 11d — LIVE 안전장치.
+    # pair별 hard cap (계약수). settings.yaml에서 명시 등록되지 않은 페어는
+    # max_position_contracts fallback. LIVE 진입 시 항상 적용.
+    live_max_contracts_per_pair: dict[str, int] = field(default_factory=dict)
+    # WS quote freshness 감시 (초). LIVE 모드에서 leg quote 마지막 갱신이
+    # 이 임계값보다 오래되면 모든 오픈 포지션 emergency flatten.
+    ws_stale_seconds: float = 60.0
+    # 오토 flatten 활성화 (False면 알림만, True면 실제 청산)
+    ws_stale_auto_flatten: bool = True
+
 
 @dataclass
 class AppConfig:
@@ -104,6 +126,7 @@ class AppConfig:
     kiwoom: KiwoomConfig = field(default_factory=KiwoomConfig)
     kis: KISConfig = field(default_factory=KISConfig)
     lighter: LighterConfig = field(default_factory=LighterConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     extra_pairs: list = field(default_factory=list)   # settings.yaml `pairs:` 블록 → ArbitragePair list
@@ -250,6 +273,15 @@ def load_config(
         cme_realtime=kis_settings.get("cme_realtime", False),
     )
 
+    # Telegram (Phase 11d)
+    tg_settings = settings.get("telegram", {})
+    tg_secrets = secrets.get("telegram", {})
+    telegram_config = TelegramConfig(
+        enabled=tg_settings.get("enabled", False),
+        bot_token=tg_secrets.get("bot_token", "") or tg_settings.get("bot_token", ""),
+        chat_id=str(tg_secrets.get("chat_id", "") or tg_settings.get("chat_id", "")),
+    )
+
     # Lighter (Phase D)
     lighter_settings = settings.get("lighter", {})
     lighter_secrets = secrets.get("lighter", {})
@@ -278,6 +310,7 @@ def load_config(
         kiwoom=kw_config,
         kis=kis_config,
         lighter=lighter_config,
+        telegram=telegram_config,
         strategy=StrategyConfig(**{k: v for k, v in strat.items() if k in StrategyConfig.__dataclass_fields__}),
         risk=RiskConfig(**{k: v for k, v in risk.items() if k in RiskConfig.__dataclass_fields__}),
         extra_pairs=extra_pairs,

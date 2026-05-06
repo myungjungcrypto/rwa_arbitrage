@@ -163,6 +163,11 @@ class PaperTradingEngine:
         self._on_trade_callbacks: list[Callable] = []
         self._on_signal_callbacks: list[Callable] = []
 
+        # Phase 11d — 알림 / 워치독.
+        self._notifier = None  # set_notifier()로 wire
+        # leg_a/leg_b 구독 freshness 워치독용
+        self._last_quote_ts: dict[tuple[str, str], float] = {}  # (pair_id, leg) -> ts
+
     # ── 콜백 등록 ──
 
     def on_trade(self, callback: Callable[[TradeRecord, str], None]):
@@ -177,6 +182,14 @@ class PaperTradingEngine:
     def on_signal(self, callback: Callable[[Signal], None]):
         """시그널 이벤트 콜백 (NONE 제외)."""
         self._on_signal_callbacks.append(callback)
+
+    def set_notifier(self, notifier) -> None:
+        """Telegram (또는 호환) notifier 등록 (Phase 11d).
+
+        notifier에 send_sync(str), send_error_alert(coroutine) 시그니처 기대.
+        None이면 알림 비활성화. PAPER 모드에서도 set 되면 거래/에러 알림 동작.
+        """
+        self._notifier = notifier
 
     # ── 메인 처리 루프 ──
 
@@ -781,6 +794,178 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"state_snapshot_loop dump error: {e}")
 
+    async def quote_freshness_watchdog(
+        self,
+        interval_seconds: int = 15,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """Phase 11d — LIVE 모드 WS freshness 워치독.
+
+        등록된 페어 각 leg의 마지막 Quote 수신 시각을 검사. 임계값
+        (config.risk.ws_stale_seconds) 초과 시:
+          1. notifier로 stale 알림
+          2. ws_stale_auto_flatten=True면 모든 오픈 포지션 reduce_only 청산
+          3. cooldown — 한 번 알린 leg는 다시 fresh해지기 전까지 재알림 X
+
+        PAPER 모드에서는 no-op (시작 직후 즉시 종료). LIVE 모드에서만 의미.
+        """
+        if (self.config.mode or "").upper() != "LIVE":
+            logger.info("[WS_WATCHDOG] PAPER mode — watchdog disabled")
+            return
+
+        threshold = float(self.config.risk.ws_stale_seconds or 60.0)
+        auto_flatten = bool(self.config.risk.ws_stale_auto_flatten)
+        logger.info(
+            f"[WS_WATCHDOG] started threshold={threshold}s "
+            f"auto_flatten={auto_flatten} interval={interval_seconds}s"
+        )
+        # 알림 cooldown: leg가 stale 상태 동안 1회만 알림
+        alerted: set[tuple[str, str]] = set()
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                logger.info("[WS_WATCHDOG] stopped")
+                return
+            try:
+                if stop_event is not None:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    if stop_event.is_set():
+                        return
+                else:
+                    await asyncio.sleep(interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            stale_legs: list[tuple[str, str, float]] = []
+            for pair_id, pair in self._registered_pairs.items():
+                if not pair.enabled:
+                    continue
+                for leg in ("a", "b"):
+                    last_ts = self._last_quote_ts.get((pair_id, leg))
+                    if last_ts is None:
+                        continue   # 아직 첫 Quote 안 들어옴 — 부팅 중일 수 있음
+                    age = now - last_ts
+                    if age > threshold:
+                        stale_legs.append((pair_id, leg, age))
+
+            # fresh로 복귀한 leg는 cooldown 해제
+            still_stale = {(p, l) for p, l, _ in stale_legs}
+            recovered = alerted - still_stale
+            for r in recovered:
+                logger.info(f"[WS_WATCHDOG] recovered {r[0]}/{r[1]}")
+                if self._notifier is not None:
+                    try:
+                        self._notifier.send_sync(
+                            f"✅ <b>WS RECOVERED</b> {r[0]} leg_{r[1]}"
+                        )
+                    except Exception:
+                        pass
+            alerted -= recovered
+
+            new_alerts = still_stale - alerted
+            if new_alerts:
+                pairs_with_open_pos = [
+                    p for p in self._open_trades_by_pair.keys()
+                ]
+                for pair_id, leg in new_alerts:
+                    age = next(a for p, l, a in stale_legs if p == pair_id and l == leg)
+                    logger.error(
+                        f"[WS_WATCHDOG] STALE {pair_id}/{leg} age={age:.0f}s "
+                        f"> threshold={threshold:.0f}s"
+                    )
+                    if self._notifier is not None:
+                        try:
+                            self._notifier.send_sync(
+                                f"🚨 <b>WS STALE</b> {pair_id} leg_{leg} "
+                                f"age={age:.0f}s\n"
+                                f"open_positions={len(pairs_with_open_pos)} "
+                                f"auto_flatten={auto_flatten}"
+                            )
+                        except Exception as e:
+                            logger.error(f"notifier ws-stale error: {e}")
+                alerted |= new_alerts
+
+                # auto-flatten — stale leg가 어떤 페어든 1개라도 있고
+                # 오픈 포지션이 있으면 즉시 모두 청산 시도.
+                if auto_flatten and pairs_with_open_pos:
+                    logger.error(
+                        f"[WS_WATCHDOG] AUTO-FLATTEN {len(pairs_with_open_pos)} "
+                        f"open positions due to stale WS"
+                    )
+                    for pid in pairs_with_open_pos:
+                        try:
+                            await self.emergency_flatten_pair(pid, reason="ws_stale")
+                        except Exception as e:
+                            logger.error(
+                                f"[WS_WATCHDOG] flatten {pid} raised: {e}"
+                            )
+
+    async def emergency_flatten_pair(self, pair_id: str, reason: str = "manual") -> bool:
+        """Phase 11d — 지정 페어의 오픈 포지션 즉시 양 leg 반대 fill로 청산.
+
+        WS-stale 워치독 / 수동 호출에서 사용. 주문은 reduce_only=True 시장가.
+        LIVE 모드 전용 (PAPER에서는 dispatch_pair_order 자체가 시뮬용 경로 X).
+
+        Returns: True if 양 leg flatten 성공 (best-effort).
+        """
+        if (self.config.mode or "").upper() != "LIVE":
+            return False
+        trade = self._open_trades_by_pair.get(pair_id)
+        if not trade:
+            return False
+        pair = self._registered_pairs.get(pair_id)
+        if pair is None or self._registry is None:
+            logger.error(f"[{pair_id}] flatten failed: pair/registry missing")
+            return False
+
+        # 진입 방향과 반대로 청산 (entry: short_basis = leg_a buy + leg_b sell)
+        is_long_basis = trade.direction == "long_basis"
+        # long_basis 진입: leg_a sell, leg_b buy → 청산: leg_a buy, leg_b sell
+        # short_basis 진입: leg_a buy, leg_b sell → 청산: leg_a sell, leg_b buy
+        leg_a_close_side = "buy" if is_long_basis else "sell"
+        leg_b_close_side = "sell" if is_long_basis else "buy"
+        leg_a_size = trade.perp_units
+        leg_b_size = float(trade.size_contracts)
+
+        logger.error(
+            f"[{pair_id}] EMERGENCY FLATTEN ({reason}) "
+            f"leg_a {leg_a_close_side} {leg_a_size} | "
+            f"leg_b {leg_b_close_side} {leg_b_size}"
+        )
+
+        async def _close_a():
+            return await self.dispatch_pair_order(
+                pair_id=pair_id, leg="a", side=leg_a_close_side,
+                size=leg_a_size, order_type="market", reduce_only=True,
+            )
+
+        async def _close_b():
+            return await self.dispatch_pair_order(
+                pair_id=pair_id, leg="b", side=leg_b_close_side,
+                size=leg_b_size, order_type="market", reduce_only=True,
+            )
+
+        ra, rb = await asyncio.gather(_close_a(), _close_b(), return_exceptions=True)
+        ok_a = not isinstance(ra, Exception) and getattr(ra, "success", False)
+        ok_b = not isinstance(rb, Exception) and getattr(rb, "success", False)
+
+        if self._notifier is not None:
+            try:
+                self._notifier.send_sync(
+                    f"🛑 <b>EMERGENCY FLATTEN [{pair_id}]</b>\n"
+                    f"reason: {reason}\n"
+                    f"leg_a={'OK' if ok_a else 'FAIL'} | leg_b={'OK' if ok_b else 'FAIL'}"
+                )
+            except Exception:
+                pass
+
+        # 성공한 leg는 open_trades에서 제거 (한쪽이라도 실패하면 남겨두고 수동 개입)
+        if ok_a and ok_b:
+            self._open_trades_by_pair.pop(pair_id, None)
+            self._state.open_positions = max(0, self._state.open_positions - 1)
+        return ok_a and ok_b
+
     def get_open_trades(self) -> dict[str, TradeRecord]:
         """현재 오픈 트레이드."""
         return self._open_trades.copy()
@@ -876,6 +1061,8 @@ class PaperTradingEngine:
         if leg not in ("a", "b"):
             raise ValueError(f"leg must be 'a' or 'b', got {leg!r}")
         self._latest_pair_quote[(pair_id, leg)] = quote
+        # WS freshness 워치독용 (Phase 11d)
+        self._last_quote_ts[(pair_id, leg)] = time.time()
 
     def latest_pair_quote(self, pair_id: str, leg: str) -> Optional[Quote]:
         return self._latest_pair_quote.get((pair_id, leg))
@@ -1042,6 +1229,15 @@ class PaperTradingEngine:
         if not risk_check.allowed:
             self._state.rejected_by_risk += 1
             logger.warning(f"[{pair_id}] Entry REJECTED by risk: {risk_check.reason}")
+            # 일일 손실 제한처럼 거래 자체를 막는 사유는 LIVE에서 즉시 알림.
+            if self._notifier is not None and "daily loss" in risk_check.reason.lower():
+                try:
+                    self._notifier.send_sync(
+                        f"⛔ <b>RISK BLOCK [{pair_id}]</b>\n"
+                        f"<code>{risk_check.reason}</code>"
+                    )
+                except Exception as e:
+                    logger.error(f"notifier risk-block error: {e}")
             return
 
         # ── 양 leg 동시 발주 (paper: kiwoom for KIS, simulate for perp) ──
@@ -1063,6 +1259,16 @@ class PaperTradingEngine:
             )
             # LIVE 모드: 한쪽만 체결됐으면 즉시 반대 fill로 unwind (단방향 노출 방지)
             if (self.config.mode or "").upper() == "LIVE":
+                if self._notifier is not None:
+                    try:
+                        self._notifier.send_sync(
+                            f"⚠️ <b>FILL FAIL [{pair_id}]</b>\n"
+                            f"leg_a={a_price:.2f} oid={a_oid or 'NONE'}\n"
+                            f"leg_b={b_price:.2f} oid={b_oid or 'NONE'}\n"
+                            f"emergency unwind triggered"
+                        )
+                    except Exception as e:
+                        logger.error(f"notifier fill-fail error: {e}")
                 await self._emergency_unwind_partial_entry(
                     pair, leg_a_side, leg_a_size, a_price, a_oid,
                     leg_b_side, leg_b_size, b_price, b_oid,
@@ -1356,7 +1562,7 @@ class PaperTradingEngine:
     ) -> int:
         """페어 leg_b 기준 계약수 결정.
 
-        max_position_usd cap + max_position_contracts cap 적용.
+        max_position_usd cap + max_position_contracts cap + per-pair LIVE cap 적용.
         leg_b가 perp(contract_size=1)이면 1배럴/USDC 단위 size로 동작.
         """
         if leg_b_price <= 0:
@@ -1367,7 +1573,14 @@ class PaperTradingEngine:
             return 1
         max_size_usd = self.config.risk.max_position_usd
         max_contracts = int(max_size_usd / notional_per_contract)
-        return max(1, min(max_contracts, self.config.risk.max_position_contracts))
+        cap = min(max_contracts, self.config.risk.max_position_contracts)
+        # Phase 11d — LIVE 모드 페어별 hard cap (settings.yaml에서 명시).
+        # PAPER 모드에서는 적용 안 함 (시뮬 그대로 돌리기 위해).
+        if (self.config.mode or "").upper() == "LIVE":
+            per_pair_cap = self.config.risk.live_max_contracts_per_pair.get(pair.id)
+            if per_pair_cap is not None and per_pair_cap > 0:
+                cap = min(cap, int(per_pair_cap))
+        return max(1, cap)
 
     async def dispatch_pair_order(
         self,

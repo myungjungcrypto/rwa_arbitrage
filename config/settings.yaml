@@ -83,6 +83,14 @@ risk:
   rollover_end_day: 10          # 롤오버 종료 영업일
   rollover_position_reduce_pct: 50  # 롤 기간 포지션 축소율 (%)
 
+  # Phase 11d — LIVE 모드 안전장치
+  # 페어별 hard cap (계약수). LIVE 모드에서만 적용 (PAPER는 무시).
+  # 첫 실거래는 1 MCL부터 시작. 안정화 후 상향.
+  live_max_contracts_per_pair:
+    wti_cme_hl: 1
+  ws_stale_seconds: 60.0        # leg quote 60s 이상 stale → 알림 + auto-flatten
+  ws_stale_auto_flatten: true   # true면 stale 감지 시 모든 오픈 포지션 즉시 청산
+
 # 데이터 저장
 database:
   type: "sqlite"
@@ -120,12 +128,9 @@ pairs:
       convergence_target_bps: 3
       max_hold_hours: 12        # 단기 hold (펀딩 누적 위험 최소화)
 
-# 알림
-notification:
-  telegram:
-    enabled: false
-    bot_token: ""               # secrets.yaml에서 로드
-    chat_id: ""
+# 알림 (Phase 11d) — bot_token / chat_id는 secrets.yaml에서 로드
+telegram:
+  enabled: true                 # token/chat_id 비어있으면 자동 비활성화
 
 # 로깅
 logging:
