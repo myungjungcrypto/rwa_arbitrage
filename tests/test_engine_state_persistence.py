@@ -75,8 +75,9 @@ def v2_db_path(tmp_path: Path) -> str:
 def test_fresh_db_lands_on_v3(fresh_db_path):
     s = Storage(fresh_db_path)
     s.connect()
-    assert SCHEMA_VERSION == 3
-    assert s._get_schema_version() == 3
+    # v4 추가 후에도 v3 테이블/인덱스는 동일하게 생성됨
+    assert s._get_schema_version() == SCHEMA_VERSION
+    assert SCHEMA_VERSION >= 3
     s.close()
 
 
@@ -87,10 +88,10 @@ def test_v2_db_upgrades_to_v3(v2_db_path):
     assert row[0] == "2"
     con.close()
 
-    # connect 후: v3
+    # connect 후: 현재 SCHEMA_VERSION (≥3)
     s = Storage(v2_db_path)
     s.connect()
-    assert s._get_schema_version() == 3
+    assert s._get_schema_version() == SCHEMA_VERSION
     s.close()
 
 
@@ -120,7 +121,7 @@ def test_v3_idempotent_no_change_on_reconnect(fresh_db_path):
     s2.connect()
     n_after = s2.conn.execute("SELECT COUNT(*) FROM engine_state").fetchone()[0]
     assert n_after == n_before
-    assert s2._get_schema_version() == 3
+    assert s2._get_schema_version() == SCHEMA_VERSION
     s2.close()
 
 

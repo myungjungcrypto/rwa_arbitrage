@@ -431,6 +431,42 @@ def leg_quote_freshness(con: sqlite3.Connection, pair_id: str) -> dict:
     return out
 
 
+def load_latest_balances(con: sqlite3.Connection) -> list[dict]:
+    """각 거래소별 가장 최근 잔고 1건씩 + age (seconds since update)."""
+    rows = con.execute(
+        """SELECT a.* FROM account_balance a
+             JOIN (SELECT exchange, MAX(ts) AS max_ts
+                     FROM account_balance GROUP BY exchange) m
+               ON a.exchange = m.exchange AND a.ts = m.max_ts
+             ORDER BY a.exchange""",
+    ).fetchall()
+    now = time.time()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["age_s"] = now - d["ts"]
+        out.append(d)
+    return out
+
+
+def load_balance_history(
+    con: sqlite3.Connection, exchange: str, hours: float = 24,
+) -> pd.DataFrame:
+    """특정 거래소 N시간 잔고 시계열 (차트용)."""
+    since = time.time() - hours * 3600
+    rows = con.execute(
+        """SELECT ts, value, currency FROM account_balance
+             WHERE exchange = ? AND ts >= ?
+             ORDER BY ts ASC""",
+        (exchange, since),
+    ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["ts", "value", "currency", "datetime"])
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["datetime"] = pd.to_datetime(df["ts"], unit="s")
+    return df
+
+
 def load_bot_mode(settings_path: str = "config/settings.yaml") -> str:
     """settings.yaml에서 mode 읽기. 파일 없거나 실패 시 'UNKNOWN'."""
     try:

@@ -25,7 +25,7 @@ logger = logging.getLogger("arbitrage.storage")
 # Schema version
 # ──────────────────────────────────────────────
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # legacy product → pair_id 매핑 (Phase B backward compat)
 LEGACY_PRODUCT_PAIR_MAP = {
@@ -266,6 +266,28 @@ CREATE INDEX IF NOT EXISTS idx_engine_state_pair_ts ON engine_state(pair_id, ts)
 """
 
 
+# ──────────────────────────────────────────────
+# Migration v4 — account_balance (LIVE 잔고 모니터링)
+# ──────────────────────────────────────────────
+#
+# 봇이 N분마다 각 거래소 어댑터 .get_account_value() 결과 저장.
+# Streamlit 대시보드가 LIVE 운영 시 잔고 변화를 실시간 추적.
+# value 단위는 거래소 native (HL=USDC, KIS=USD 환산, Binance=USDT, ...).
+
+MIGRATION_V4_ACCOUNT_BALANCE = """
+CREATE TABLE IF NOT EXISTS account_balance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exchange TEXT NOT NULL,
+    ts REAL NOT NULL,
+    value REAL NOT NULL,           -- 잔고 (native currency 단위)
+    currency TEXT DEFAULT 'USD',   -- 단위
+    note TEXT                      -- 'ok' / 'error: ...' / 빈값
+);
+CREATE INDEX IF NOT EXISTS idx_account_balance_exch_ts
+    ON account_balance(exchange, ts);
+"""
+
+
 class Storage:
     """SQLite 저장소 관리."""
 
@@ -367,6 +389,10 @@ class Storage:
         if current < 3:
             self._migrate_to_v3()
 
+        # v3 → v4 (additive only — account_balance 추가)
+        if current < 4:
+            self._migrate_to_v4()
+
         # 버전 기록
         self.conn.execute(
             "INSERT OR REPLACE INTO schema_meta (key, value, updated_at) VALUES (?, ?, ?)",
@@ -394,6 +420,11 @@ class Storage:
     def _migrate_to_v3(self) -> None:
         """v2 → v3: engine_state 스냅샷 테이블 신규 (additive only)."""
         self.conn.executescript(MIGRATION_V3_ENGINE_STATE)
+        self.conn.commit()
+
+    def _migrate_to_v4(self) -> None:
+        """v3 → v4: account_balance 테이블 (additive only)."""
+        self.conn.executescript(MIGRATION_V4_ACCOUNT_BALANCE)
         self.conn.commit()
 
     # ── 시세 저장 ──
@@ -919,6 +950,42 @@ class Storage:
             (pair_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    # ── account_balance (Phase 11d+) ──
+
+    def save_account_balance(
+        self, exchange: str, value: float,
+        currency: str = "USD", note: str = "ok",
+    ) -> None:
+        """거래소 잔고 1건 저장. 봇의 balance_poll_loop가 호출."""
+        self.conn.execute(
+            """INSERT INTO account_balance (exchange, ts, value, currency, note)
+                 VALUES (?, ?, ?, ?, ?)""",
+            (exchange, time.time(), float(value), currency, note),
+        )
+        self.conn.commit()
+
+    def get_latest_balances(self) -> list[dict]:
+        """각 exchange별 가장 최근 잔고 1건씩."""
+        rows = self.conn.execute(
+            """SELECT a.* FROM account_balance a
+                 JOIN (SELECT exchange, MAX(ts) AS max_ts
+                         FROM account_balance GROUP BY exchange) m
+                   ON a.exchange = m.exchange AND a.ts = m.max_ts
+                 ORDER BY a.exchange""",
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_balance_history(self, exchange: str, hours: float = 24) -> list[dict]:
+        """특정 거래소 최근 N시간 잔고 시계열."""
+        since = time.time() - hours * 3600
+        rows = self.conn.execute(
+            """SELECT * FROM account_balance
+                 WHERE exchange = ? AND ts >= ?
+                 ORDER BY ts ASC""",
+            (exchange, since),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_engine_state_history(self, pair_id: str, hours: float = 24) -> list[dict]:
         """최근 N시간 engine_state 시계열 (대시보드 funnel/trend 차트용)."""

@@ -864,7 +864,51 @@ class KISExchange:
         return out
 
     async def get_account_value(self) -> float:
-        return 0.0   # 별도 잔고 조회 endpoint(예: inquire-deposit) 필요
+        """해외선물 예수금 합계 조회.
+
+        GET /uapi/overseas-futureoption/v1/trading/inquire-deposit
+        tr_id: OTFM3115R(실전) / VTFM3115R(모의)
+        응답 output1.frcr_dncl_amt_smtl  외화예수금 합계 (USD 환산)
+              .tot_dncl_amt              총 예수금
+        실패 시 0.0 (silent — balance polling은 best-effort).
+        """
+        auth = self._client.auth
+        cano, acnt_prdt = auth.account_cano_prdt
+        if not cano:
+            return 0.0
+        tr_id = "VTFM3115R" if auth.is_paper else "OTFM3115R"
+        try:
+            access_token = await auth.get_access_token()
+        except Exception as e:
+            logger.warning(f"[KIS] balance: token error {e}")
+            return 0.0
+        headers = auth.get_rest_headers(tr_id)
+        params = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt,
+            "OVRS_EXCG_CD": "CME",   # 거래소 코드
+            "CRCY_CD": "USD",         # 통화 코드
+        }
+        url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/inquire-deposit"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params) as r:
+                    data = await r.json()
+        except Exception as e:
+            logger.warning(f"[KIS] balance HTTP error: {e}")
+            return 0.0
+        if data.get("rt_cd") != "0":
+            logger.warning(f"[KIS] balance rt_cd={data.get('rt_cd')} msg={data.get('msg1','')}")
+            return 0.0
+        out1 = data.get("output1") or {}
+        # 응답 키 우선순위 — 거래소/계정 종류별 fallback
+        for key in ("frcr_dncl_amt_smtl", "tot_dncl_amt", "frcr_dncl_amt"):
+            if key in out1 and out1[key]:
+                try:
+                    return float(out1[key])
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
 
     async def get_funding_info(self, symbol: str) -> Optional[_base.FundingInfo]:
         """KIS는 dated_futures venue → funding 개념 없음. 항상 None."""

@@ -668,6 +668,11 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         engine.quote_freshness_watchdog(interval_seconds=15, stop_event=stop_event)
     )
 
+    # 거래소 잔고 polling (2분 간격, 대시보드 표시용)
+    balance_task = asyncio.create_task(
+        engine.balance_poll_loop(interval_seconds=120, stop_event=stop_event)
+    )
+
     # 부팅 알림
     if notifier.enabled:
         try:
@@ -691,8 +696,9 @@ async def run_paper(config_path: str = "config/settings.yaml"):
 
     state_snapshot_task.cancel()
     watchdog_task.cancel()
+    balance_task.cancel()
     for task in [collect_task, status_task, funding_task, rollover_task,
-                 state_snapshot_task, watchdog_task]:
+                 state_snapshot_task, watchdog_task, balance_task]:
         try:
             await task
         except asyncio.CancelledError:

@@ -245,6 +245,31 @@ def main():
         "🔴 > 60s면 backend WS 워치독이 자동 flatten 발동 + Telegram 알림."
     )
 
+    # ── Account balances (거래소별 잔고) ──
+    # 봇이 2분마다 각 어댑터 .get_account_value() polling → DB 저장.
+    # paper-only 어댑터(lighter/binance/bybit/okx scaffold)는 NotImplementedError로 skip되어 표시 X.
+    with sqlite3.connect(db_path) as _con:
+        _con.row_factory = sqlite3.Row
+        balances = queries.load_latest_balances(_con)
+
+    st.subheader("💰 거래소 잔고")
+    if not balances:
+        st.info("아직 잔고 데이터 없음 — 봇 부팅 후 첫 polling(2분 이내) 대기 또는 LIVE 모드 인증 키 확인")
+    else:
+        bcols = st.columns(min(len(balances), 5) or 1)
+        for i, b in enumerate(balances):
+            with bcols[i % len(bcols)]:
+                age_min = b["age_s"] / 60
+                age_str = f"{b['age_s']:.0f}s" if b["age_s"] < 120 else f"{age_min:.1f}m"
+                ok = b.get("note", "ok") == "ok" and b["value"] > 0
+                emoji = "🟢" if ok else ("🟡" if b["value"] == 0 else "🔴")
+                label = f"{emoji} {b['exchange'].upper()} ({b['currency']})"
+                st.metric(label, f"{b['value']:,.2f}", delta=None)
+                if b.get("note") and b["note"] != "ok":
+                    st.caption(f"⚠️ {b['note'][:80]}")
+                else:
+                    st.caption(f"updated {age_str} ago")
+
     st.divider()
 
     # ── Basis chart ──

@@ -794,6 +794,65 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"state_snapshot_loop dump error: {e}")
 
+    async def balance_poll_loop(
+        self,
+        interval_seconds: int = 120,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """등록된 모든 거래소 어댑터의 잔고를 N초마다 DB에 저장.
+
+        대시보드가 읽음. 어댑터별로 try/except로 보호 (한 거래소 실패해도
+        나머지는 계속). registry 미등록 시 즉시 종료.
+        """
+        if self._registry is None:
+            logger.info("[BALANCE_POLL] no registry — loop disabled")
+            return
+
+        names = list(self._registry.names())
+        logger.info(
+            f"[BALANCE_POLL] started interval={interval_seconds}s "
+            f"adapters={names}"
+        )
+        # 첫 polling 즉시 1회
+        await self._poll_all_balances()
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                logger.info("[BALANCE_POLL] stopped")
+                return
+            try:
+                if stop_event is not None:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    if stop_event.is_set():
+                        return
+                else:
+                    await asyncio.sleep(interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+            await self._poll_all_balances()
+
+    async def _poll_all_balances(self) -> None:
+        if self._registry is None:
+            return
+        for name in self._registry.names():
+            adapter = self._registry.get(name)
+            try:
+                value = await adapter.get_account_value()
+                note = "ok"
+            except NotImplementedError:
+                continue   # paper-only 어댑터 (lighter/binance/bybit/okx scaffold) 스킵
+            except Exception as e:
+                logger.warning(f"[BALANCE_POLL] {name} failed: {e}")
+                value = 0.0
+                note = f"error: {str(e)[:80]}"
+            currency = getattr(adapter, "margin_asset", "USD") or "USD"
+            try:
+                self.storage.save_account_balance(
+                    exchange=name, value=float(value),
+                    currency=currency, note=note,
+                )
+            except Exception as e:
+                logger.error(f"[BALANCE_POLL] save {name} failed: {e}")
+
     async def quote_freshness_watchdog(
         self,
         interval_seconds: int = 15,
