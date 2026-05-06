@@ -508,11 +508,23 @@ class HyperliquidClient:
             return OrderResult(success=False, error=f"build_exchange: {e}")
 
         is_buy = side == OrderSide.BUY
-        # 시장가 = IOC limit. SDK는 sliding limit을 권장하지만 단순화 위해 큰 호가 사용.
-        # 그러나 호출자가 limit_px를 명시적으로 넘기면 그 값 사용.
+        # 시장가 = IOC limit. HL은 limit_px=0을 invalid로 거절하므로
+        # 현재 mark price 조회 후 buy=mark*(1+slip), sell=mark*(1-slip)로
+        # cross 보장. SDK는 자체적으로 tick_size에 round.
         if price is None:
-            # market: 호가창 충분히 cross 보장하기 위해 ~50bp away 책정
-            limit_px = 0.0   # SDK가 0이면 적절히 처리하길 기대 — 안전 위해 작은 값 권장
+            slip = 0.05    # 5% slippage 버퍼 — 시장가 의도이므로 충분히 넓게
+            try:
+                md = await self.get_market_data(ticker)
+                ref = md.mark_price if md and md.mark_price > 0 else 0.0
+            except Exception as e:
+                logger.warning(f"HL market_data fetch failed for {ticker}: {e}")
+                ref = 0.0
+            if ref <= 0:
+                return OrderResult(
+                    success=False,
+                    error=f"market order: cannot fetch mark price for {ticker}",
+                )
+            limit_px = ref * (1 + slip) if is_buy else ref * (1 - slip)
             order_type = {"limit": {"tif": "Ioc"}}
         else:
             limit_px = price

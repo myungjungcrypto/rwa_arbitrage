@@ -93,19 +93,63 @@ async def test_place_order_filled_response():
 
 
 @pytest.mark.asyncio
-async def test_place_order_market_uses_ioc():
+async def test_place_order_market_uses_ioc_with_slippage_buffer():
+    """시장가 주문은 mark price 조회 후 ±slip% 버퍼 limit_px로 IOC 발주."""
+    from src.exchange.hyperliquid import MarketData
     c = _make_client(pk="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
     fake_exchange = MagicMock()
     fake_exchange.order.return_value = {
         "status": "ok",
         "response": {"data": {"statuses": [{"filled": {"oid": 1, "totalSz": "1", "avgPx": "80"}}]}},
     }
-    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange):
+    # mark_price=100, sell이면 limit_px = 100 * 0.95 = 95
+    md = MarketData(ticker="xyz:CL", mark_price=100.0, index_price=100.0,
+                    funding_rate=0, predicted_funding_rate=0,
+                    open_interest=0, volume_24h=0)
+    async def _mock_md(t): return md
+    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange), \
+         patch.object(HyperliquidClient, "get_market_data", side_effect=_mock_md):
         r = await c.place_order(ticker="xyz:CL", side=OrderSide.SELL, size=1.0, price=None)
     assert r.success is True
     args, kwargs = fake_exchange.order.call_args
     assert kwargs["order_type"] == {"limit": {"tif": "Ioc"}}
     assert kwargs["is_buy"] is False
+    # sell → mark * (1 - 0.05) = 95
+    assert kwargs["limit_px"] == pytest.approx(95.0)
+
+
+@pytest.mark.asyncio
+async def test_place_order_market_buy_uses_upward_slippage():
+    from src.exchange.hyperliquid import MarketData
+    c = _make_client(pk="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"oid": 1, "totalSz": "1", "avgPx": "100"}}]}},
+    }
+    md = MarketData(ticker="xyz:CL", mark_price=100.0, index_price=100.0,
+                    funding_rate=0, predicted_funding_rate=0,
+                    open_interest=0, volume_24h=0)
+    async def _mock_md(t): return md
+    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange), \
+         patch.object(HyperliquidClient, "get_market_data", side_effect=_mock_md):
+        r = await c.place_order(ticker="xyz:CL", side=OrderSide.BUY, size=1.0, price=None)
+    assert r.success is True
+    args, kwargs = fake_exchange.order.call_args
+    # buy → mark * (1 + 0.05) = 105
+    assert kwargs["limit_px"] == pytest.approx(105.0)
+
+
+@pytest.mark.asyncio
+async def test_place_order_market_fails_when_no_mark_price():
+    c = _make_client(pk="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+    fake_exchange = MagicMock()
+    async def _no_md(t): return None
+    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange), \
+         patch.object(HyperliquidClient, "get_market_data", side_effect=_no_md):
+        r = await c.place_order(ticker="xyz:CL", side=OrderSide.BUY, size=1.0, price=None)
+    assert r.success is False
+    assert "mark price" in r.error.lower()
 
 
 @pytest.mark.asyncio
@@ -126,13 +170,19 @@ async def test_place_order_resting_returns_success_with_oid():
 
 @pytest.mark.asyncio
 async def test_place_order_status_error_returns_failure():
+    from src.exchange.hyperliquid import MarketData
     c = _make_client(pk="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
     fake_exchange = MagicMock()
     fake_exchange.order.return_value = {
         "status": "ok",
         "response": {"data": {"statuses": [{"error": "insufficient margin"}]}},
     }
-    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange):
+    md = MarketData(ticker="xyz:CL", mark_price=80.0, index_price=80.0,
+                    funding_rate=0, predicted_funding_rate=0,
+                    open_interest=0, volume_24h=0)
+    async def _mock_md(t): return md
+    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange), \
+         patch.object(HyperliquidClient, "get_market_data", side_effect=_mock_md):
         r = await c.place_order(ticker="xyz:CL", side=OrderSide.BUY, size=1.0)
     assert r.success is False
     assert "insufficient margin" in r.error
@@ -140,10 +190,16 @@ async def test_place_order_status_error_returns_failure():
 
 @pytest.mark.asyncio
 async def test_place_order_exchange_exception_returns_failure():
+    from src.exchange.hyperliquid import MarketData
     c = _make_client(pk="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
     fake_exchange = MagicMock()
     fake_exchange.order.side_effect = RuntimeError("network down")
-    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange):
+    md = MarketData(ticker="xyz:CL", mark_price=80.0, index_price=80.0,
+                    funding_rate=0, predicted_funding_rate=0,
+                    open_interest=0, volume_24h=0)
+    async def _mock_md(t): return md
+    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange), \
+         patch.object(HyperliquidClient, "get_market_data", side_effect=_mock_md):
         r = await c.place_order(ticker="xyz:CL", side=OrderSide.BUY, size=1.0)
     assert r.success is False
     assert "network down" in r.error
