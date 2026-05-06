@@ -384,9 +384,50 @@ class HyperliquidClient:
         return positions
 
     async def get_account_value(self) -> float:
-        """총 계좌 가치 (USDC)."""
-        state = await self.get_user_state()
-        return float(state.get("marginSummary", {}).get("accountValue", 0))
+        """총 계좌 가치 (USDC) — native perp + HIP-3 builder dex + spot 합산.
+
+        HL Unified Account: 같은 wallet이 native perp / xyz dex (HIP-3) /
+        spot에 자금 분산 가능. 봇이 거래에 쓸 수 있는 총액은 세 영역 합.
+
+        - native perp:    {type:'clearinghouseState', user}
+        - HIP-3 dex(xyz): {type:'clearinghouseState', user, dex:'xyz'}
+        - spot USDC:      {type:'spotClearinghouseState', user} 의 USDC.total
+        """
+        if not self.wallet_address:
+            return 0.0
+        # 1) native perp
+        native = await self._post("/info", {
+            "type": "clearinghouseState", "user": self.wallet_address,
+        })
+        v_native = 0.0
+        if isinstance(native, dict):
+            v_native = float((native.get("marginSummary") or {}).get("accountValue", 0) or 0)
+
+        # 2) HIP-3 builder dex (trade.xyz)
+        v_dex = 0.0
+        if self.perp_dex:
+            dex_state = await self._post("/info", {
+                "type": "clearinghouseState",
+                "user": self.wallet_address,
+                "dex": self.perp_dex,
+            })
+            if isinstance(dex_state, dict):
+                v_dex = float((dex_state.get("marginSummary") or {}).get("accountValue", 0) or 0)
+
+        # 3) spot USDC
+        v_spot = 0.0
+        spot = await self._post("/info", {
+            "type": "spotClearinghouseState", "user": self.wallet_address,
+        })
+        if isinstance(spot, dict):
+            for b in spot.get("balances", []) or []:
+                if b.get("coin") == "USDC":
+                    try:
+                        v_spot = float(b.get("total", 0) or 0)
+                    except (TypeError, ValueError):
+                        v_spot = 0.0
+                    break
+        return v_native + v_dex + v_spot
 
     # ── 주문 ──
 
