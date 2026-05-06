@@ -299,7 +299,12 @@ class LighterExchange:
         return []   # 페이퍼 단계 (live 단계에서 SDK AccountApi.account 활용)
 
     async def get_account_value(self) -> float:
-        return 0.0
+        # Phase D scaffolding — live AccountApi.account 미구현. polling loop가
+        # 이 어댑터를 dashboard에서 빼도록 NotImplementedError raise.
+        raise NotImplementedError(
+            "LighterExchange.get_account_value is paper-only stage. "
+            "Live AccountApi balance lands in Phase I."
+        )
 
     async def get_funding_info(self, symbol: str) -> Optional[_base.FundingInfo]:
         """최근 fundings 시계열에서 정산 주기 + 현재 rate 추정.
