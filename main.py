@@ -30,6 +30,7 @@ from src.exchange.kiwoom import create_kiwoom_client
 from src.exchange.lighter import LighterExchange
 from src.exchange.binance import BinanceExchange
 from src.exchange.bybit import BybitExchange
+from src.exchange.okx import OKXExchange
 from src.exchange.registry import ExchangeRegistry
 from src.strategy.pair import LegRole
 from src.strategy.rollover import get_active_contract, us_market_holidays
@@ -425,6 +426,32 @@ async def run_paper(config_path: str = "config/settings.yaml"):
             logger.warning("Bybit connect failed; skipping registration")
             bybit_adapter = None
 
+    # ── Phase G: OKX 어댑터 (활성화 시) ──
+    okx_adapter: OKXExchange | None = None
+    if config.okx.enabled:
+        okx_adapter = OKXExchange(
+            rest_url=config.okx.rest_url,
+            ws_url=config.okx.ws_url,
+        )
+        ok = await okx_adapter.connect()
+        if ok:
+            registry.register(okx_adapter)
+            logger.info("OKX adapter registered (Phase G)")
+            for pair in pairs:
+                if pair.leg_b.exchange != "okx":
+                    continue
+                try:
+                    found = await okx_adapter.discover_symbol(pair.leg_b.symbol)
+                    if not found:
+                        logger.warning(
+                            f"[OKX] {pair.leg_b.symbol} not in instruments"
+                        )
+                except Exception as e:
+                    logger.warning(f"OKX discover_symbol failed: {e}")
+        else:
+            logger.warning("OKX connect failed; skipping registration")
+            okx_adapter = None
+
     engine.set_exchange_registry(registry)
     engine.set_notifier(notifier)
     for pair in pairs:
@@ -501,6 +528,25 @@ async def run_paper(config_path: str = "config/settings.yaml"):
                 logger.info(f"[BYBIT] subscribed {pair.id} leg_b → {pair.leg_b.symbol}")
             except Exception as e:
                 logger.error(f"[BYBIT] subscribe failed for {pair.id}: {e}")
+
+    # OKX 페어 leg_b WS 구독
+    if okx_adapter is not None:
+        for pair in pairs:
+            if pair.leg_b.exchange != "okx":
+                continue
+
+            def _make_okx_cb(pair_id: str):
+                def _cb(q: Quote) -> None:
+                    collector.update_leg_quote(pair_id, "b", q)
+                return _cb
+
+            try:
+                await okx_adapter.subscribe_quotes(
+                    pair.leg_b.symbol, _make_okx_cb(pair.id),
+                )
+                logger.info(f"[OKX] subscribed {pair.id} leg_b → {pair.leg_b.symbol}")
+            except Exception as e:
+                logger.error(f"[OKX] subscribe failed for {pair.id}: {e}")
 
     pair_by_product: dict[str, "object"] = {
         product: collector.get_pair(LEGACY_PRODUCT_PAIR_MAP.get(product, product))

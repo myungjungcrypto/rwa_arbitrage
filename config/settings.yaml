@@ -116,6 +116,14 @@ bybit:
   rest_url: "https://api.bybit.com"
   ws_url: "wss://stream.bybit.com/v5/public/linear"
 
+# OKX v5 SWAP (Phase G)
+# 페이퍼 shadow는 public REST/WS. live는 Phase I에서 3-header 인증
+# (OK-ACCESS-KEY, OK-ACCESS-SIGN, OK-ACCESS-PASSPHRASE) + HMAC-SHA256.
+okx:
+  enabled: false
+  rest_url: "https://www.okx.com"
+  ws_url: "wss://ws.okx.com:8443/ws/v5/public"
+
 # 명시 페어 — Web2-Web3 페어(wti_cme_hl)는 products+kis_symbol_map에서 자동 합성.
 # 아래는 Web3-Web3 페어 추가용. Phase D에서 wti_hl_lighter shadow로 시작.
 pairs:
@@ -185,6 +193,29 @@ pairs:
       margin_asset: USDT
     params:
       entry_threshold_bps: 15   # Binance와 동일 (4h funding asymmetry 같음)
+      convergence_target_bps: 3
+      max_hold_hours: 12
+
+  - id: wti_hl_okx
+    enabled: false              # Phase G shadow → 24h 분포 분석 후 true flip
+    strategy: basis_convergence
+    gate: cme_hours
+    leg_a:
+      exchange: hyperliquid
+      symbol: "xyz:CL"
+      role: perp
+      taker_fee_bps: 0.9
+      funding_interval_hours: 1.0
+      margin_asset: USDC
+    leg_b:
+      exchange: okx
+      symbol: "CL-USDT-SWAP"    # OKX v5 swap, 4h funding (사용자 정정 2026-04-21)
+      role: perp
+      taker_fee_bps: 5.0        # OKX USDT swap taker ~0.05% (실측 후 보정)
+      funding_interval_hours: 4.0
+      margin_asset: USDT
+    params:
+      entry_threshold_bps: 15   # 4h funding asymmetry, USDC/USDT peg 버퍼
       convergence_target_bps: 3
       max_hold_hours: 12
 

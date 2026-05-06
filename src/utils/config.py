@@ -86,6 +86,21 @@ class BybitConfig:
 
 
 @dataclass
+class OKXConfig:
+    """OKX v5 SWAP 어댑터 설정 — Phase G.
+
+    페이퍼 shadow는 인증 불필요. live는 Phase I에서 3-header 인증 추가
+    (OK-ACCESS-KEY, OK-ACCESS-SIGN, OK-ACCESS-PASSPHRASE).
+    """
+    enabled: bool = False
+    rest_url: str = "https://www.okx.com"
+    ws_url: str = "wss://ws.okx.com:8443/ws/v5/public"
+    api_key: str = ""
+    api_secret: str = ""
+    passphrase: str = ""
+
+
+@dataclass
 class TelegramConfig:
     """Telegram 알림 설정 (Phase 11d).
 
@@ -155,6 +170,7 @@ class AppConfig:
     lighter: LighterConfig = field(default_factory=LighterConfig)
     binance: BinanceConfig = field(default_factory=BinanceConfig)
     bybit: BybitConfig = field(default_factory=BybitConfig)
+    okx: OKXConfig = field(default_factory=OKXConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -344,6 +360,18 @@ def load_config(
         api_secret=by_secrets.get("api_secret", ""),
     )
 
+    # OKX (Phase G)
+    ok_settings = settings.get("okx", {})
+    ok_secrets = secrets.get("okx", {})
+    okx_config = OKXConfig(
+        enabled=ok_settings.get("enabled", False),
+        rest_url=ok_settings.get("rest_url", "https://www.okx.com"),
+        ws_url=ok_settings.get("ws_url", "wss://ws.okx.com:8443/ws/v5/public"),
+        api_key=ok_secrets.get("api_key", ""),
+        api_secret=ok_secrets.get("api_secret", ""),
+        passphrase=ok_secrets.get("passphrase", ""),
+    )
+
     # 전략/리스크 설정
     strat = settings.get("strategy", {})
     risk = settings.get("risk", {})
@@ -363,6 +391,7 @@ def load_config(
         lighter=lighter_config,
         binance=binance_config,
         bybit=bybit_config,
+        okx=okx_config,
         telegram=telegram_config,
         strategy=StrategyConfig(**{k: v for k, v in strat.items() if k in StrategyConfig.__dataclass_fields__}),
         risk=RiskConfig(**{k: v for k, v in risk.items() if k in RiskConfig.__dataclass_fields__}),
