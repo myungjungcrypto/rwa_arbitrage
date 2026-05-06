@@ -59,6 +59,20 @@ class LighterConfig:
 
 
 @dataclass
+class BinanceConfig:
+    """Binance USDⓈ-M Futures 어댑터 설정 — Phase E.
+
+    페이퍼 shadow는 인증 불필요 (REST + WS public). live는 Phase I에서
+    HMAC-SHA256 키 추가.
+    """
+    enabled: bool = False
+    rest_url: str = "https://fapi.binance.com"
+    ws_url: str = "wss://fstream.binance.com/ws"
+    api_key: str = ""             # live 단계만 사용
+    api_secret: str = ""
+
+
+@dataclass
 class TelegramConfig:
     """Telegram 알림 설정 (Phase 11d).
 
@@ -126,6 +140,7 @@ class AppConfig:
     kiwoom: KiwoomConfig = field(default_factory=KiwoomConfig)
     kis: KISConfig = field(default_factory=KISConfig)
     lighter: LighterConfig = field(default_factory=LighterConfig)
+    binance: BinanceConfig = field(default_factory=BinanceConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -293,6 +308,17 @@ def load_config(
         api_secret=lighter_secrets.get("api_secret", ""),
     )
 
+    # Binance (Phase E)
+    bn_settings = settings.get("binance", {})
+    bn_secrets = secrets.get("binance", {})
+    binance_config = BinanceConfig(
+        enabled=bn_settings.get("enabled", False),
+        rest_url=bn_settings.get("rest_url", "https://fapi.binance.com"),
+        ws_url=bn_settings.get("ws_url", "wss://fstream.binance.com/ws"),
+        api_key=bn_secrets.get("api_key", ""),
+        api_secret=bn_secrets.get("api_secret", ""),
+    )
+
     # 전략/리스크 설정
     strat = settings.get("strategy", {})
     risk = settings.get("risk", {})
@@ -310,6 +336,7 @@ def load_config(
         kiwoom=kw_config,
         kis=kis_config,
         lighter=lighter_config,
+        binance=binance_config,
         telegram=telegram_config,
         strategy=StrategyConfig(**{k: v for k, v in strat.items() if k in StrategyConfig.__dataclass_fields__}),
         risk=RiskConfig(**{k: v for k, v in risk.items() if k in RiskConfig.__dataclass_fields__}),

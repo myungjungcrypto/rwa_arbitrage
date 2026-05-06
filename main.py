@@ -28,6 +28,7 @@ from src.exchange.hyperliquid import HyperliquidExchange
 from src.exchange.kis import KISAuth, KISExchange, KISFuturesClient
 from src.exchange.kiwoom import create_kiwoom_client
 from src.exchange.lighter import LighterExchange
+from src.exchange.binance import BinanceExchange
 from src.exchange.registry import ExchangeRegistry
 from src.strategy.pair import LegRole
 from src.strategy.rollover import get_active_contract, us_market_holidays
@@ -370,6 +371,33 @@ async def run_paper(config_path: str = "config/settings.yaml"):
             logger.warning("Lighter connect failed; skipping registration")
             lighter_adapter = None
 
+    # ── Phase E: Binance 어댑터 (활성화 시) ──
+    binance_adapter: BinanceExchange | None = None
+    if config.binance.enabled:
+        binance_adapter = BinanceExchange(
+            rest_url=config.binance.rest_url,
+            ws_url=config.binance.ws_url,
+        )
+        ok = await binance_adapter.connect()
+        if ok:
+            registry.register(binance_adapter)
+            logger.info("Binance adapter registered (Phase E)")
+            # 페어별 leg_b 심볼 메타데이터 lookup (CLUSDT 등)
+            for pair in pairs:
+                if pair.leg_b.exchange != "binance":
+                    continue
+                try:
+                    found = await binance_adapter.discover_symbol(pair.leg_b.symbol)
+                    if not found:
+                        logger.warning(
+                            f"[BINANCE] {pair.leg_b.symbol} not in exchangeInfo"
+                        )
+                except Exception as e:
+                    logger.warning(f"Binance discover_symbol failed: {e}")
+        else:
+            logger.warning("Binance connect failed; skipping registration")
+            binance_adapter = None
+
     engine.set_exchange_registry(registry)
     engine.set_notifier(notifier)
     for pair in pairs:
@@ -408,6 +436,26 @@ async def run_paper(config_path: str = "config/settings.yaml"):
                 logger.info(f"[LIGHTER] subscribed {pair.id} leg_b → {pair.leg_b.symbol}")
             except Exception as e:
                 logger.error(f"[LIGHTER] subscribe failed for {pair.id}: {e}")
+
+    # Binance 페어 leg_b WS 구독 — Quote 도착 시 collector.update_leg_quote 푸시
+    if binance_adapter is not None:
+        for pair in pairs:
+            if pair.leg_b.exchange != "binance":
+                continue
+
+            def _make_binance_cb(pair_id: str):
+                def _cb(q: Quote) -> None:
+                    collector.update_leg_quote(pair_id, "b", q)
+                return _cb
+
+            try:
+                await binance_adapter.subscribe_quotes(
+                    pair.leg_b.symbol, _make_binance_cb(pair.id),
+                )
+                logger.info(f"[BINANCE] subscribed {pair.id} leg_b → {pair.leg_b.symbol}")
+            except Exception as e:
+                logger.error(f"[BINANCE] subscribe failed for {pair.id}: {e}")
+
     pair_by_product: dict[str, "object"] = {
         product: collector.get_pair(LEGACY_PRODUCT_PAIR_MAP.get(product, product))
         for product in config.products

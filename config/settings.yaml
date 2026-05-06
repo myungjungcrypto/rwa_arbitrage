@@ -102,6 +102,13 @@ lighter:
   base_url: "https://mainnet.zklighter.elliot.ai"
   ws_url: "wss://mainnet.zklighter.elliot.ai/stream"
 
+# Binance USDⓈ-M Futures (Phase E)
+# 인증 불필요 — 페이퍼 shadow는 public REST/WS만 사용. live(Phase I)에서 HMAC 키 추가.
+binance:
+  enabled: false
+  rest_url: "https://fapi.binance.com"
+  ws_url: "wss://fstream.binance.com/ws"
+
 # 명시 페어 — Web2-Web3 페어(wti_cme_hl)는 products+kis_symbol_map에서 자동 합성.
 # 아래는 Web3-Web3 페어 추가용. Phase D에서 wti_hl_lighter shadow로 시작.
 pairs:
@@ -127,6 +134,29 @@ pairs:
       entry_threshold_bps: 12   # Web3-Web3 페어는 CME 페어보다 좁은 임계 (수수료 적음)
       convergence_target_bps: 3
       max_hold_hours: 12        # 단기 hold (펀딩 누적 위험 최소화)
+
+  - id: wti_hl_binance
+    enabled: false              # Phase E shadow → 24h 분포 분석 후 true flip
+    strategy: basis_convergence
+    gate: cme_hours
+    leg_a:
+      exchange: hyperliquid
+      symbol: "xyz:CL"
+      role: perp
+      taker_fee_bps: 0.9
+      funding_interval_hours: 1.0
+      margin_asset: USDC
+    leg_b:
+      exchange: binance
+      symbol: "CLUSDT"          # Binance USDⓈ-M Futures (2026-04-01 런칭, 100x)
+      role: perp
+      taker_fee_bps: 4.0        # Binance USD-M taker default ~0.04% (실측 후 보정)
+      funding_interval_hours: 4.0
+      margin_asset: USDT
+    params:
+      entry_threshold_bps: 15   # 1h vs 4h 펀딩 비대칭 + USDC/USDT peg 버퍼
+      convergence_target_bps: 3
+      max_hold_hours: 12
 
 # 알림 (Phase 11d) — bot_token / chat_id는 secrets.yaml에서 로드
 telegram:
