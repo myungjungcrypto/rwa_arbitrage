@@ -54,7 +54,7 @@ async def main() -> int:
 
     print("[OK ] config loaded + notifier ENABLED. Sending test message...")
     try:
-        await notifier.send(
+        ok = await notifier.send(
             "🧪 <b>Telegram test from rwa_arbitrage</b>\n"
             "If you see this, alerts are wired correctly."
         )
@@ -62,14 +62,20 @@ async def main() -> int:
         print(f"[FAIL] send() raised: {e}")
         return 2
 
-    print("[OK ] send() returned without exception.")
-    print()
-    print("Check your Telegram chat. If no message arrived:")
-    print("  - bot_token wrong (check @BotFather → your bot)")
-    print("  - chat_id wrong (start a chat with your bot, then visit:")
-    print("      https://api.telegram.org/bot<TOKEN>/getUpdates")
-    print("    and copy 'chat.id' from the latest 'message' object)")
-    print("  - bot blocked / not added to group")
+    if not ok:
+        print()
+        print("[FAIL] Telegram rejected the request "
+              "(see ERROR log above for description/error_code)")
+        print()
+        print("Common rejections:")
+        print("  - 'Bad Request: chat not found'")
+        print("      → wrong chat_id, OR you never started a chat with the bot.")
+        print("        Open Telegram, find your bot, send /start, then re-run.")
+        print("  - 'Forbidden: bot was blocked by the user' → unblock the bot.")
+        print("  - 'Unauthorized' → bot_token is wrong (check @BotFather).")
+        return 3
+
+    print("[OK ] Telegram acknowledged ok=true — message should be in your chat.")
     return 0
 
 

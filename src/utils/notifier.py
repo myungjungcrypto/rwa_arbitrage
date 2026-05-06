@@ -58,15 +58,20 @@ class TelegramNotifier:
         else:
             logger.info("Telegram notifier disabled (enabled=false)")
 
-    async def send(self, message: str, parse_mode: str = "HTML"):
-        """비동기 메시지 전송."""
+    async def send(self, message: str, parse_mode: str = "HTML") -> bool:
+        """비동기 메시지 전송. Telegram이 ok=false 응답하면 False 반환.
+
+        Returns:
+            True  — Telegram이 ok=true 응답 (메시지 실제 도착 보장)
+            False — disabled 상태 / HTTP non-200 / ok=false / 예외
+        """
         if not self.enabled:
             logger.debug(f"Notification (disabled): {message[:80]}")
-            return
+            return False
 
         aiohttp = _get_aiohttp()
         if aiohttp is None:
-            return
+            return False
 
         url = f"{self.API_BASE.format(token=self.bot_token)}/sendMessage"
         payload = {
@@ -79,11 +84,30 @@ class TelegramNotifier:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as resp:
                     self._last_send = time.time()
+                    text = await resp.text()
                     if resp.status != 200:
-                        text = await resp.text()
-                        logger.error(f"Telegram send failed: {text[:200]}")
+                        logger.error(
+                            f"Telegram HTTP {resp.status}: {text[:300]}"
+                        )
+                        return False
+                    # 200이어도 Telegram 자체가 ok=false로 거절할 수 있음
+                    # (chat_id 틀림, bot blocked 등). description을 그대로 노출.
+                    try:
+                        import json as _json
+                        body = _json.loads(text)
+                    except Exception:
+                        body = {}
+                    if not body.get("ok", False):
+                        logger.error(
+                            f"Telegram REJECTED: "
+                            f"description={body.get('description', text[:200])} "
+                            f"error_code={body.get('error_code')}"
+                        )
+                        return False
+                    return True
         except Exception as e:
             logger.error(f"Telegram error: {e}")
+            return False
 
     def send_sync(self, message: str, parse_mode: str = "HTML"):
         """동기 메시지 전송 (sync 콜백에서 사용).
