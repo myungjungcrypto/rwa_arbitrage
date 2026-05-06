@@ -422,10 +422,14 @@ class HyperliquidClient:
         # account_address가 wallet과 같으면 (단순 trading wallet) 자동 추론.
         # agent wallet 사용 시 account_address는 메인 wallet 주소여야 함.
         account_address = self.wallet_address or signer.address
+        # perp_dexs: HIP-3 builder dex (예: trade.xyz의 'xyz') 인식.
+        # 이게 없으면 SDK의 name_to_coin map에 xyz:CL 등이 없어 KeyError 발생.
+        perp_dexs = [self.perp_dex] if self.perp_dex else None
         return Exchange(
             wallet=signer,
             base_url=base_url,
             account_address=account_address,
+            perp_dexs=perp_dexs,
         )
 
     async def place_order(
@@ -474,8 +478,9 @@ class HyperliquidClient:
             order_type = {"limit": {"tif": "Gtc"}}
 
         try:
+            # SDK v0.23+: param renamed coin → name
             result = exchange.order(
-                coin=ticker,
+                name=ticker,
                 is_buy=is_buy,
                 sz=size,
                 limit_px=limit_px,
@@ -523,7 +528,8 @@ class HyperliquidClient:
             exchange = self._build_exchange()
             if exchange is None:
                 return False
-            result = exchange.cancel(coin=ticker, oid=int(order_id))
+            # SDK v0.23+: param renamed coin → name
+            result = exchange.cancel(name=ticker, oid=int(order_id))
             return result.get("status") == "ok"
         except Exception as e:
             logger.error(f"HL cancel_order error: {e}")

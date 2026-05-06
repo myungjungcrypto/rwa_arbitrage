@@ -85,7 +85,7 @@ async def test_place_order_filled_response():
     assert r.filled_price == 80.5
     # SDK 호출 인자 검증
     args, kwargs = fake_exchange.order.call_args
-    assert kwargs["coin"] == "xyz:CL"
+    assert kwargs["name"] == "xyz:CL"
     assert kwargs["is_buy"] is True
     assert kwargs["sz"] == 1.0
     # limit price 지정한 경우 GTC
@@ -169,7 +169,7 @@ async def test_cancel_order_success_path():
         ok = await c.cancel_order("xyz:CL", 12345)
     assert ok is True
     args, kwargs = fake_exchange.cancel.call_args
-    assert kwargs["coin"] == "xyz:CL"
+    assert kwargs["name"] == "xyz:CL"
     assert kwargs["oid"] == 12345
 
 
