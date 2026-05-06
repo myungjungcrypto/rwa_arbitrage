@@ -316,7 +316,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     데이터 수집 + 시그널 생성 + 자동 주문 시뮬레이션.
     """
     config, logger, storage, kiwoom = _setup(config_path)
-    logger.info(f"Starting RWA Arbitrage Bot (mode: PAPER TRADING)")
+    logger.info(f"Starting RWA Arbitrage Bot (mode: {config.mode})")
     logger.info(f"Products: {list(config.products.keys())}")
 
     # Telegram 알림 (Phase 11d) — secrets.yaml의 token/chat_id 있으면 자동 활성화.
@@ -632,7 +632,10 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         except Exception as e:
             logger.warning(f"startup notify error: {e}")
 
-    logger.info("Paper trading engine started — waiting for signals...")
+    logger.info(
+        f"[{config.mode}] engine started — waiting for signals "
+        f"(notifier={'on' if notifier.enabled else 'off'}, pairs={len(pairs)})"
+    )
     await stop_event.wait()
 
     logger.info("Shutting down paper trading...")
