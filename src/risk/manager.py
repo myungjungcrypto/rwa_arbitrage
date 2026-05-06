@@ -107,16 +107,32 @@ class RiskManager:
 
         매월 5~10 영업일.
         """
-        dt = current_date or date.today()
+        bd = self._business_day(current_date)
+        return self.config.rollover_start_day <= bd <= self.config.rollover_end_day
 
-        # 해당 월의 영업일 계산 (간이 버전: 주말 제외)
-        business_day = 0
+    def is_rollover_blackout(self, current_date: date | None = None) -> bool:
+        """롤 window 시작 N영업일 전부터 BD 마지막까지 신규 진입 전면 차단 + flatten.
+
+        rollover_block_entry_days=0이면 비활성 (False 항상).
+        rollover_block_entry_days=1이면 BD (start - 1)부터 BD end 까지 True.
+        """
+        block_days = self.config.rollover_block_entry_days
+        if block_days <= 0:
+            return False
+        bd = self._business_day(current_date)
+        blackout_start = self.config.rollover_start_day - block_days
+        return blackout_start <= bd <= self.config.rollover_end_day
+
+    @staticmethod
+    def _business_day(current_date: date | None = None) -> int:
+        """해당 월의 영업일 (월~금만 카운트, 휴일은 보수적으로 무시)."""
+        dt = current_date or date.today()
+        bd = 0
         for day in range(1, dt.day + 1):
             d = date(dt.year, dt.month, day)
-            if d.weekday() < 5:  # 월~금
-                business_day += 1
-
-        return self.config.rollover_start_day <= business_day <= self.config.rollover_end_day
+            if d.weekday() < 5:
+                bd += 1
+        return bd
 
     def record_pnl(self, pnl_usd: float, dt: date | None = None):
         """일일 PnL 기록."""

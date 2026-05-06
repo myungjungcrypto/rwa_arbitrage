@@ -91,6 +91,17 @@ risk:
   ws_stale_seconds: 60.0        # leg quote 60s 이상 stale → 알림 + auto-flatten
   ws_stale_auto_flatten: true   # true면 stale 감지 시 모든 오픈 포지션 즉시 청산
 
+  # Rollover blackout — KIS leg dated_futures 페어 한정.
+  # 롤 window 시작(BD 5) N영업일 전부터 신규 진입 차단 + 보유 포지션 flatten.
+  # 1이면 BD 4부터 차단 (롤 시작 1일 전), 0이면 비활성.
+  rollover_block_entry_days: 1
+
+  # Contract alignment — HL oracle index ↔ KIS mid_price 일치성 모니터.
+  # |diff_bps|가 임계 초과 시 알림. auto_flatten=true면 즉시 청산.
+  # 정상 운영: 0~10bp. 50bp 초과 = 양 leg가 다른 contract 추종 의심.
+  contract_alignment_max_bps: 50.0
+  contract_alignment_auto_flatten: false   # true 권장하나 안전 위해 알림만 default
+
 # 데이터 저장
 database:
   type: "sqlite"

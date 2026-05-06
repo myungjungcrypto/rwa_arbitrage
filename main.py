@@ -183,9 +183,12 @@ async def rollover_watch_loop(
     subs_state: dict,
     stop_event: asyncio.Event,
     check_interval: int = 3600,
+    engine=None,
 ):
-    """매시간 active contract 재계산 후 변화 시 resubscribe.
+    """매시간 active contract 재계산 + 롤오버 blackout 진입 시 자동 flatten.
 
+    engine 인자가 있으면 매 사이클마다 engine.rollover_blackout_check()
+    호출 — blackout 진입 시점에 dated_futures 페어 일제히 flatten.
     stop_event 설정 시 즉시 종료.
     """
     logger = get_logger()
@@ -194,6 +197,15 @@ async def rollover_watch_loop(
     logger.info(f"[ROLLOVER] watch loop started (interval={check_interval}s)")
 
     while not stop_event.is_set():
+        # 부팅 직후 + 매 사이클 blackout 체크 (BD 4 진입 시점에 즉시 flatten 발동)
+        if engine is not None:
+            try:
+                n_flat = await engine.rollover_blackout_check()
+                if n_flat > 0:
+                    logger.warning(f"[ROLLOVER] blackout flattened {n_flat} pairs")
+            except Exception as e:
+                logger.error(f"[ROLLOVER] blackout check error: {e}")
+
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=check_interval)
             break
@@ -701,7 +713,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
 
     funding_task = asyncio.create_task(funding_loop())
     rollover_task = asyncio.create_task(
-        rollover_watch_loop(kis_client, config, kis_subs, stop_event)
+        rollover_watch_loop(kis_client, config, kis_subs, stop_event, engine=engine)
     )
 
     # 대시보드용 engine_state 스냅샷 (30초마다 DB에 dump)
@@ -717,6 +729,13 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     # 거래소 잔고 polling (2분 간격, 대시보드 표시용)
     balance_task = asyncio.create_task(
         engine.balance_poll_loop(interval_seconds=120, stop_event=stop_event)
+    )
+
+    # Contract alignment 모니터 — HL index ↔ KIS mid (1분 간격)
+    alignment_task = asyncio.create_task(
+        engine.contract_alignment_monitor_loop(
+            interval_seconds=60, stop_event=stop_event,
+        )
     )
 
     # 부팅 알림
@@ -743,8 +762,10 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     state_snapshot_task.cancel()
     watchdog_task.cancel()
     balance_task.cancel()
+    alignment_task.cancel()
     for task in [collect_task, status_task, funding_task, rollover_task,
-                 state_snapshot_task, watchdog_task, balance_task]:
+                 state_snapshot_task, watchdog_task, balance_task,
+                 alignment_task]:
         try:
             await task
         except asyncio.CancelledError:

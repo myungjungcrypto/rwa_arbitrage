@@ -158,6 +158,18 @@ class RiskConfig:
     # 오토 flatten 활성화 (False면 알림만, True면 실제 청산)
     ws_stale_auto_flatten: bool = True
 
+    # Rollover blackout — CME 월물 롤 window 시작 N영업일 전부터 신규 진입
+    # 차단 + 보유 포지션 강제 flatten. HL의 oracle blending과 KIS leg가
+    # 다른 contract를 추종하는 BD 5~10 구간을 회피하기 위함.
+    # 0이면 비활성. 1이면 BD 4부터 차단 (롤 시작 1영업일 전).
+    rollover_block_entry_days: int = 1
+
+    # Contract alignment monitor — HL oracle index_price와 KIS mid_price의
+    # |diff_bps|가 임계 초과 시 alignment 손실 의심 → 알림 + (선택) flatten.
+    # 정상 운영: 0~10bp. 50bp 초과 = 다른 contract 추종 가능성.
+    contract_alignment_max_bps: float = 50.0
+    contract_alignment_auto_flatten: bool = False
+
 
 @dataclass
 class AppConfig:

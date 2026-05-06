@@ -960,6 +960,137 @@ class PaperTradingEngine:
                                 f"[WS_WATCHDOG] flatten {pid} raised: {e}"
                             )
 
+    async def contract_alignment_monitor_loop(
+        self,
+        interval_seconds: int = 60,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """HL oracle index ↔ KIS mid 일치성 모니터.
+
+        |diff_bps| > contract_alignment_max_bps 임계 초과 시:
+          1. notifier로 ALIGNMENT 경보 (한 번만, recovery 시 해제)
+          2. contract_alignment_auto_flatten=True면 dated_futures 페어 flatten
+
+        dated_futures leg를 가진 페어만 의미 있음 (Web3-Web3는 양 leg 모두 perp).
+        """
+        threshold = float(self.config.risk.contract_alignment_max_bps or 50.0)
+        auto_flatten = bool(self.config.risk.contract_alignment_auto_flatten)
+        logger.info(
+            f"[ALIGNMENT] monitor started threshold={threshold}bp "
+            f"auto_flatten={auto_flatten} interval={interval_seconds}s"
+        )
+        alerted: set[str] = set()
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                logger.info("[ALIGNMENT] monitor stopped")
+                return
+            try:
+                if stop_event is not None:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    if stop_event.is_set():
+                        return
+                else:
+                    await asyncio.sleep(interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+            for pair_id, pair in self._registered_pairs.items():
+                if pair.leg_b.role != LegRole.DATED_FUTURES:
+                    continue
+                diff = self.check_contract_alignment(pair_id)
+                if diff is None:
+                    continue
+                if diff > threshold:
+                    if pair_id not in alerted:
+                        logger.error(
+                            f"[ALIGNMENT] {pair_id} mismatch |diff|={diff:.1f}bp "
+                            f"> threshold={threshold:.1f}bp"
+                        )
+                        if self._notifier is not None:
+                            try:
+                                self._notifier.send_sync(
+                                    f"⚠️ <b>CONTRACT ALIGNMENT [{pair_id}]</b>\n"
+                                    f"|HL_index − KIS_mid| = {diff:.1f}bp "
+                                    f"(threshold {threshold:.0f}bp)\n"
+                                    f"auto_flatten={auto_flatten}"
+                                )
+                            except Exception:
+                                pass
+                        alerted.add(pair_id)
+                        if auto_flatten and pair_id in self._open_trades_by_pair:
+                            try:
+                                await self.emergency_flatten_pair(
+                                    pair_id, reason=f"alignment_{diff:.0f}bp"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"[ALIGNMENT] flatten {pair_id} raised: {e}"
+                                )
+                else:
+                    if pair_id in alerted:
+                        logger.info(
+                            f"[ALIGNMENT] {pair_id} recovered |diff|={diff:.1f}bp"
+                        )
+                        if self._notifier is not None:
+                            try:
+                                self._notifier.send_sync(
+                                    f"✅ <b>ALIGNMENT RECOVERED [{pair_id}]</b> "
+                                    f"|diff|={diff:.1f}bp"
+                                )
+                            except Exception:
+                                pass
+                        alerted.discard(pair_id)
+
+    async def rollover_blackout_check(self) -> int:
+        """롤오버 blackout 감지 시 dated_futures leg 페어들을 flatten.
+
+        매 시간 (rollover_watch_loop) 호출. blackout 진입 시점에 한 번만
+        일제히 flatten. 이미 cooldown에 들어간 경우는 skip.
+
+        Returns: flattened pair 수.
+        """
+        if not self.risk_mgr.is_rollover_blackout():
+            return 0
+        n = 0
+        for pair_id, pair in list(self._registered_pairs.items()):
+            if pair.leg_b.role != LegRole.DATED_FUTURES:
+                continue
+            if pair_id not in self._open_trades_by_pair:
+                continue
+            try:
+                ok = await self.emergency_flatten_pair(pair_id, reason="rollover_blackout")
+                if ok:
+                    n += 1
+            except Exception as e:
+                logger.error(f"[{pair_id}] rollover blackout flatten raised: {e}")
+        if n > 0 and self._notifier is not None:
+            try:
+                self._notifier.send_sync(
+                    f"📅 <b>ROLLOVER BLACKOUT</b>\n"
+                    f"BD={self.risk_mgr._business_day()} → {n} pairs flattened"
+                )
+            except Exception:
+                pass
+        return n
+
+    def check_contract_alignment(self, pair_id: str) -> Optional[float]:
+        """HL oracle index_price ↔ KIS mid_price 추종 일치성 체크.
+
+        Returns: |diff_bps| (둘 다 양수일 때) 또는 None (정보 부족).
+        대시보드/감사 로그용 — 임계 초과 시 알림 + (옵션) flatten.
+        """
+        leg_a = self._latest_pair_quote.get((pair_id, "a"))
+        leg_b = self._latest_pair_quote.get((pair_id, "b"))
+        if leg_a is None or leg_b is None:
+            return None
+        # leg_a (HL perp): index_price = HL oracle (CME 근월물 기반)
+        # leg_b (KIS futures): mid_price = 실제 KIS 호가 mid
+        ref = leg_a.index_price
+        actual = leg_b.mid_price
+        if ref <= 0 or actual <= 0:
+            return None
+        return abs(ref - actual) / actual * 10_000
+
     async def emergency_flatten_pair(self, pair_id: str, reason: str = "manual") -> bool:
         """Phase 11d — 지정 페어의 오픈 포지션 즉시 양 leg 반대 fill로 청산.
 
@@ -1224,6 +1355,26 @@ class PaperTradingEngine:
         # Shadow mode 가드 — pair.enabled=False면 진입 차단 (basis stats만 누적).
         # 신규 거래소 합류 시 분포 검증 단계용.
         if not pair.enabled:
+            return
+
+        # Rollover blackout 가드 — 롤 window 시작 N영업일 전부터 진입 차단.
+        # KIS leg가 dated_futures인 페어에만 적용 (Web3-Web3 페어는 무관).
+        if pair.leg_b.role == LegRole.DATED_FUTURES and self.risk_mgr.is_rollover_blackout():
+            self._state.rejected_by_risk += 1
+            logger.warning(
+                f"[{pair_id}] ENTRY_BLOCKED rollover_blackout — "
+                f"BD={self.risk_mgr._business_day()} "
+                f"(block from BD {self.config.risk.rollover_start_day - self.config.risk.rollover_block_entry_days} "
+                f"to {self.config.risk.rollover_end_day})"
+            )
+            if self._notifier is not None:
+                try:
+                    self._notifier.send_sync(
+                        f"⛔ <b>ENTRY BLOCKED [{pair_id}]</b>\n"
+                        f"reason: rollover blackout"
+                    )
+                except Exception:
+                    pass
             return
 
         direction = "long_basis" if signal.type == SignalType.ENTRY_LONG_BASIS else "short_basis"

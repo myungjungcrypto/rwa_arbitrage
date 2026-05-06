@@ -106,7 +106,7 @@ def cfg() -> AppConfig:
             entry_threshold_bps=20,
             min_abs_entry_bps=10,
         ),
-        risk=RiskConfig(),
+        risk=RiskConfig(rollover_block_entry_days=0),
     )
 
 
