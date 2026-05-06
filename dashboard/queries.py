@@ -12,6 +12,7 @@ since_ts/since_date 필터: 의미있는 데이터만 보기 위한 cutoff.
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import date, datetime
 from typing import Optional
 
@@ -397,8 +398,52 @@ def state_freshness_seconds(state_latest: Optional[dict]) -> Optional[float]:
     """latest engine_state row 시각이 현재로부터 몇 초 전인지. None이면 데이터 없음."""
     if not state_latest:
         return None
-    import time as _t
-    return _t.time() - state_latest["ts"]
+    return time.time() - state_latest["ts"]
+
+
+def leg_quote_freshness(con: sqlite3.Connection, pair_id: str) -> dict:
+    """페어 leg_a / leg_b 각각 마지막 quote ts와 age (초). LIVE 운영 가시성용.
+
+    leg_prices 테이블에서 (pair_id, leg)별 max(ts). leg_prices가 비어있으면
+    legacy 테이블(perp_prices/futures_prices)에서 폴백 (Phase C 이전 상태).
+    """
+    out: dict = {"a": None, "b": None}
+    now = time.time()
+    for leg in ("a", "b"):
+        row = con.execute(
+            "SELECT MAX(ts) AS last_ts FROM leg_prices "
+            "WHERE pair_id = ? AND leg = ?",
+            (pair_id, leg),
+        ).fetchone()
+        last_ts = row["last_ts"] if row else None
+        if last_ts:
+            out[leg] = {"last_ts": last_ts, "age_s": now - last_ts}
+    # legacy fallback — wti_cme_hl 페어이고 leg_prices 비어있으면 perp/futures 직접
+    if pair_id == "wti_cme_hl":
+        if out["a"] is None:
+            r = con.execute("SELECT MAX(ts) AS t FROM perp_prices").fetchone()
+            if r and r["t"]:
+                out["a"] = {"last_ts": r["t"], "age_s": now - r["t"]}
+        if out["b"] is None:
+            r = con.execute("SELECT MAX(ts) AS t FROM futures_prices").fetchone()
+            if r and r["t"]:
+                out["b"] = {"last_ts": r["t"], "age_s": now - r["t"]}
+    return out
+
+
+def load_bot_mode(settings_path: str = "config/settings.yaml") -> str:
+    """settings.yaml에서 mode 읽기. 파일 없거나 실패 시 'UNKNOWN'."""
+    try:
+        import yaml
+        from pathlib import Path
+        p = Path(settings_path)
+        if not p.exists():
+            return "UNKNOWN"
+        with open(p) as f:
+            data = yaml.safe_load(f) or {}
+        return str(data.get("mode", "UNKNOWN")).upper()
+    except Exception:
+        return "UNKNOWN"
 
 
 def load_alltime_stats(

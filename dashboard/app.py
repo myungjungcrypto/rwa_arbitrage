@@ -16,6 +16,7 @@ PM2 등록:
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -107,7 +108,14 @@ st.set_page_config(
 
 
 def main():
-    st.title("📊 rwa_arb 페이퍼 트레이딩 대시보드")
+    # mode 표시는 설정 파일에서 직접 (engine_state에는 없음)
+    mode = queries.load_bot_mode()
+    if mode == "LIVE":
+        st.title("🔴 rwa_arb 대시보드 — LIVE")
+    elif mode == "PAPER":
+        st.title("📊 rwa_arb 대시보드 — PAPER")
+    else:
+        st.title(f"❓ rwa_arb 대시보드 — mode={mode}")
 
     # ── Sidebar ──
     with st.sidebar:
@@ -210,6 +218,32 @@ def main():
             )
     else:
         cols[4].metric("Total signals (session)", "—")
+
+    # ── Per-leg quote freshness (LIVE 운영 가시성) ──
+    # LIVE 모드에서는 양 leg 모두 실시간 흘러야 함. 어느 한쪽이 stale이면
+    # 봇은 backend 워치독이 60s 후 자동 flatten 하지만, UI에서는 그 전에 보임.
+    with sqlite3.connect(db_path) as _con:
+        _con.row_factory = sqlite3.Row
+        legf = queries.leg_quote_freshness(_con, pair_id)
+
+    fcols = st.columns([1, 1, 4])
+    for i, (leg, label) in enumerate([("a", "leg_a (perp)"), ("b", "leg_b (futures)")]):
+        info = legf.get(leg)
+        with fcols[i]:
+            if info is None:
+                st.metric(f"{label} quote", "no data")
+            else:
+                age = info["age_s"]
+                if age < 5:
+                    st.metric(f"{label} quote", f"🟢 {age:.0f}s ago")
+                elif age < 60:
+                    st.metric(f"{label} quote", f"🟡 {age:.0f}s ago")
+                else:
+                    st.metric(f"{label} quote", f"🔴 {age/60:.1f}m ago")
+    fcols[2].caption(
+        "LIVE 모드: 양 leg 모두 🟢 < 5s 정상. "
+        "🔴 > 60s면 backend WS 워치독이 자동 flatten 발동 + Telegram 알림."
+    )
 
     st.divider()
 
