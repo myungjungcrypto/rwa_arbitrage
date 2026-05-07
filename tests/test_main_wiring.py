@@ -44,9 +44,13 @@ def cfg() -> AppConfig:
             entry_threshold_bps=20,
             min_abs_entry_bps=10,
         ),
-        # blackout off — wiring tests assert entry succeeds; rollover gating
-        # is verified separately in test_rollover_blackout_alignment.py
-        risk=RiskConfig(rollover_block_entry_days=0),
+        # rollover gates off — wiring tests assert entry succeeds; gating
+        # behaviour is verified separately in test_rollover_blackout_alignment.
+        # rollover_position_reduce_pct=0 keeps size cap from kicking in on BD 5+.
+        risk=RiskConfig(
+            rollover_block_entry_days=0,
+            rollover_position_reduce_pct=0,
+        ),
     )
 
 

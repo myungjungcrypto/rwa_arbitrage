@@ -167,6 +167,8 @@ class PaperTradingEngine:
         self._notifier = None  # set_notifier()로 wire
         # leg_a/leg_b 구독 freshness 워치독용
         self._last_quote_ts: dict[tuple[str, str], float] = {}  # (pair_id, leg) -> ts
+        # rollover blackout 알림 cooldown — 상태 전이 시만 1회 알림
+        self._rollover_blackout_announced: bool = False
 
     # ── 콜백 등록 ──
 
@@ -1042,36 +1044,81 @@ class PaperTradingEngine:
                         alerted.discard(pair_id)
 
     async def rollover_blackout_check(self) -> int:
-        """롤오버 blackout 감지 시 dated_futures leg 페어들을 flatten.
+        """롤오버 blackout 상태 전이 감지 + dated_futures 페어 flatten.
 
-        매 시간 (rollover_watch_loop) 호출. blackout 진입 시점에 한 번만
-        일제히 flatten. 이미 cooldown에 들어간 경우는 skip.
+        rollover_watch_loop가 매시간 호출. 알림은 상태 전이 시 1회만:
+          - OFF → ON: '📅 BLACKOUT ENTERED' (+ flatten 결과)
+          - ON → OFF: '✅ BLACKOUT CLEARED'
 
-        Returns: flattened pair 수.
+        Returns: flattened pair 수 (이번 호출에서).
         """
-        if not self.risk_mgr.is_rollover_blackout():
-            return 0
-        n = 0
-        for pair_id, pair in list(self._registered_pairs.items()):
-            if pair.leg_b.role != LegRole.DATED_FUTURES:
-                continue
-            if pair_id not in self._open_trades_by_pair:
-                continue
-            try:
-                ok = await self.emergency_flatten_pair(pair_id, reason="rollover_blackout")
-                if ok:
-                    n += 1
-            except Exception as e:
-                logger.error(f"[{pair_id}] rollover blackout flatten raised: {e}")
-        if n > 0 and self._notifier is not None:
-            try:
-                self._notifier.send_sync(
-                    f"📅 <b>ROLLOVER BLACKOUT</b>\n"
-                    f"BD={self.risk_mgr._business_day()} → {n} pairs flattened"
-                )
-            except Exception:
-                pass
-        return n
+        is_blackout = self.risk_mgr.is_rollover_blackout()
+        announced = self._rollover_blackout_announced
+
+        # 상태 전이: OFF → ON
+        if is_blackout and not announced:
+            n = 0
+            for pair_id, pair in list(self._registered_pairs.items()):
+                if pair.leg_b.role != LegRole.DATED_FUTURES:
+                    continue
+                if pair_id not in self._open_trades_by_pair:
+                    continue
+                try:
+                    ok = await self.emergency_flatten_pair(
+                        pair_id, reason="rollover_blackout",
+                    )
+                    if ok:
+                        n += 1
+                except Exception as e:
+                    logger.error(f"[{pair_id}] rollover blackout flatten raised: {e}")
+            self._rollover_blackout_announced = True
+            if self._notifier is not None:
+                bd = self.risk_mgr._business_day()
+                divergence_day = self.config.risk.rollover_start_day + 1
+                end_day = self.config.risk.rollover_end_day
+                try:
+                    self._notifier.send_sync(
+                        f"📅 <b>ROLLOVER BLACKOUT ENTERED</b>\n"
+                        f"BD={bd} (divergence first day BD {divergence_day}, "
+                        f"clears after BD {end_day})\n"
+                        f"flattened {n} dated_futures pair(s); "
+                        f"new entries blocked until end."
+                    )
+                except Exception:
+                    pass
+            return n
+
+        # 상태 전이: ON → OFF
+        if not is_blackout and announced:
+            self._rollover_blackout_announced = False
+            if self._notifier is not None:
+                try:
+                    self._notifier.send_sync(
+                        f"✅ <b>ROLLOVER BLACKOUT CLEARED</b>\n"
+                        f"BD={self.risk_mgr._business_day()} → entries re-enabled"
+                    )
+                except Exception:
+                    pass
+
+        # 같은 상태 유지 시 — 추가 알림 X. blackout 중에도 어딘가에서 새 포지션이
+        # 생겼다면 (예: 사용자 수동 진입) flatten 시도하되 알림은 안 보냄.
+        if is_blackout:
+            n = 0
+            for pair_id, pair in list(self._registered_pairs.items()):
+                if pair.leg_b.role != LegRole.DATED_FUTURES:
+                    continue
+                if pair_id not in self._open_trades_by_pair:
+                    continue
+                try:
+                    ok = await self.emergency_flatten_pair(
+                        pair_id, reason="rollover_blackout",
+                    )
+                    if ok:
+                        n += 1
+                except Exception as e:
+                    logger.error(f"[{pair_id}] rollover blackout flatten raised: {e}")
+            return n
+        return 0
 
     def check_contract_alignment(self, pair_id: str) -> Optional[float]:
         """HL oracle index_price ↔ KIS mid_price 추종 일치성 체크.
@@ -1359,6 +1406,8 @@ class PaperTradingEngine:
 
         # Rollover blackout 가드 — 롤 window 시작 N영업일 전부터 진입 차단.
         # KIS leg가 dated_futures인 페어에만 적용 (Web3-Web3 페어는 무관).
+        # 알림은 상태 전이 시 (rollover_blackout_check) 1회만 — 매 신호마다
+        # 알림 spam 방지. 여기서는 logger.warning만.
         if pair.leg_b.role == LegRole.DATED_FUTURES and self.risk_mgr.is_rollover_blackout():
             self._state.rejected_by_risk += 1
             divergence_day = self.config.risk.rollover_start_day + 1
@@ -1369,14 +1418,6 @@ class PaperTradingEngine:
                 f"(blackout BD {blackout_from}–{self.config.risk.rollover_end_day}, "
                 f"divergence first day = BD {divergence_day})"
             )
-            if self._notifier is not None:
-                try:
-                    self._notifier.send_sync(
-                        f"⛔ <b>ENTRY BLOCKED [{pair_id}]</b>\n"
-                        f"reason: rollover blackout"
-                    )
-                except Exception:
-                    pass
             return
 
         direction = "long_basis" if signal.type == SignalType.ENTRY_LONG_BASIS else "short_basis"

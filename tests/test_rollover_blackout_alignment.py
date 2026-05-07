@@ -410,3 +410,83 @@ async def test_alignment_monitor_auto_flatten_when_enabled(monkeypatch):
     )
     # auto_flatten 활성 → 포지션 제거
     assert p.id not in e._open_trades_by_pair
+
+
+# ──────────────────────────────────────────────
+# 6. blackout 알림 cooldown — state transition 시 1회만
+# ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_blackout_check_alerts_only_on_off_to_on_transition(monkeypatch):
+    """blackout 진입 시 1회 ENTERED 알림. 같은 상태 유지면 추가 알림 X."""
+    e = _engine("LIVE", risk=RiskConfig(rollover_block_entry_days=1))
+    p = _kis_pair()
+    e.register_pair(p)
+    monkeypatch.setattr(e.risk_mgr, "is_rollover_blackout", lambda *a, **kw: True)
+    notif = MagicMock(); notif.send_sync = MagicMock()
+    e.set_notifier(notif)
+
+    # 첫 호출 — OFF → ON 전이 → ENTERED 알림
+    await e.rollover_blackout_check()
+    msgs1 = [c.args[0] for c in notif.send_sync.call_args_list]
+    assert any("ENTERED" in m for m in msgs1)
+
+    # 두 번째 호출 — 여전히 ON, 알림 X
+    notif.send_sync.reset_mock()
+    await e.rollover_blackout_check()
+    assert notif.send_sync.call_count == 0
+
+    # 세 번째 — 여전히 ON, 알림 X
+    await e.rollover_blackout_check()
+    assert notif.send_sync.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_blackout_check_alerts_on_to_off_transition(monkeypatch):
+    """ON → OFF 전이 시 CLEARED 알림 1회."""
+    e = _engine("LIVE", risk=RiskConfig(rollover_block_entry_days=1))
+    p = _kis_pair()
+    e.register_pair(p)
+    notif = MagicMock(); notif.send_sync = MagicMock()
+    e.set_notifier(notif)
+
+    # ON 상태로 진입
+    monkeypatch.setattr(e.risk_mgr, "is_rollover_blackout", lambda *a, **kw: True)
+    await e.rollover_blackout_check()    # ENTERED
+    notif.send_sync.reset_mock()
+
+    # OFF로 전이
+    monkeypatch.setattr(e.risk_mgr, "is_rollover_blackout", lambda *a, **kw: False)
+    await e.rollover_blackout_check()
+    msgs = [c.args[0] for c in notif.send_sync.call_args_list]
+    assert any("CLEARED" in m for m in msgs), msgs
+
+    # 다시 호출 — 여전히 OFF, 알림 X
+    notif.send_sync.reset_mock()
+    await e.rollover_blackout_check()
+    assert notif.send_sync.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_pair_entry_blackout_does_not_notify(monkeypatch):
+    """매 entry attempt에서 blackout 차단되어도 notifier 호출 X (logger only)."""
+    e = _engine("LIVE", risk=RiskConfig(rollover_block_entry_days=1))
+    p = _kis_pair()
+    e.register_pair(p)
+    monkeypatch.setattr(e.risk_mgr, "is_rollover_blackout", lambda *a, **kw: True)
+    notif = MagicMock(); notif.send_sync = MagicMock()
+    e.set_notifier(notif)
+    sig = Signal(type=SignalType.ENTRY_SHORT_BASIS, basis_bps=25.0,
+                 product="wti", confidence=1.0, reason="test",
+                 basis_mean=0.0, basis_std=10.0)
+    leg_a = Quote(exchange="hyperliquid", symbol="xyz:CL", mid_price=80.0,
+                  bid=79.95, ask=80.05)
+    leg_b = Quote(exchange="kis", symbol="MCLM26", mid_price=80.10,
+                  bid=80.09, ask=80.11)
+
+    # 같은 신호 5번 attempt — notifier 호출 0회여야 함
+    for _ in range(5):
+        await e._handle_pair_entry(p.id, sig, leg_a, leg_b)
+    assert notif.send_sync.call_count == 0
+    assert e._state.rejected_by_risk == 5    # logger만 매번 찍히고 카운터는 정확히 누적
