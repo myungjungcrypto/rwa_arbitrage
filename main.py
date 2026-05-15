@@ -113,7 +113,15 @@ async def _setup_kis(config, collector, kiwoom=None):
 
     connected = await client.connect()
     if not connected:
-        logger.error("KIS connection failed — falling back to Kiwoom mock")
+        # LIVE 모드에서 KIS 연결 실패 시 mock fallback은 위험 — 봇이 가짜 시세로
+        # 시그널 생성 후 HL에만 실주문 보낼 수 있음. LIVE에서는 즉시 abort.
+        if (config.mode or "").upper() == "LIVE":
+            logger.error(
+                "KIS connection failed in LIVE mode — REFUSING mock fallback. "
+                "Wait 60s (KIS token rate limit) then restart, or switch to PAPER."
+            )
+            raise RuntimeError("KIS connection failed in LIVE mode")
+        logger.error("KIS connection failed — falling back to Kiwoom mock (PAPER)")
         return None, None
 
     subs_state = {
