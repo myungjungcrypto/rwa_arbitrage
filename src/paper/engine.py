@@ -796,6 +796,102 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"state_snapshot_loop dump error: {e}")
 
+    async def kis_license_health_loop(
+        self,
+        interval_seconds: int = 1800,    # 30분 — 가벼운 체크
+        stale_threshold_minutes: float = 5.0,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """KIS 시세 라이센스 만료 자가 감지.
+
+        매 N분마다:
+          1. CME 시장이 open인지 (휴장 시 quote 없는 게 정상이라 skip)
+          2. futures_prices 최근 row age > stale_threshold_minutes
+          3. 위 둘 모두 yes → 라이센스 만료 또는 KIS 시스템 장애 의심
+          4. 한 번만 알림 (상태 전이 — 라이센스 만료 → 회복 시도 cooldown)
+
+        WS_WATCHDOG (60s)는 즉각 알림이고 이건 5분 슬랙 + 라이센스 명시.
+        """
+        from src.strategy.market_hours import is_cme_open
+        from datetime import datetime, timezone
+
+        # legacy KIS-only 페어 한정 — 다른 페어는 leg_b가 perp라 무관
+        kis_pair_ids = [
+            pid for pid, p in self._registered_pairs.items()
+            if p.leg_b.role == LegRole.DATED_FUTURES and p.leg_b.exchange == "kis"
+        ]
+        if not kis_pair_ids:
+            logger.info("[KIS_LICENSE] no KIS pairs registered — health loop disabled")
+            return
+        logger.info(
+            f"[KIS_LICENSE] health monitor started interval={interval_seconds}s "
+            f"stale_threshold={stale_threshold_minutes}min pairs={kis_pair_ids}"
+        )
+        alerted = False
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            try:
+                if stop_event is not None:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    if stop_event.is_set():
+                        return
+                else:
+                    await asyncio.sleep(interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+            # 1. CME open?
+            if not is_cme_open(datetime.now(timezone.utc)):
+                continue   # 휴장 — quote 없는 게 정상
+
+            # 2. futures_prices stale?
+            try:
+                row = self.storage.conn.execute(
+                    "SELECT MAX(ts) AS t FROM futures_prices"
+                ).fetchone()
+                last_ts = row["t"] if row else None
+            except Exception as e:
+                logger.error(f"[KIS_LICENSE] DB query error: {e}")
+                continue
+            if last_ts is None:
+                continue
+            age_min = (time.time() - last_ts) / 60.0
+            if age_min < stale_threshold_minutes:
+                # 회복됨 — alerted였으면 recovery 알림 1회
+                if alerted:
+                    alerted = False
+                    logger.info(f"[KIS_LICENSE] feed recovered ({age_min:.1f}m ago)")
+                    if self._notifier is not None:
+                        try:
+                            self._notifier.send_sync(
+                                f"✅ <b>KIS LICENSE RECOVERED</b>\n"
+                                f"feed back online (last quote {age_min:.1f}m ago)"
+                            )
+                        except Exception:
+                            pass
+                continue
+
+            # 3. stale + CME open → 라이센스 의심
+            if not alerted:
+                alerted = True
+                logger.error(
+                    f"[KIS_LICENSE] feed stale {age_min:.1f}m + CME OPEN — "
+                    "라이센스 만료 의심"
+                )
+                if self._notifier is not None:
+                    try:
+                        self._notifier.send_sync(
+                            f"🚨 <b>KIS LICENSE SUSPECT</b>\n"
+                            f"futures feed stale {age_min:.1f}m (CME OPEN)\n\n"
+                            f"⚠️ NYMEX 실시간 시세 결제/연장 확인 필요:\n"
+                            f"https://apiportal.koreainvestment.com\n"
+                            f"또는 콜센터 1544-5000"
+                        )
+                    except Exception as e:
+                        logger.error(f"notifier kis-license error: {e}")
+
     async def balance_poll_loop(
         self,
         interval_seconds: int = 120,
@@ -935,6 +1031,19 @@ class PaperTradingEngine:
                         f"[WS_WATCHDOG] STALE {pair_id}/{leg} age={age:.0f}s "
                         f"> threshold={threshold:.0f}s"
                     )
+                    # leg_b가 KIS dated_futures인 페어에서 stale이면 시세 라이센스
+                    # 만료 의심 — 메시지에 명시.
+                    pair = self._registered_pairs.get(pair_id)
+                    license_hint = ""
+                    if (leg == "b" and pair is not None
+                            and pair.leg_b.role == LegRole.DATED_FUTURES
+                            and pair.leg_b.exchange == "kis"):
+                        license_hint = (
+                            "\n\n⚠️ KIS 시세 라이센스 만료 의심 — "
+                            "apiportal.koreainvestment.com 에서 NYMEX 실시간 시세 "
+                            "결제/연장 확인. 또는 .venv/bin/python "
+                            "scripts/diagnose_kis_feed.py 로 즉시 검증."
+                        )
                     if self._notifier is not None:
                         try:
                             self._notifier.send_sync(
@@ -942,6 +1051,7 @@ class PaperTradingEngine:
                                 f"age={age:.0f}s\n"
                                 f"open_positions={len(pairs_with_open_pos)} "
                                 f"auto_flatten={auto_flatten}"
+                                f"{license_hint}"
                             )
                         except Exception as e:
                             logger.error(f"notifier ws-stale error: {e}")

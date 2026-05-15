@@ -747,6 +747,14 @@ async def run_paper(config_path: str = "config/settings.yaml"):
         )
     )
 
+    # KIS 시세 라이센스 만료 자가 감지 (30분 간격, 5분 stale + CME open 시 ALERT)
+    kis_license_task = asyncio.create_task(
+        engine.kis_license_health_loop(
+            interval_seconds=1800, stale_threshold_minutes=5.0,
+            stop_event=stop_event,
+        )
+    )
+
     # 부팅 알림
     if notifier.enabled:
         try:
@@ -772,9 +780,10 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     watchdog_task.cancel()
     balance_task.cancel()
     alignment_task.cancel()
+    kis_license_task.cancel()
     for task in [collect_task, status_task, funding_task, rollover_task,
                  state_snapshot_task, watchdog_task, balance_task,
-                 alignment_task]:
+                 alignment_task, kis_license_task]:
         try:
             await task
         except asyncio.CancelledError:
