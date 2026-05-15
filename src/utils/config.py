@@ -42,6 +42,7 @@ class KISConfig:
     app_key: str = ""
     app_secret: str = ""
     account_number: str = ""
+    hts_id: str = ""             # KIS Developer 등록 HTS ID (예수금/주문 일부에서 검증)
     base_url: str = "https://openapi.koreainvestment.com:9443"
     ws_url: str = "ws://ops.koreainvestment.com:21000"
     is_paper: bool = False       # 모의투자 여부
@@ -324,6 +325,7 @@ def load_config(
         app_key=kis_secrets.get("app_key", ""),
         app_secret=kis_secrets.get("app_secret", ""),
         account_number=kis_secrets.get("account_number", ""),
+        hts_id=kis_secrets.get("hts_id", "") or kis_settings.get("hts_id", ""),
         base_url=kis_settings.get("base_url", "https://openapi.koreainvestment.com:9443"),
         ws_url=kis_settings.get("ws_url", "ws://ops.koreainvestment.com:21000"),
         is_paper=kis_settings.get("is_paper", False),

@@ -81,6 +81,7 @@ class KISAuth:
         base_url: str = "https://openapi.koreainvestment.com:9443",
         is_paper: bool = False,
         account_number: str = "",
+        hts_id: str = "",
     ):
         self.app_key = app_key
         self.app_secret = app_secret
@@ -89,6 +90,9 @@ class KISAuth:
             self.base_url = "https://openapivts.koreainvestment.com:29443"
         self.is_paper = is_paper
         self.account_number = account_number    # "12345678-08" 또는 "1234567808"
+        # KIS 일부 endpoint (inquire-deposit/balance 등)에서 HTS ID 헤더 요구.
+        # 빈 문자열이면 헤더 미포함 (시세/구독 같이 HTS ID 불필요한 endpoint는 영향 X).
+        self.hts_id = hts_id
         self._access_token: str = ""
         self._token_expires: float = 0.0
         self._approval_key: str = ""
@@ -147,14 +151,23 @@ class KISAuth:
                 return self._approval_key
 
     def get_rest_headers(self, tr_id: str) -> dict:
-        """REST API 호출용 헤더."""
-        return {
+        """REST API 호출용 헤더.
+
+        hts_id: KIS 일부 endpoint(inquire-deposit/balance, 주문 일부)는 KIS Developer에
+        등록한 HTS ID와 호출 ID 일치 요구 (rt_cd=7 '계좌에 등록된 HTS ID와 일치하지 않습니다').
+        secrets.yaml의 kis.hts_id 필드에서 로드.
+        """
+        h = {
             "content-type": "application/json; charset=utf-8",
             "authorization": f"Bearer {self._access_token}",
             "appkey": self.app_key,
             "appsecret": self.app_secret,
             "tr_id": tr_id,
+            "custtype": "P",   # 개인 (KIS 기본)
         }
+        if self.hts_id:
+            h["hts_id"] = self.hts_id
+        return h
 
 
 # ──────────────────────────────────────────────
