@@ -755,6 +755,45 @@ class KISExchange:
                 error=f"account config error: {e}",
             )
 
+        # reduce_only — KIS REST는 직접 flag 없음. adapter 측에서 사전 잔고
+        # 체크로 동등 효과. 5/18 incident: EXIT retry가 reduce_only=False로
+        # 발사되어 KIS가 reverse position 누적 (long 0 → sell → short 2).
+        # 이제 reduce_only=True면 보유 포지션과 방향/크기 검증 후 reject.
+        if reduce_only:
+            try:
+                positions = await self.get_positions()
+                held = next(
+                    (p for p in positions if p.symbol == symbol), None,
+                )
+                if held is None or held.size == 0:
+                    return _base.OrderResult(
+                        success=False, exchange=self.name, symbol=symbol,
+                        error="reduce_only: no position to reduce",
+                    )
+                # 방향 일치 검증 — long(positive) 보유 시 sell만, short(negative)면 buy만
+                want_buy = (side == "buy")
+                holds_short = (held.size < 0)
+                if want_buy != holds_short:
+                    return _base.OrderResult(
+                        success=False, exchange=self.name, symbol=symbol,
+                        error=(f"reduce_only: side={side} doesn't match "
+                               f"position size={held.size}"),
+                    )
+                # 사이즈 cap — 보유 이상 못 보냄
+                if size > abs(held.size):
+                    logger.warning(
+                        f"[KIS] reduce_only: capping size {size} → {abs(held.size)} "
+                        f"(actual position)"
+                    )
+                    size = abs(held.size)
+            except Exception as e:
+                # 잔고 조회 실패 — 보수적으로 주문 차단 (silent over-fill 방지)
+                logger.error(f"[KIS] reduce_only pre-check failed: {e}")
+                return _base.OrderResult(
+                    success=False, exchange=self.name, symbol=symbol,
+                    error=f"reduce_only pre-check failed: {e}",
+                )
+
         sll_buy = "02" if side == "buy" else "01"
         if order_type == "market":
             pric_dvsn = "2"
