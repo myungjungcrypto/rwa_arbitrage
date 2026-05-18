@@ -242,6 +242,20 @@ async def rollover_watch_loop(
             if ok:
                 subs_state["current_subs"][product] = desired
                 logger.warning(f"[ROLLOVER] {product}: now subscribed to {desired}")
+
+                # 핵심 — pair object의 leg_b.symbol도 동기화. 안 하면 봇이
+                # stale symbol로 주문 시도 (KIS reject 또는 만기 임박 contract).
+                if engine is not None:
+                    for pair in engine._registered_pairs.values():
+                        if (pair.leg_b.role.value == "dated_futures"
+                                and pair.leg_b.exchange == "kis"
+                                and pair.id.split("_", 1)[0] == product):
+                            old = pair.leg_b.symbol
+                            pair.leg_b.symbol = desired
+                            logger.warning(
+                                f"[ROLLOVER] {pair.id} leg_b symbol synced: "
+                                f"{old} → {desired}"
+                            )
             else:
                 logger.error(
                     f"[ROLLOVER] {product}: resubscribe failed, will retry next cycle"
@@ -475,6 +489,36 @@ async def run_paper(config_path: str = "config/settings.yaml"):
 
     engine.set_exchange_registry(registry)
     engine.set_notifier(notifier)
+
+    # KIS dated_futures leg는 매월 contract advance가 필요.
+    # config.kis_symbol_map은 정적 → 매월 수동 update 비현실적.
+    # 부팅 시 active contract 계산해서 pair.leg_b.symbol을 자동 override.
+    # rollover_watch_loop가 이후 advance 감지 시 동일 메커니즘으로 sync.
+    today_for_advance = date.today()
+    hols_for_advance = us_market_holidays(today_for_advance.year)
+    for pair in pairs:
+        if (pair.leg_b.role == LegRole.DATED_FUTURES
+                and pair.leg_b.exchange == "kis"):
+            # product key = pair.id 의 첫 token (예: 'wti' from 'wti_cme_hl')
+            product_key = pair.id.split("_", 1)[0]
+            prod = config.products.get(product_key)
+            if prod is None:
+                logger.warning(
+                    f"[{pair.id}] no product config for '{product_key}' — "
+                    f"using stale symbol {pair.leg_b.symbol}"
+                )
+                continue
+            active = get_active_contract(
+                today_for_advance, prefix=prod.futures_symbol,
+                holidays=hols_for_advance,
+            )
+            if pair.leg_b.symbol != active:
+                logger.warning(
+                    f"[{pair.id}] KIS symbol auto-advance: "
+                    f"{pair.leg_b.symbol} → {active}"
+                )
+                pair.leg_b.symbol = active
+
     for pair in pairs:
         engine.register_pair(pair)
         collector.register_pair(pair)
