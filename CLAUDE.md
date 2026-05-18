@@ -164,8 +164,8 @@ rwa_arbitrage/
 | M7 | exit 전략 개선 (스프레드 수렴 기반 청산) | ✅ |
 | M8 | 자동 롤오버 + 좀비 포지션 정리 | ✅ |
 | M9 | 페이퍼 트레이딩 수익성 재검증 (롤오버 픽스 후) | ✅ — 발견된 추가 버그 모두 수정 |
-| **M10** | **멀티 거래소 통합 (Web2-Web3 + Web3-Web3)** | **진행 중 (Phase C5)** |
-| M11 | KIS 주문 API 연동 → 실거래 전환 (최소 규모) | - |
+| M10 | 멀티 거래소 통합 (Web2-Web3 + Web3-Web3) | ✅ — 5/5 adapter scaffolding 완료 (Phase A-G) |
+| **M11** | **KIS 주문 API 연동 → 실거래 전환 (최소 규모)** | **✅ — LIVE 가동 중 (5/18 첫 거래 발생, latency fix 적용)** |
 | M12 | 실거래 안정화 + 스케일업 | - |
 
 ### M10 sub-phase 상세
@@ -181,11 +181,11 @@ rwa_arbitrage/
 | **C4a** | `PaperTradingEngine` 인프라 (registry, dispatch helper, Semaphore) | ✅ |
 | **C4b** | pair-keyed entry/exit flow (`process_pair_basis_update`) | ✅ |
 | **C5** | `main.py` 배선 — pair-keyed 경로로 switch | ✅ |
-| **D** | Lighter 어댑터 + `wti_hl_lighter` 페어 (shadow → live) | **scaffolding 완료, EC2 shadow 검증 단계** |
-| E | Binance 어댑터 + `wti_hl_binance` 페어 | - |
-| F | Bybit 어댑터 + `wti_hl_bybit` 페어 | - |
-| G | OKX 어댑터 + `wti_hl_okx` 페어 | - |
-| H | 5개 페어 동시 paper + per-pair risk cap + 멀티 페어 리포트 | - |
+| D | Lighter 어댑터 + `wti_hl_lighter` 페어 | ✅ scaffolding (shadow) |
+| E | Binance 어댑터 + `wti_hl_binance` 페어 | ✅ scaffolding (shadow) |
+| F | Bybit 어댑터 + `wti_hl_bybit` 페어 | ✅ scaffolding (shadow) |
+| G | OKX 어댑터 + `wti_hl_okx` 페어 | ✅ scaffolding (shadow) |
+| **H** | 5개 페어 동시 paper + per-pair risk cap + 멀티 페어 리포트 | **다음** |
 
 ### M (Monitoring) sub-phase
 
@@ -194,34 +194,54 @@ rwa_arbitrage/
 | M1 | DB schema v3 (engine_state 스냅샷 테이블) + 봇 30s dump 루프 | ✅ |
 | M2 | Streamlit 대시보드 (queries + charts + Streamlit UI) | ✅ |
 | M3 | `requirements.txt` + EC2 PM2 등록 + SSH 터널 접속 | ✅ |
+| M4 | LIVE 가시성 (mode badge, leg freshness, balance card) | ✅ |
+
+### M11 sub-phase (LIVE 트랙) 상세
+
+| 단계 | 작업 | 상태 |
+|---|---|---|
+| 11a | KIS REST 실 주문 (OTFM3001U/OTFM1412R, CANO+ACNT_PRDT_CD split) | ✅ |
+| 11b | HL eth_account signer + SDK v0.23 호환 (`name=` + `perp_dexs=`) | ✅ |
+| 11c | LIVE-mode 분기 + emergency partial-entry unwind | ✅ |
+| 11d | Telegram + per-pair cap + WS watchdog + license auto-detect | ✅ |
+| 11e | LIVE 가동 + 첫 거래 발생 + spike latency fix | ✅ (5/18) |
+| 11f | scale-up (1 MCL → N MCL) + 다거래 PnL 검증 | 진행 예정 |
+
+### LIVE 안전장치 (전체) 상세
+
+| 가드 | 트리거 | 동작 |
+|---|---|---|
+| Per-pair contract cap | `live_max_contracts_per_pair` | 1 MCL hard cap |
+| WS quote freshness watchdog | leg quote 60s+ stale | 알림 + auto_flatten |
+| KIS license auto-detect | CME open + futures 5min stale | 라이센스 결제 안내 알림 |
+| Rollover blackout | BD 5 시작 1일 전 | 신규 진입 차단 + 보유 flatten |
+| Contract alignment monitor | HL index ↔ KIS mid 50bp+ 차이 | 알림 (옵션: auto_flatten) |
+| Emergency partial-entry unwind | 한 leg fill + 한 leg fail | 반대 reduce_only 청산 |
+| Mock fallback 차단 (LIVE) | KIS connect fail | RuntimeError raise (crash loud) |
+| Entry lock per pair | 동일 페어 in-flight | asyncio.Lock (KIS 초당 한도 회피) |
+| Daily loss cap | 누적 일일 손실 한도 | 진입 차단 |
 
 ---
 
-## 현재 진행 (2026-05-01)
+## 현재 진행 (2026-05-18)
 
-**Phase D — Lighter 어댑터 합류 (shadow 검증 단계)**
+**M11 (LIVE 트랙) 가동 중 + spike latency 최적화 진행**
 
-scaffolding 완료. EC2 운영에서 24h shadow 데이터 누적 후 `enabled: true` flip.
+### LIVE 상태
+- `mode: LIVE`, `wti_cme_hl` pair 진입 가능
+- 양 leg 실시간 데이터 + 잔고 표시 + 모든 안전장치 active
+- 5/18 첫 LIVE 거래 발생 — 양 leg fill OK, 단 latency slippage 14bp 발생 (분석 + fix 완료)
+- 다음 rollover blackout: BD 5 (~2026-06-05) 자동 차단
 
-**완료 (Phase D 1/2)**:
-- `src/exchange/lighter.py` — `LighterExchange(ExchangeBase)` 어댑터.
-  lighter-sdk(`pip install lighter-sdk`) optional 의존, mock 주입 지원.
-- `LighterConfig` + `extra_pairs` settings.yaml 블록 — Web3-Web3 페어 명시 등록 경로.
-- engine `_handle_pair_entry`에 `pair.enabled` shadow gate (False면 진입 차단, basis stats만 누적).
-- settings.yaml: `wti_hl_lighter` 페어 (`enabled: false`, leg_a HL `xyz:CL`, leg_b Lighter `WTI`, threshold 12bp).
-- main.py: `cfg.lighter.enabled` 시 `LighterExchange.connect()` + `discover_markets()` + WS 구독.
-  HL Quote는 모든 HL-leg_a 페어로 fan-out (lighter 페어 leg_a까지 동기 push).
-  Lighter Quote는 어댑터가 직접 `collector.update_leg_quote(pair_id, "b", quote)` 호출.
+### M10 (Multi-exchange paper shadow) — 5/5 어댑터 완료
+- Phase D (Lighter), E (Binance), F (Bybit), G (OKX) 모두 scaffolding ready
+- 각 페어 `enabled: false` shadow 상태. 거래소별 `enabled: true` flip 시 시세 인입 시작.
+- 활성화 권장 순서: Lighter → Binance → Bybit → OKX (funding asymmetry 적은 순)
 
-**EC2 활성화 절차** (다음 단계):
-1. `pip install lighter-sdk --user`
-2. `config/settings.yaml`에서 `lighter.enabled: true` flip
-3. `pm2 restart rwa-arb`
-4. 로그에 `Lighter markets: N symbols discovered` + `[LIGHTER] subscribed wti_hl_lighter leg_b → WTI` 확인
-5. 24h dashboard에서 `wti_hl_lighter` basis 분포 관측 (mean/std/range)
-6. distribution sane이면 `pairs[].enabled: true` flip → paper 진입 시작
-
-**Phase E (다음)**: Binance 어댑터 + `wti_hl_binance` 페어.
+### 다음
+1. LIVE entry latency 검증 (다음 거래에서 `latency=XXXms` 측정값 확인)
+2. PAPER 수준 (~2bp slippage) 도달 시 다음 entry signal 안정 운영
+3. Phase H — 5-pair concurrent activation + per-pair risk caps + analyze_paper 멀티 페어 확장
 
 ---
 
@@ -229,7 +249,88 @@ scaffolding 완료. EC2 운영에서 24h shadow 데이터 누적 후 `enabled: t
 
 (역순; 자세한 commit 메시지는 `git log` 참조)
 
-### 2026-05-01
+### 2026-05-18
+- `404d7cc` — **perf: HL entry latency 축소 (Exchange cache + ref_price hint + ms log)**.
+  5/18 첫 LIVE 거래에서 signal mid -21.35bp → 실 fill -6.79bp (slippage 14bp,
+  spike가 1.4s만 지속한 동안 latency 2.4s로 못 잡음). 3 layer fix:
+  ① SDK Exchange 객체 캐싱 (`_build_exchange` per-order → startup 1회).
+  ② `ref_price` 인자 — adapter가 in-memory `_latest_meta.mark_price` 전달 →
+  `get_market_data()` REST 호출 생략.
+  ③ `latency=XXXms` 텔레메트리 로그. 기대: 600-1500ms → 150-400ms.
+- `d7369fd` — **asyncio.Lock per pair + unwind Telegram 알림**. 5/15 incident에서
+  같은 signal로 1초에 수십 번 entry retry → KIS 초당 거래 한도 초과.
+  Lock으로 직렬화 + emergency unwind 결과 (🛟 OK / 🚨 FAILED) Telegram.
+- `41461f2` — **HL 5 sig figs round**. `mark * 1.05 = 104.034` (6 sig) → SDK reject
+  `Order has invalid price`. round 2 → 104.03 적용.
+- `1f1e21c` — **KIS contract auto-advance**. `pair.leg_b.symbol`이 매월 stale 됨
+  (settings.yaml에 MCLM26 박혀있는데 봇은 MCLN26 시세 수신). 부팅 시 + 매시간
+  rollover_watch_loop에서 `get_active_contract()` 결과로 pair object의 symbol을
+  hot-mutate. 매월 수동 sed 불필요.
+- `e721604`, `34bda4c`, `9dadcd7` — **scripts/test_live_round_trip.py**.
+  수동 1 MCL 양 leg market entry + 5초 후 reduce_only 청산 검증 스크립트.
+  KIS rate-limit-friendly (confirm 후 auth) + case-insensitive yes/YES.
+
+### 2026-05-16
+- `364f935` — **KIS 시세 라이센스 만료 자가 감지**. 2 layer: ① WS_WATCHDOG STALE
+  알림에 KIS leg + dated_futures이면 "라이센스 만료 의심" hint + apiportal URL
+  자동 첨부. ② 30분 간격 `kis_license_health_loop` — CME open인데 futures_prices
+  5분+ stale이면 한 번 `🚨 KIS LICENSE SUSPECT` 알림 (recovery 시 `✅ RECOVERED`).
+  수동 calendar 관리 불필요.
+- `829ef66` — **LIVE 모드 mock fallback 차단**. EC2 KIS 토큰 rate limit (EGW00133,
+  1분당 1회) 위반 시 봇이 silent하게 KiwoomMock으로 fallback → LIVE 모드인데
+  가짜 시세로 HL에만 실 주문 발사 위험. LIVE에서 KIS connect 실패 시 즉시
+  RuntimeError raise (crash loud, no single-leg exposure).
+- `600b765` — KIS `hts_id` 헤더 wire (`rt_cd=7 계좌에 등록된 HTS ID와 일치하지
+  않습니다` 대응). secrets.yaml `kis.hts_id` 필드 추가. 새 KIS app_key 발급 후
+  잔고/주문 endpoint 일부에서 검증.
+
+### 2026-05-15
+- `1cb11c0` — **rollover blackout 알림 cooldown**. BD 5~10 동안 매 신호마다
+  ⛔ ENTRY BLOCKED 알림이 6일간 spam. 상태 전이 시만 1회 알림 (📅 ENTERED /
+  ✅ CLEARED), 매 entry attempt에서는 logger.warning만.
+- `ecee4f1` — **HL invalid price fix (1st)**. 시장가 IOC에 `limit_px=0` 보내면
+  SDK reject. mark price ±5% slippage buffer 적용. (이후 41461f2의 sig fig
+  round와 함께 LIVE entry path 안정화.)
+- `d7d2d84` — **rollover blackout off-by-one fix**. `get_roll_weights` 공식상
+  `(bd - start) / span`이 BD start_day=5에서 weight 0 → 실제 divergence
+  시작일은 BD 6. blackout_start를 `(rollover_start_day + 1) - block_days`로
+  보정. block_days=1 → BD 5부터 차단.
+- `71c6df7` — **rollover blackout (BD-1) + contract alignment monitor**. KIS-leg
+  pair 한정. ① 롤 window 시작 N영업일 전부터 진입 차단 + 보유 포지션 자동
+  flatten. ② HL `index_price` ↔ KIS `mid_price` |diff_bps|가 임계 초과 시
+  `⚠️ CONTRACT ALIGNMENT` 알림. 양 leg가 다른 contract 추종하는 경우
+  (예: HL이 롤됐는데 KIS 안 됨) 즉시 감지.
+
+### 2026-05-12 ~ 14
+- `1446af4` — **M10 Phase G**: OKX v5 SWAP 어댑터 (paper shadow). 5/5 거래소
+  ExchangeBase adapter 완료 (HL/KIS/Lighter/Binance/Bybit/OKX).
+  `wti_hl_okx` (CL-USDT-SWAP, 4h funding) shadow pair settings.yaml 추가.
+- `53018d1` — **M10 Phase F**: Bybit v5 linear adapter + `wti_hl_bybit` shadow.
+- `d12c2c3` — **M10 Phase E**: Binance USDⓈ-M Futures adapter + `wti_hl_binance` shadow.
+- `50467de`, `e35b83e`, `44bf330`, `bb99a79` — **KIS 잔고 endpoint 보정 시리즈**.
+  최종: tr_id=OTFM1411R + response key=`output` (singular) + `fm_tot_asst_evlu_amt`
+  파싱. HL 잔고는 native perp + xyz dex + spot 3 영역 합산.
+- `7fc02f6` — **dashboard 잔고 polling 추가**. 봇이 2분마다 각 adapter
+  `get_account_value()` → `account_balance` 테이블 (schema v4) → dashboard
+  카드 표시. paper-only adapter (lighter/binance/bybit/okx)는 NotImplementedError
+  로 raise해서 polling skip.
+- `db03099` — **dashboard LIVE 가시성**. 타이틀 mode badge (🔴 LIVE / 📊 PAPER) +
+  leg_a/leg_b quote freshness 카드 (🟢 <5s / 🟡 <60s / 🔴 >60s).
+
+### 2026-05-03 ~ 11 (M11 Phase 11 — LIVE 인프라)
+- `1a83aa6` — **Phase 11d: LIVE safety**. TelegramConfig wire +
+  `live_max_contracts_per_pair` (1 MCL hard cap) + WS quote freshness 워치독
+  (60s threshold, auto_flatten on stale).
+- `8661d71` — **Phase 11c: LIVE-mode 분기 + emergency unwind**. `_fill_pair_leg`
+  가 `config.mode == "LIVE"`면 ExchangeRegistry 통해 실 어댑터 dispatch.
+  한 leg만 fill되고 다른 leg fail 시 `_emergency_unwind_partial_entry`로
+  체결된 leg를 reduce_only 시장가 청산.
+- `77aa690` — **HL SDK v0.23 호환**. SDK가 `coin=` → `name=` 인자 rename +
+  `perp_dexs=["xyz"]` 추가 요구. HIP-3 universe 로드 위해.
+- `c82295b` — **Phase 11b: HL eth_account signer**. agent wallet PK로 SDK
+  Exchange object build + 실 주문/취소 path.
+- `3b96d1d` — **Phase 11a: KIS REST 실 주문**. OTFM3001U/OTFM3003U/OTFM1412R
+  (실전) + VTFM* (모의). CANO+ACNT_PRDT_CD split.
 - **M10 Phase D scaffolding**: Lighter 어댑터 + shadow 페어 인프라.
   - `514b85e` — `LighterExchange(ExchangeBase)` adapter (lighter-sdk optional, factory injection for tests). 18 tests.
   - 후속 commit — `LighterConfig` + `pairs:` YAML 블록 + `pair.enabled` shadow gate + main.py wiring (HL Quote fan-out to all HL-hub pairs). 311 tests pass.
@@ -359,6 +460,49 @@ python3 scripts/analyze_paper.py --db data/arbitrage.db
 ---
 
 ## 주요 발견 & 의사결정 기록
+
+### 2026-05-18 LIVE 첫 거래 분석 — spike latency 14bp 손실 → fix
+첫 LIVE 거래 (id=3260) 분석에서 **PAPER ↔ LIVE 사이 평균 12bp slippage 차이**
+가 발견됨. 원인은 spread 모델 차이가 **아니라 entry latency**.
+
+- Signal 발생 시점 (ts=718.6): basis mid -21.35bp (futures가 102.94 → 103.04로
+  점프, 1.4초간 지속).
+- 봇 entry fill 시점 (ts=721.0, +2.4초): basis -6.79bp (mid reversion 완료).
+- spike profit 14.5bp가 latency에 잡혀먹힘.
+
+**비교 — PAPER 거래 (3251-3259)**:
+- in-memory sync fill (ms 단위) → spike 정점 그대로 잡음
+- 평균 slippage 1.5-2.5bp만 (대부분 spike 진행 중 fill)
+
+**Root cause** — HL place_order 안에 3 round-trip:
+1. `_build_exchange()` 매 호출 (SDK metaAndAssetCtxs REST, 200-500ms)
+2. `get_market_data()` (시장가 limit_px 계산용 REST, 200-500ms)
+3. 실 `order()` 호출 (200-500ms)
+
+총 600-1500ms/leg, 양 leg gather라 ~1.5s. 1.4s spike에 부적합.
+
+**Fix (404d7cc)**:
+1. `_build_exchange()` 캐싱 — 봇 startup 시 1회 build, 이후 재사용.
+2. `place_order(ref_price=...)` 인자 — adapter가 in-memory mark_price 전달 →
+   REST `get_market_data()` 호출 생략.
+3. `latency=XXXms` 로그 — 다음 거래에서 실측 가능.
+4. 기대: HL leg 600-1500ms → 150-400ms → 1.4s spike 잡힘 + PAPER 수준 slippage.
+
+**교훈** — PAPER over-optimistic 가설은 부분만 맞음 (KIS 환산비용 등). 진짜 차이는
+양 leg fill 시차 동안의 mean reversion. low-latency 경로가 spike 잡는 본질.
+다음 LIVE entry에서 `latency=XXXms` 측정값 + 실 exec spread로 검증 필요.
+
+### 2026-05-15 LIVE 첫 진입 시도 incident (자료)
+HL fill OK + KIS fail (위험고지 미등록) → 단일 leg 노출. emergency unwind 호출은
+됐지만 HL invalid price 버그(당시)로 unwind도 fail → 사용자 수동 청산.
+
+근본 fix들 (이번 incident 직후 commit):
+- 41461f2 — HL 5 sig figs round (mark*1.05 → 6 sig → reject 해소)
+- d7369fd — asyncio.Lock per pair (KIS 초당 거래 한도 위반 방지)
+- d7369fd — unwind 결과 Telegram 알림 (silent failure 인지 가능)
+- 600b765 — HTS ID 헤더 (잔고/주문 일부 endpoint 검증)
+
+이 incident 이후 LIVE 안전장치 완전 wire 완료 (다음 거래는 5/18에 성공).
 
 ### 2026-04-21~04-27 페이퍼 분석 결과
 30 trade, 7일 운영. 핵심 발견:
