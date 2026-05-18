@@ -25,7 +25,7 @@ logger = logging.getLogger("arbitrage.storage")
 # Schema version
 # ──────────────────────────────────────────────
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # legacy product → pair_id 매핑 (Phase B backward compat)
 LEGACY_PRODUCT_PAIR_MAP = {
@@ -288,6 +288,23 @@ CREATE INDEX IF NOT EXISTS idx_account_balance_exch_ts
 """
 
 
+# ──────────────────────────────────────────────
+# Migration v5 — entry diagnostics (signal vs exec, latency)
+# ──────────────────────────────────────────────
+#
+# LIVE 운영 중 spike latency 분석용 (additive — DB rollback 안전).
+# 5/18 LIVE 첫 거래에서 signal -21bp vs exec -6.79bp 발견 후 추가.
+# 나중에 LIVE 안정화되면 제거 가능.
+
+MIGRATION_V5_DIAGNOSTICS = """
+ALTER TABLE positions ADD COLUMN signal_basis_bps REAL;
+ALTER TABLE positions ADD COLUMN exec_basis_bps REAL;
+ALTER TABLE positions ADD COLUMN entry_latency_ms_a REAL;
+ALTER TABLE positions ADD COLUMN entry_latency_ms_b REAL;
+ALTER TABLE positions ADD COLUMN signal_ts REAL;
+"""
+
+
 class Storage:
     """SQLite 저장소 관리."""
 
@@ -393,6 +410,10 @@ class Storage:
         if current < 4:
             self._migrate_to_v4()
 
+        # v4 → v5 (additive only — entry diagnostics 컬럼 5종 추가)
+        if current < 5:
+            self._migrate_to_v5()
+
         # 버전 기록
         self.conn.execute(
             "INSERT OR REPLACE INTO schema_meta (key, value, updated_at) VALUES (?, ?, ?)",
@@ -425,6 +446,24 @@ class Storage:
     def _migrate_to_v4(self) -> None:
         """v3 → v4: account_balance 테이블 (additive only)."""
         self.conn.executescript(MIGRATION_V4_ACCOUNT_BALANCE)
+        self.conn.commit()
+
+    def _migrate_to_v5(self) -> None:
+        """v4 → v5: positions에 entry diagnostics 컬럼 5종 (additive only).
+
+        signal_basis_bps, exec_basis_bps, entry_latency_ms_a, entry_latency_ms_b,
+        signal_ts. ALTER TABLE이라 이미 있는 컬럼 skip.
+        """
+        diag_cols = [
+            ("signal_basis_bps", "REAL"),
+            ("exec_basis_bps", "REAL"),
+            ("entry_latency_ms_a", "REAL"),
+            ("entry_latency_ms_b", "REAL"),
+            ("signal_ts", "REAL"),
+        ]
+        for col, type_def in diag_cols:
+            if not self._column_exists("positions", col):
+                self.conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {type_def}")
         self.conn.commit()
 
     # ── 시세 저장 ──
@@ -772,17 +811,30 @@ class Storage:
         futures_entry: float,
         ts: float | None = None,
         pair_id: str | None = None,
+        signal_basis_bps: float | None = None,
+        exec_basis_bps: float | None = None,
+        entry_latency_ms_a: float | None = None,
+        entry_latency_ms_b: float | None = None,
+        signal_ts: float | None = None,
     ) -> int:
-        """포지션 오픈 기록. v2 pair_id 함께 채움. 반환: row id."""
+        """포지션 오픈 기록.
+
+        v5 (5/18+): signal_basis_bps + exec_basis_bps + leg별 latency_ms +
+        signal_ts 추가 (테스트용 진단 metric). caller가 안 넘기면 NULL.
+        """
         ts = ts or time.time()
         if pair_id is None:
             pair_id = LEGACY_PRODUCT_PAIR_MAP.get(product)
         cursor = self.conn.execute(
             """INSERT INTO positions
                (product, perp_size, perp_entry, futures_size, futures_entry,
-                status, opened_at, pair_id)
-               VALUES (?, ?, ?, ?, ?, 'open', ?, ?)""",
-            (product, perp_size, perp_entry, futures_size, futures_entry, ts, pair_id),
+                status, opened_at, pair_id,
+                signal_basis_bps, exec_basis_bps,
+                entry_latency_ms_a, entry_latency_ms_b, signal_ts)
+               VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)""",
+            (product, perp_size, perp_entry, futures_size, futures_entry, ts, pair_id,
+             signal_basis_bps, exec_basis_bps,
+             entry_latency_ms_a, entry_latency_ms_b, signal_ts),
         )
         self.conn.commit()
         return cursor.lastrowid  # type: ignore

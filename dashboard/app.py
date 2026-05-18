@@ -294,6 +294,74 @@ def main():
     st.divider()
 
     # ── Open positions ──
+    # ── 🧪 Entry diagnostics (LIVE 테스트용, latency/slippage 진단) ──
+    # 나중에 LIVE 안정화되면 제거. signal vs exec vs latency 한눈에.
+    st.subheader("🧪 Entry diagnostics (signal vs exec, latency)")
+    with sqlite3.connect(db_path) as _con:
+        _con.row_factory = sqlite3.Row
+        diag_df = queries.load_entry_diagnostics(_con, pair_id, limit=20)
+    if diag_df.empty:
+        st.info(
+            "v5 schema 마이그레이션 이전 거래 또는 신규 entry 없음. "
+            "다음 LIVE entry 후 표시됨."
+        )
+    else:
+        # 정리해서 표시 — id, time, signal/exec/slip/latency, prices, pnl
+        display_df = diag_df.copy()
+        display_df["time"] = display_df["opened_dt"].dt.strftime("%m-%d %H:%M:%S")
+        display_df = display_df[[
+            "id", "time", "signal_basis_bps", "exec_basis_bps", "slip_bps",
+            "max_latency_ms", "entry_latency_ms_a", "entry_latency_ms_b",
+            "perp_entry", "futures_entry", "realized_pnl", "status",
+        ]].rename(columns={
+            "signal_basis_bps": "signal_bp",
+            "exec_basis_bps": "exec_bp",
+            "slip_bps": "slip_bp",
+            "max_latency_ms": "max_ms",
+            "entry_latency_ms_a": "leg_a_ms",
+            "entry_latency_ms_b": "leg_b_ms",
+            "perp_entry": "perp",
+            "futures_entry": "fut",
+            "realized_pnl": "pnl",
+        })
+        st.dataframe(
+            display_df,
+            hide_index=True,
+            column_config={
+                "signal_bp": st.column_config.NumberColumn(format="%+.1f"),
+                "exec_bp":   st.column_config.NumberColumn(format="%+.1f"),
+                "slip_bp":   st.column_config.NumberColumn(
+                    format="%+.1f",
+                    help="signal_bp - exec_bp (latency가 잡아먹은 edge)",
+                ),
+                "max_ms":    st.column_config.NumberColumn(format="%.0f"),
+                "leg_a_ms":  st.column_config.NumberColumn(format="%.0f"),
+                "leg_b_ms":  st.column_config.NumberColumn(format="%.0f"),
+                "perp":      st.column_config.NumberColumn(format="%.3f"),
+                "fut":       st.column_config.NumberColumn(format="%.3f"),
+                "pnl":       st.column_config.NumberColumn(format="%+.2f"),
+            },
+        )
+        # 요약 통계 (NULL 제외)
+        valid = diag_df.dropna(subset=["signal_basis_bps", "exec_basis_bps"])
+        if not valid.empty:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("avg signal", f"{valid['signal_basis_bps'].mean():+.1f}bp")
+            c2.metric("avg exec",   f"{valid['exec_basis_bps'].mean():+.1f}bp")
+            c3.metric(
+                "avg slip", f"{valid['slip_bps'].mean():+.1f}bp",
+                help="signal 대비 fill 시점까지 잠식된 spread (latency 영향)",
+            )
+            v_lat = valid.dropna(subset=["max_latency_ms"])
+            if not v_lat.empty:
+                c4.metric("avg max latency", f"{v_lat['max_latency_ms'].mean():.0f}ms")
+        st.caption(
+            "🧪 테스트용 — slip_bp = signal_bp - exec_bp (latency가 잡아먹은 spike profit). "
+            "낮을수록 좋음 (PAPER 기준 1-2bp, LIVE 목표 ≤ 5bp)."
+        )
+
+    st.divider()
+
     st.subheader("🔓 오픈 포지션")
     open_df = _open_positions(db_path)
     if open_df.empty:

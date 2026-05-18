@@ -1642,13 +1642,22 @@ class PaperTradingEngine:
         leg_a_side = "sell" if direction == "long_basis" else "buy"
         leg_b_side = "buy" if direction == "long_basis" else "sell"
 
-        async def _fill_a() -> tuple[float, str]:
-            return await self._fill_pair_leg(pair, "a", leg_a_side, leg_a_size, leg_a)
+        # signal_ts = signal 도착 시점 (entry attempt 시작 직전). 양 leg
+        # gather 직전에 기록해서 fill 후 latency 측정.
+        signal_ts_value = time.time()
 
-        async def _fill_b() -> tuple[float, str]:
-            return await self._fill_pair_leg(pair, "b", leg_b_side, leg_b_size, leg_b)
+        async def _fill_a_timed() -> tuple[float, str, float]:
+            t0 = time.time()
+            price, oid = await self._fill_pair_leg(pair, "a", leg_a_side, leg_a_size, leg_a)
+            return price, oid, (time.time() - t0) * 1000   # ms
 
-        (a_price, a_oid), (b_price, b_oid) = await asyncio.gather(_fill_a(), _fill_b())
+        async def _fill_b_timed() -> tuple[float, str, float]:
+            t0 = time.time()
+            price, oid = await self._fill_pair_leg(pair, "b", leg_b_side, leg_b_size, leg_b)
+            return price, oid, (time.time() - t0) * 1000
+
+        (a_price, a_oid, a_latency_ms), (b_price, b_oid, b_latency_ms) = \
+            await asyncio.gather(_fill_a_timed(), _fill_b_timed())
         if a_price <= 0 or b_price <= 0:
             self._state.failed_orders += 1
             logger.error(
@@ -1715,6 +1724,10 @@ class PaperTradingEngine:
             filled_size=leg_b_size, order_id=b_oid, status="filled",
             is_paper=True, pair_id=pair_id, exchange=pair.leg_b.exchange,
         )
+        # 진단 metric — v5 schema (signal vs exec, latency)
+        exec_basis_bps = (
+            (a_price - b_price) / b_price * 10_000 if b_price else 0.0
+        )
         self.storage.save_position(
             product=legacy_product,
             perp_size=leg_a_size if trade.perp_side == "long" else -leg_a_size,
@@ -1722,13 +1735,21 @@ class PaperTradingEngine:
             futures_size=leg_b_size if trade.futures_side == "long" else -leg_b_size,
             futures_entry=b_price,
             pair_id=pair_id,
+            signal_basis_bps=signal.basis_bps,
+            exec_basis_bps=exec_basis_bps,
+            entry_latency_ms_a=a_latency_ms,
+            entry_latency_ms_b=b_latency_ms,
+            signal_ts=signal_ts_value,
         )
 
+        slip_bps = signal.basis_bps - exec_basis_bps
+        max_latency = max(a_latency_ms, b_latency_ms)
         logger.info(
-            f"[{pair_id}] ▶ ENTRY {direction} | basis={signal.basis_bps:+.1f}bp | "
-            f"leg_a {leg_a_side} {leg_a_size}@{a_price:.2f} | "
-            f"leg_b {leg_b_side} {leg_b_size}@{b_price:.2f} | "
-            f"exec={exec_basis:+.1f}bp"
+            f"[{pair_id}] ▶ ENTRY {direction} | "
+            f"signal={signal.basis_bps:+.1f}bp exec={exec_basis_bps:+.1f}bp "
+            f"slip={slip_bps:+.1f}bp latency={max_latency:.0f}ms | "
+            f"leg_a {leg_a_side} {leg_a_size}@{a_price:.2f} ({a_latency_ms:.0f}ms) | "
+            f"leg_b {leg_b_side} {leg_b_size}@{b_price:.2f} ({b_latency_ms:.0f}ms)"
         )
         for cb in self._on_trade_callbacks:
             try:

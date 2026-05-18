@@ -467,6 +467,34 @@ def load_balance_history(
     return df
 
 
+def load_entry_diagnostics(
+    con: sqlite3.Connection, pair_id: str, limit: int = 20,
+) -> pd.DataFrame:
+    """최근 N건 entry의 signal vs exec vs latency 진단 (테스트용).
+
+    v5 schema 컬럼: signal_basis_bps, exec_basis_bps, entry_latency_ms_a/b,
+    signal_ts. NULL이면 v5 마이그레이션 이전 거래 (구거래).
+    """
+    rows = con.execute(
+        """SELECT id, opened_at, closed_at, perp_entry, futures_entry,
+                  signal_basis_bps, exec_basis_bps,
+                  entry_latency_ms_a, entry_latency_ms_b,
+                  realized_pnl, status
+             FROM positions
+             WHERE pair_id = ?
+             ORDER BY id DESC LIMIT ?""",
+        (pair_id, limit),
+    ).fetchall()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["opened_dt"] = pd.to_datetime(df["opened_at"], unit="s")
+    # slippage = signal - exec (signal 대비 잠식)
+    df["slip_bps"] = df["signal_basis_bps"] - df["exec_basis_bps"]
+    df["max_latency_ms"] = df[["entry_latency_ms_a", "entry_latency_ms_b"]].max(axis=1)
+    return df
+
+
 def load_bot_mode(settings_path: str = "config/settings.yaml") -> str:
     """settings.yaml에서 mode 읽기. 파일 없거나 실패 시 'UNKNOWN'."""
     try:
