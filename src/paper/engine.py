@@ -155,6 +155,11 @@ class PaperTradingEngine:
         self._latest_pair_quote: dict[tuple[str, str], Quote] = {}  # (pair_id, leg) -> Quote
         # 각 거래소당 동시 in-flight 주문 1건 보장 (HL이 5개 페어의 leg_a라 충돌 위험)
         self._exchange_semaphores: dict[str, asyncio.Semaphore] = {}
+        # pair별 entry-in-flight 락 — 동일 페어의 _handle_pair_entry가 동시에 두
+        # 번 이상 돌면 같은 신호로 양 leg 다중 주문 발사되어 KIS rate-limit (초당
+        # 거래 한도) 위반. 락으로 직렬화 + 락 안에서 _open_trades_by_pair 체크해
+        # 중복 진입 차단.
+        self._pair_entry_locks: dict[str, asyncio.Lock] = {}
 
         # 최소 워밍업 데이터 수 (이 이하면 거래 안 함)
         self.MIN_WARMUP_POINTS = 3600  # 약 1시간 분량
@@ -1384,6 +1389,9 @@ class PaperTradingEngine:
         for leg in (pair.leg_a, pair.leg_b):
             if leg.exchange not in self._exchange_semaphores:
                 self._exchange_semaphores[leg.exchange] = asyncio.Semaphore(1)
+        # 페어별 entry 락 lazy-create
+        if pair.id not in self._pair_entry_locks:
+            self._pair_entry_locks[pair.id] = asyncio.Lock()
         logger.info(
             f"[ENGINE] pair registered: {pair.id} "
             f"({pair.leg_a.exchange}/{pair.leg_a.symbol} ↔ "
@@ -1503,7 +1511,34 @@ class PaperTradingEngine:
     ) -> None:
         """진입 처리 (pair-keyed). 레거시 _handle_entry와 미러 — 회귀 위험 없도록
         flow 동일. 차이: kiwoom 대신 dispatch_pair_order 사용 (KIS 어댑터 placeholder),
-        sizing은 pair.leg_b.contract_size 직접 참조."""
+        sizing은 pair.leg_b.contract_size 직접 참조.
+
+        Lock: 같은 페어의 entry는 한 번에 하나만 in-flight. asyncio.gather가
+        1-2초 걸리는 사이 새 basis update가 또 entry 호출하면 같은 신호로
+        다중 발사되어 KIS 초당 거래 한도 위반.
+        """
+        if pair_id in self._open_trades_by_pair:
+            return
+
+        lock = self._pair_entry_locks.get(pair_id)
+        if lock is None:
+            # 등록 안 된 페어 — race or programming error. 보수적으로 skip.
+            logger.warning(f"[{pair_id}] entry attempted on unregistered pair")
+            return
+
+        if lock.locked():
+            # 이미 entry in-flight — silent skip (logger only, no notify spam).
+            logger.debug(f"[{pair_id}] entry already in-flight, skip")
+            return
+
+        async with lock:
+            await self._do_pair_entry(pair_id, signal, leg_a, leg_b)
+
+    async def _do_pair_entry(
+        self, pair_id: str, signal: Signal, leg_a: Quote, leg_b: Quote
+    ) -> None:
+        """실제 entry 로직 — lock 안에서 호출."""
+        # lock 획득 후 다시 한 번 open 체크 (이전 await 사이에 다른 entry가 끝났을 수 있음)
         if pair_id in self._open_trades_by_pair:
             return
 
@@ -1883,7 +1918,8 @@ class PaperTradingEngine:
             # leg_b 실패. leg_a를 반대 방향으로 close.
             opp_side = "sell" if leg_a_side == "buy" else "buy"
             logger.warning(
-                f"[{pair.id}] EMERGENCY UNWIND leg_a ({leg_a_side}→{opp_side} {leg_a_size})"
+                f"[{pair.id}] EMERGENCY_UNWIND leg_a START "
+                f"{leg_a_side}→{opp_side} size={leg_a_size} (filled @ {a_price})"
             )
             try:
                 r = await self.dispatch_pair_order(
@@ -1891,18 +1927,49 @@ class PaperTradingEngine:
                     order_type="market", reduce_only=True,
                 )
                 if r.success:
-                    logger.warning(f"[{pair.id}] emergency unwind leg_a OK oid={r.order_id}")
+                    msg = (f"[{pair.id}] EMERGENCY_UNWIND leg_a OK "
+                           f"oid={r.order_id} filled @ {r.filled_price}")
+                    logger.warning(msg)
+                    if self._notifier is not None:
+                        try:
+                            self._notifier.send_sync(
+                                f"🛟 <b>UNWIND OK [{pair.id}]</b>\n"
+                                f"leg_a {leg_a_side}@{a_price} → "
+                                f"{opp_side}@{r.filled_price} (reduce_only)"
+                            )
+                        except Exception: pass
                 else:
-                    logger.error(
-                        f"[{pair.id}] EMERGENCY UNWIND leg_a FAILED: {r.error} — "
-                        f"manual intervention required (open leg_a oid={a_oid})"
-                    )
+                    msg = (f"[{pair.id}] EMERGENCY_UNWIND leg_a FAILED: {r.error} "
+                           f"— MANUAL INTERVENTION REQUIRED (open leg_a oid={a_oid} "
+                           f"side={leg_a_side} size={leg_a_size} @ {a_price})")
+                    logger.error(msg)
+                    if self._notifier is not None:
+                        try:
+                            self._notifier.send_sync(
+                                f"🚨 <b>UNWIND FAILED [{pair.id}]</b>\n"
+                                f"<b>MANUAL INTERVENTION REQUIRED</b>\n"
+                                f"open leg_a oid={a_oid} {leg_a_side} "
+                                f"size={leg_a_size} @ {a_price}\n"
+                                f"error: <code>{(r.error or '?')[:200]}</code>"
+                            )
+                        except Exception: pass
             except Exception as e:
-                logger.error(f"[{pair.id}] emergency unwind leg_a raised: {e}")
+                logger.error(f"[{pair.id}] EMERGENCY_UNWIND leg_a raised: {e}")
+                if self._notifier is not None:
+                    try:
+                        self._notifier.send_sync(
+                            f"🚨 <b>UNWIND EXCEPTION [{pair.id}]</b>\n"
+                            f"open leg_a oid={a_oid} {leg_a_side} "
+                            f"size={leg_a_size} @ {a_price}\n"
+                            f"exception: <code>{str(e)[:200]}</code>\n"
+                            f"<b>MANUAL INTERVENTION REQUIRED</b>"
+                        )
+                    except Exception: pass
         elif b_price > 0 and a_price <= 0:
             opp_side = "sell" if leg_b_side == "buy" else "buy"
             logger.warning(
-                f"[{pair.id}] EMERGENCY UNWIND leg_b ({leg_b_side}→{opp_side} {leg_b_size})"
+                f"[{pair.id}] EMERGENCY_UNWIND leg_b START "
+                f"{leg_b_side}→{opp_side} size={leg_b_size} (filled @ {b_price})"
             )
             try:
                 r = await self.dispatch_pair_order(
@@ -1910,14 +1977,46 @@ class PaperTradingEngine:
                     order_type="market", reduce_only=True,
                 )
                 if r.success:
-                    logger.warning(f"[{pair.id}] emergency unwind leg_b OK oid={r.order_id}")
+                    logger.warning(
+                        f"[{pair.id}] EMERGENCY_UNWIND leg_b OK "
+                        f"oid={r.order_id} filled @ {r.filled_price}"
+                    )
+                    if self._notifier is not None:
+                        try:
+                            self._notifier.send_sync(
+                                f"🛟 <b>UNWIND OK [{pair.id}]</b>\n"
+                                f"leg_b {leg_b_side}@{b_price} → "
+                                f"{opp_side}@{r.filled_price} (reduce_only)"
+                            )
+                        except Exception: pass
                 else:
                     logger.error(
-                        f"[{pair.id}] EMERGENCY UNWIND leg_b FAILED: {r.error} — "
-                        f"manual intervention required (open leg_b oid={b_oid})"
+                        f"[{pair.id}] EMERGENCY_UNWIND leg_b FAILED: {r.error} "
+                        f"— MANUAL INTERVENTION REQUIRED (open leg_b oid={b_oid} "
+                        f"side={leg_b_side} size={leg_b_size} @ {b_price})"
                     )
+                    if self._notifier is not None:
+                        try:
+                            self._notifier.send_sync(
+                                f"🚨 <b>UNWIND FAILED [{pair.id}]</b>\n"
+                                f"<b>MANUAL INTERVENTION REQUIRED</b>\n"
+                                f"open leg_b oid={b_oid} {leg_b_side} "
+                                f"size={leg_b_size} @ {b_price}\n"
+                                f"error: <code>{(r.error or '?')[:200]}</code>"
+                            )
+                        except Exception: pass
             except Exception as e:
-                logger.error(f"[{pair.id}] emergency unwind leg_b raised: {e}")
+                logger.error(f"[{pair.id}] EMERGENCY_UNWIND leg_b raised: {e}")
+                if self._notifier is not None:
+                    try:
+                        self._notifier.send_sync(
+                            f"🚨 <b>UNWIND EXCEPTION [{pair.id}]</b>\n"
+                            f"open leg_b oid={b_oid} {leg_b_side} "
+                            f"size={leg_b_size} @ {b_price}\n"
+                            f"exception: <code>{str(e)[:200]}</code>\n"
+                            f"<b>MANUAL INTERVENTION REQUIRED</b>"
+                        )
+                    except Exception: pass
         # 둘 다 실패 → unwind 불필요
 
     def _calculate_pair_contracts(
