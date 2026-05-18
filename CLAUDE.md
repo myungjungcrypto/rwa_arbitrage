@@ -219,29 +219,43 @@ rwa_arbitrage/
 | Emergency partial-entry unwind | 한 leg fill + 한 leg fail | 반대 reduce_only 청산 |
 | Mock fallback 차단 (LIVE) | KIS connect fail | RuntimeError raise (crash loud) |
 | Entry lock per pair | 동일 페어 in-flight | asyncio.Lock (KIS 초당 한도 회피) |
+| **EXIT lock per pair + 5s cooldown** | EXIT 동시 호출 / retry | asyncio.Lock + `_last_exit_attempt_ts` (5/18 incident 후 추가) |
+| **EXIT reduce_only=True 강제** | EXIT 모든 발사 | HL SDK 자체 enforce + KIS adapter settlement-aware pre-check |
 | Daily loss cap | 누적 일일 손실 한도 | 진입 차단 |
 
 ---
 
-## 현재 진행 (2026-05-18)
+## 현재 진행 (2026-05-18 09:22 KST)
 
-**M11 (LIVE 트랙) 가동 중 + spike latency 최적화 진행**
+**M11 LIVE 트랙 — EXIT critical fix 완료 + 재가동**
 
 ### LIVE 상태
-- `mode: LIVE`, `wti_cme_hl` pair 진입 가능
-- 양 leg 실시간 데이터 + 잔고 표시 + 모든 안전장치 active
-- 5/18 첫 LIVE 거래 발생 — 양 leg fill OK, 단 latency slippage 14bp 발생 (분석 + fix 완료)
+- `mode: LIVE` 09:22 재기동 (5/18 07:58 incident → 1시간 정지 → fix → 재가동)
+- 양 leg 실시간 데이터 + 잔고 표시 + **5/18 critical fix 4종 적용 + round-trip 재검증 통과**
 - 다음 rollover blackout: BD 5 (~2026-06-05) 자동 차단
+
+### 5/18 발생 사건 + Fix (긴 하루)
+1. **08:00경 첫 LIVE entry** (id=3260): spike latency 14bp loss
+   → `404d7cc` HL Exchange cache + ref_price hint (latency 1500ms→400ms)
+2. **08:00경 KIS WS silent-stale**: server-close 후 push 미시작
+   → `d2bda96` KIS WS reconnect verify + retry
+3. **07:58 EXIT retry storm** (id=3261, critical): HL 978배럴 + KIS 2계약 reverse
+   → `041c3ba` EXIT lock + 5s cooldown
+   → `42fb006` `_fill_pair_leg(reduce_only)` 인자 추가, EXIT path True 명시
+   → `157d9f5` → `1e17fbb` KIS adapter reduce_only graceful pre-check
+4. **알림 noise 개선**: `cc1a97a` WS STALE 메시지에 거래소/심볼/시각/원인 명시
+5. **dashboard 진단**: `aab6d82` schema v5 + Entry diagnostics 섹션
+   (signal_bp / exec_bp / slip_bp / latency_ms 한눈에)
 
 ### M10 (Multi-exchange paper shadow) — 5/5 어댑터 완료
 - Phase D (Lighter), E (Binance), F (Bybit), G (OKX) 모두 scaffolding ready
-- 각 페어 `enabled: false` shadow 상태. 거래소별 `enabled: true` flip 시 시세 인입 시작.
-- 활성화 권장 순서: Lighter → Binance → Bybit → OKX (funding asymmetry 적은 순)
+- 각 페어 `enabled: false` shadow 상태
 
 ### 다음
-1. LIVE entry latency 검증 (다음 거래에서 `latency=XXXms` 측정값 확인)
-2. PAPER 수준 (~2bp slippage) 도달 시 다음 entry signal 안정 운영
-3. Phase H — 5-pair concurrent activation + per-pair risk caps + analyze_paper 멀티 페어 확장
+1. LIVE 다음 entry 모니터 — EXIT lock + reduce_only 정상 작동 검증
+2. 손실 정리 (5/18 incident 추정 $100-300, HL/KIS 직접 확인)
+3. fault injection 회귀 테스트 추가 (EXIT fail retry storm 시뮬)
+4. Phase H — 5-pair concurrent + per-pair risk caps + analyze_paper 멀티 페어
 
 ---
 
@@ -250,6 +264,28 @@ rwa_arbitrage/
 (역순; 자세한 commit 메시지는 `git log` 참조)
 
 ### 2026-05-18
+- `1e17fbb` — **KIS reduce_only pre-check 완화 (settlement delay 인식)**.
+  157d9f5의 strict pre-check (positions empty → reject)가 정상 EXIT까지
+  reject. KIS `inquire-unpd` (positions) endpoint는 일일 정산 단위라 당일
+  신규 거래 즉시 반영 X. 3-tier 변경:
+  ① positions row 있고 symbol 매칭 → strict 검증 (size/side/cap).
+  ② positions row 있는데 symbol 없음 → reject (다른 symbol만 보유).
+  ③ positions 빈 응답 → settlement delay 추정 → WARNING + dispatch 진행.
+  5/18 incident 재발 방지는 engine 측 lock + cooldown으로 충분 (KIS pre-check
+  은 보조). round-trip 재검증 통과.
+- `157d9f5` — **KIS adapter reduce_only pre-check** (1차, 너무 strict).
+  KIS REST가 직접 reduce_only flag 없어서 adapter에서 사전 positions 조회 +
+  보유 검증. round-trip에서 빈 응답에 모두 reject → 1e17fbb로 완화.
+- `42fb006` — **CRITICAL fix: EXIT path reduce_only=True 명시**.
+  5/18 07:58 incident root cause. `_fill_pair_leg`가 reduce_only 인자 자체
+  없었음 → EXIT/unwind retry 시 reverse position 누적. HL은 SDK 레벨에서
+  reduce_only=True면 거래소가 자체 enforce (보유 0 시 reject). engine
+  `_do_pair_exit`이 양 leg fill 호출 시 reduce_only=True 명시 전달.
+- `041c3ba` — **CRITICAL fix: EXIT lock per pair + 5s cooldown**.
+  5/18 07:58 incident: 정상 EXIT 청산 후 1분 21초 동안 같은 EXIT가 1초당
+  20+회 무한 retry. ENTRY는 `_pair_entry_locks`로 보호되지만 EXIT은 보호
+  안 됨. 추가: `_pair_exit_locks` + `_last_exit_attempt_ts` 5초 cooldown.
+  ⚠️ EXIT FAIL Telegram 알림 (KIS HTS 확인 안내).
 - `d2bda96` — **KIS WS reconnect verify + 자동 재시도**. 5/18 07:02 silent-stale
   사건 fix. KIS server-close 후 우리 봇이 reconnect + subscribe restore까지는
   성공했지만 KIS 서버가 새 connection에 데이터 push를 시작 안 함 (KIS의
@@ -483,6 +519,49 @@ python3 scripts/analyze_paper.py --db data/arbitrage.db
 ---
 
 ## 주요 발견 & 의사결정 기록
+
+### 2026-05-18 EXIT retry storm → HL 978배럴 + KIS 2계약 reverse position (critical incident)
+
+**Timeline (trade id=3261)**:
+- 07:56:39 ENTRY long_basis: HL sell 100배럴 (short 100), KIS buy 1 (long 1)
+- 07:56:55 EXIT 정상 청산: HL buy 100 → 0, KIS sell 1 → 0
+- 07:58:16 ~ 07:58:18 **EXIT가 1초당 20+회 무한 retry** (1분 21초간)
+- 결과: HL **long 978배럴** (의도하지 않은 reverse), KIS **short 2계약** (reverse)
+- 사용자 수동 청산으로 정리. 추정 손실 $100-$300.
+
+**Root cause 3종 결합**:
+1. **EXIT path에 asyncio.Lock 없음** — ENTRY는 `_pair_entry_locks` 보호되지만
+   EXIT은 보호 안 됨. process_pair_basis_update가 매 quote tick마다 EXIT
+   signal 재생성 → `_handle_pair_exit` 동시 호출.
+2. **`reduce_only=False` 누락** — `_fill_pair_leg`가 reduce_only 인자 자체
+   없었음. EXIT/unwind 모두 `reduce_only=False`로 dispatch:
+   - HL: SDK가 reduce_only=False로 처리 → reverse 누적 가능 → 증거금 한계
+     978배럴에서 멈춤
+   - KIS: reduce_only flag 자체 없는 REST → 보유 무관 sell 처리 → reverse
+     누적 → 증거금 한계 2계약에서 reject 시작
+3. **EXIT fail retry 로직** — "will retry" 메시지 후 그냥 return → 다음
+   quote tick에 또 호출 → 1초당 20+회 발사.
+
+**Fix (5/18, 4개 commit)**:
+- `041c3ba` — `_pair_exit_locks` per pair + 5초 cooldown (`_last_exit_attempt_ts`)
+- `42fb006` — `_fill_pair_leg(..., reduce_only)` 인자 추가, EXIT path에서 True 전달
+- `157d9f5` — KIS adapter reduce_only pre-check (positions 조회 + 검증) — strict
+- `1e17fbb` — KIS pre-check 완화 (settlement delay 인식, dispatch 허용)
+
+**왜 PAPER에서 안 잡혔나** (1달 무탈했던 이유):
+1. PAPER `_fill_pair_leg`는 양 leg 100% success 시뮬 (KiwoomMock + quote bid/ask)
+   → EXIT fail 케이스 절대 발생 안 함 → retry 루프 trigger 0건.
+2. PAPER fill latency 0ms → 양 leg gather가 ms 안에 끝남 → race condition 0.
+3. KiwoomMock도 `reduce_only` 무시 (보유 무관 reverse 가능)했지만 EXIT retry
+   가 절대 안 일어나서 dormant.
+4. 결국 reduce_only=False는 fail-only-path 버그라 PAPER에서 영원히 dormant.
+   LIVE 첫 fail (KIS REST 7초 hang)에서 즉시 explosion.
+
+**교훈**: PAPER backtest ≠ LIVE failure mode 검증. fault injection 시뮬 필요.
+회귀 테스트도 happy path만 검증 → fail-path explicit 테스트 추가 권장.
+
+**검증**: round-trip 2회 재실행 후 정상 동작 확인 (08:49:38). EXIT lock +
+cooldown + reduce_only + KIS settlement-aware pre-check 모두 작동.
 
 ### 2026-05-18 KIS WS server-close silent-stale 사건 → 자동 verify+retry
 하루 동안 KIS WS가 4번 끊김 (02:04, 03:13, 06:09, 07:02). 마지막 07:02
