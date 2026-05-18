@@ -82,9 +82,11 @@ async def main() -> int:
     print(f"  → 5초 대기 → 양 leg reduce_only 청산")
     print(f"\n예상 비용: slippage (~$10) + 수수료 (~$5 HL + ~$5 KIS) = 약 $15-30")
 
-    confirm = input("\n진행하려면 'YES' 입력: ").strip()
+    confirm = input("\n진행하려면 'YES' 입력: ").strip().upper()
     if confirm != "YES":
-        print("취소됨"); return 0
+        print("취소됨")
+        await _cleanup(hl_rest, None)
+        return 0
 
     # KIS auth는 confirm 후에 호출 — rate limit cooldown 동안 사용자 결정 가능
     print(f"\n[AUTH] KIS access_token 발급 (1분 rate limit 주의)...")
