@@ -247,3 +247,46 @@ async def test_cancel_order_exception_returns_false():
     with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange):
         ok = await c.cancel_order("xyz:CL", 12345)
     assert ok is False
+
+
+# ──────────────────────────────────────────────
+# HL 5-sig-figs price rounding (avoid 'invalid price')
+# ──────────────────────────────────────────────
+
+
+def test_hl_round_price_5_sig_figs():
+    from src.exchange.hyperliquid import _hl_round_price_sig_figs as r
+    # 6 sig figs → 5 sig figs
+    assert r(104.034) == 104.03
+    assert r(99.0825) == 99.082 or r(99.0825) == 99.083   # banker's round OK
+    # 이미 5 sig 이내 → 그대로
+    assert r(99.080) == 99.08
+    # 작은 가격
+    assert r(0.0001234567) == pytest.approx(0.00012346, abs=1e-10)
+    # 0 또는 음수 → 그대로
+    assert r(0) == 0
+    assert r(-1) == -1
+
+
+@pytest.mark.asyncio
+async def test_place_order_market_rounds_to_5_sig_figs():
+    """ref * 1.05가 6 sig figs 나와도 limit_px는 5 sig로 round되어 SDK 전달."""
+    from src.exchange.hyperliquid import MarketData
+    c = _make_client(pk="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"oid": 1, "totalSz": "1", "avgPx": "104"}}]}},
+    }
+    # mark=99.08, buy → 99.08 * 1.05 = 104.034 (6 sig)
+    md = MarketData(ticker="xyz:CL", mark_price=99.08, index_price=99.08,
+                    funding_rate=0, predicted_funding_rate=0,
+                    open_interest=0, volume_24h=0)
+    async def _mock_md(t): return md
+    with patch.object(HyperliquidClient, "_build_exchange", return_value=fake_exchange), \
+         patch.object(HyperliquidClient, "get_market_data", side_effect=_mock_md):
+        r = await c.place_order(ticker="xyz:CL", side=OrderSide.BUY, size=1.0, price=None)
+    assert r.success is True
+    args, kwargs = fake_exchange.order.call_args
+    # 6 sig (104.034) → 5 sig (104.03)
+    assert kwargs["limit_px"] == 104.03

@@ -46,6 +46,20 @@ TESTNET_WS_URL = "wss://api.hyperliquid-testnet.xyz/ws"
 TRADE_XYZ_PERP_DEX = "xyz"
 
 
+def _hl_round_price_sig_figs(px: float, sig: int = 5) -> float:
+    """HL 가격을 5 significant figures로 round. 6+ sig면 SDK reject.
+
+    예: 104.034 → 104.03, 99.082345 → 99.082, 0.00012345 → 0.00012346
+    HL HIP-3 perp는 일반적으로 5 sig figs + tickSize 룰. SDK가 자체 round를
+    안 해주는 경우 있어서 클라이언트 측에서 명시 처리.
+    """
+    if px <= 0:
+        return px
+    from math import floor, log10
+    digits = sig - 1 - int(floor(log10(abs(px))))
+    return round(px, max(digits, 0))
+
+
 class OrderSide(str, Enum):
     BUY = "B"
     SELL = "A"
@@ -510,7 +524,7 @@ class HyperliquidClient:
         is_buy = side == OrderSide.BUY
         # 시장가 = IOC limit. HL은 limit_px=0을 invalid로 거절하므로
         # 현재 mark price 조회 후 buy=mark*(1+slip), sell=mark*(1-slip)로
-        # cross 보장. SDK는 자체적으로 tick_size에 round.
+        # cross 보장.
         if price is None:
             slip = 0.05    # 5% slippage 버퍼 — 시장가 의도이므로 충분히 넓게
             try:
@@ -529,6 +543,10 @@ class HyperliquidClient:
         else:
             limit_px = price
             order_type = {"limit": {"tif": "Gtc"}}
+        # HL price rule: ≤5 significant figures + tickSize. 6 sig figs 보내면
+        # SDK가 'Order has invalid price' reject. ref*1.05 같은 곱셈은 거의
+        # 항상 6+ sig 결과라 round 필수.
+        limit_px = _hl_round_price_sig_figs(limit_px, sig=5)
 
         try:
             # SDK v0.23+: param renamed coin → name
