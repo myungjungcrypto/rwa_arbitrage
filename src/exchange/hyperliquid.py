@@ -559,11 +559,15 @@ class HyperliquidClient:
         # 항상 6+ sig 결과라 round 필수.
         limit_px = _hl_round_price_sig_figs(limit_px, sig=5)
 
-        # 단계별 latency 측정 — SDK order() 호출 시간 instrumentation
+        # SDK exchange.order()는 sync (eth_account 서명 + requests.post HTTP).
+        # 직접 호출 시 asyncio 이벤트 루프 전체가 1000-1500ms 블록 →
+        # 같은 gather의 KIS leg이 schedule 안 됨 → 양 leg "병렬" 환상이 깨짐.
+        # asyncio.to_thread로 스레드 풀에 offload → 진짜 병렬 실행.
         try:
-            # SDK v0.23+: param renamed coin → name
             t_order_start = time.time()
-            result = exchange.order(
+            # SDK v0.23+: param renamed coin → name
+            result = await asyncio.to_thread(
+                exchange.order,
                 name=ticker,
                 is_buy=is_buy,
                 sz=size,
@@ -615,7 +619,10 @@ class HyperliquidClient:
             if exchange is None:
                 return False
             # SDK v0.23+: param renamed coin → name
-            result = exchange.cancel(name=ticker, oid=int(order_id))
+            # cancel도 sync HTTP — to_thread로 offload (이벤트 루프 블록 방지)
+            result = await asyncio.to_thread(
+                exchange.cancel, name=ticker, oid=int(order_id)
+            )
             return result.get("status") == "ok"
         except Exception as e:
             logger.error(f"HL cancel_order error: {e}")
