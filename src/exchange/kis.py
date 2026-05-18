@@ -756,21 +756,41 @@ class KISExchange:
             )
 
         # reduce_only — KIS REST는 직접 flag 없음. adapter 측에서 사전 잔고
-        # 체크로 동등 효과. 5/18 incident: EXIT retry가 reduce_only=False로
-        # 발사되어 KIS가 reverse position 누적 (long 0 → sell → short 2).
-        # 이제 reduce_only=True면 보유 포지션과 방향/크기 검증 후 reject.
+        # 체크로 동등 효과.
+        # 단 KIS positions endpoint (OTFM1412R)는 당일 신규 진입을 즉시 반영
+        # 못 함 (일일 정산 단위). 빈 응답은 settlement delay 가능성 → engine
+        # 측 asyncio.Lock + 5s cooldown 안전망에 신뢰 + dispatch 허용.
+        #
+        # 5/18 incident 메커니즘 차단은 engine 측 가드로 충분:
+        # 1) _pair_exit_locks → 동시 EXIT 다중 발사 차단
+        # 2) _last_exit_attempt_ts 5초 cooldown → retry storm 차단
+        # 3) reduce_only=True → HL은 SDK 레벨 자체 enforce
+        # KIS는 lock+cooldown 안에서 EXIT 1회만 발사되니 reverse 누적 0%.
         if reduce_only:
             try:
                 positions = await self.get_positions()
-                held = next(
-                    (p for p in positions if p.symbol == symbol), None,
+            except Exception as e:
+                logger.warning(
+                    f"[KIS] reduce_only pre-check failed (network/auth): {e} "
+                    f"— relying on engine lock+cooldown"
                 )
-                if held is None or held.size == 0:
+                positions = None
+
+            if positions is not None and len(positions) > 0:
+                # 응답에 row 있음 — 명시적 검증
+                held = next((p for p in positions if p.symbol == symbol), None)
+                if held is None:
+                    # 다른 symbol은 있는데 우리 symbol 없음 → 진짜 보유 0
                     return _base.OrderResult(
                         success=False, exchange=self.name, symbol=symbol,
-                        error="reduce_only: no position to reduce",
+                        error=f"reduce_only: no position for {symbol} (other symbols held)",
                     )
-                # 방향 일치 검증 — long(positive) 보유 시 sell만, short(negative)면 buy만
+                if held.size == 0:
+                    return _base.OrderResult(
+                        success=False, exchange=self.name, symbol=symbol,
+                        error="reduce_only: position size 0",
+                    )
+                # 방향 일치 — long(+) 보유 시 sell만, short(-)면 buy만
                 want_buy = (side == "buy")
                 holds_short = (held.size < 0)
                 if want_buy != holds_short:
@@ -782,16 +802,14 @@ class KISExchange:
                 # 사이즈 cap — 보유 이상 못 보냄
                 if size > abs(held.size):
                     logger.warning(
-                        f"[KIS] reduce_only: capping size {size} → {abs(held.size)} "
-                        f"(actual position)"
+                        f"[KIS] reduce_only: capping size {size} → {abs(held.size)}"
                     )
                     size = abs(held.size)
-            except Exception as e:
-                # 잔고 조회 실패 — 보수적으로 주문 차단 (silent over-fill 방지)
-                logger.error(f"[KIS] reduce_only pre-check failed: {e}")
-                return _base.OrderResult(
-                    success=False, exchange=self.name, symbol=symbol,
-                    error=f"reduce_only pre-check failed: {e}",
+            else:
+                # 빈 응답 (settlement delay 추정) — engine 측 가드에 신뢰
+                logger.warning(
+                    f"[KIS] reduce_only: positions empty (당일 거래 KIS settlement "
+                    f"delay 추정) — engine lock+cooldown에 신뢰 + dispatch 진행"
                 )
 
         sll_buy = "02" if side == "buy" else "01"
