@@ -57,7 +57,7 @@ async def main() -> int:
               f"{cfg.kis_symbol_map.get('wti')!r}, active = {active_kis!r}")
         print(f"     이 스크립트는 active({active_kis})로 주문합니다.")
 
-    # HL adapter
+    # HL adapter (인증 가벼움)
     hl_rest = HyperliquidClient(
         use_testnet=cfg.hyperliquid.use_testnet,
         wallet_address=cfg.hyperliquid.wallet_address,
@@ -67,21 +67,7 @@ async def main() -> int:
     hl_ws = HyperliquidWebSocket(use_testnet=cfg.hyperliquid.use_testnet)
     hl = HyperliquidExchange(rest=hl_rest, ws=hl_ws)
 
-    # KIS adapter
-    auth = KISAuth(
-        app_key=cfg.kis.app_key,
-        app_secret=cfg.kis.app_secret,
-        account_number=cfg.kis.account_number,
-        is_paper=cfg.kis.is_paper,
-        hts_id=cfg.kis.hts_id,
-    )
-    await auth.get_access_token()
-    kis_client = KISFuturesClient(
-        auth=auth, ws_url=cfg.kis.ws_url, is_paper=cfg.kis.is_paper,
-    )
-    kis = KISExchange(client=kis_client)
-
-    # 현재 HL 시세
+    # 현재 HL 시세 (auth 불필요)
     hl_q = await hl.get_quote("xyz:CL")
     if not hl_q:
         print("\n[FAIL] HL 시세 조회 실패"); return 1
@@ -99,6 +85,29 @@ async def main() -> int:
     confirm = input("\n진행하려면 'YES' 입력: ").strip()
     if confirm != "YES":
         print("취소됨"); return 0
+
+    # KIS auth는 confirm 후에 호출 — rate limit cooldown 동안 사용자 결정 가능
+    print(f"\n[AUTH] KIS access_token 발급 (1분 rate limit 주의)...")
+    auth = KISAuth(
+        app_key=cfg.kis.app_key,
+        app_secret=cfg.kis.app_secret,
+        account_number=cfg.kis.account_number,
+        is_paper=cfg.kis.is_paper,
+        hts_id=cfg.kis.hts_id,
+    )
+    try:
+        await auth.get_access_token()
+    except RuntimeError as e:
+        if "EGW00133" in str(e) or "1분당 1회" in str(e):
+            print(f"  [FAIL] KIS 토큰 rate limit — 60초 후 재시도하세요")
+            print(f"    sleep 60 && .venv/bin/python scripts/test_live_round_trip.py")
+        else:
+            print(f"  [FAIL] {e}")
+        await _cleanup(hl_rest, None); return 4
+    kis_client = KISFuturesClient(
+        auth=auth, ws_url=cfg.kis.ws_url, is_paper=cfg.kis.is_paper,
+    )
+    kis = KISExchange(client=kis_client)
 
     # ── ENTRY: 양 leg 동시 ──
     print(f"\n[ENTRY] {time.strftime('%H:%M:%S')} 양 leg market 진입...")
