@@ -667,11 +667,38 @@ C) KIS WS push delay — KIS 일시 stale 후 push 재개 시 spike처럼 보임
 |---|---|---|---|
 | `404d7cc` | HL `_build_exchange` cache + `ref_price` hint | HL | first cold 7491ms → warm 865-1157ms |
 | `475c041` | KIS persistent aiohttp session + DNS cache | KIS | 218-3253ms variance → 200-500ms 목표 |
-| TBD | HL eth_account signing offload (ProcessPoolExecutor) | HL | 100-200ms 절감 추정 |
+| 5/18 TBD | HL `exchange.order()` `asyncio.to_thread` offload | both | sync SDK 호출이 이벤트 루프 1.5s 블록 → KIS leg을 schedule 못 함. to_thread로 진짜 병렬화 → KIS variance 261-4074ms 의 root cause 일부 제거 추정 |
 | TBD | HL Info object cache (universe lookup) | HL | 추가 측정 후 결정 |
 
 **목표 latency**: 양 leg 500ms 이내. 현재 HL 1000ms + KIS persistent session 후
 200-500ms 예상 → 다음 entry로 검증.
+
+### 2026-05-18 KIS latency variance 261-4074ms — 5건 spike 손실 후 측정 (Option A 분석)
+
+`475c041` (KIS persistent session) 적용 후에도 KIS leg latency 측정값:
+11:45 637ms → 1883ms / 13:01 3040ms / 13:02 1125ms / 13:43 1687ms / 13:44 403ms /
+14:05 4074ms / 14:07 261ms → 1474ms / 14:10 367ms. 평균 1438ms variance huge.
+
+**Root cause 가설**:
+- KIS persistent session 자체는 정상 작동 (261-403ms 케이스가 connection reuse 증거)
+- **하지만 같은 gather의 HL leg이 `exchange.order()` sync 호출로 이벤트 루프
+  1000-1500ms 블록 중 → KIS coroutine이 schedule 못 받음 → 측정된 KIS
+  latency = HL 블록 시간 + KIS 실제 REST 시간**
+- 양 leg "병렬" 환상이 깨진 것 — asyncio.gather는 sync 함수 안에서 양보 불가
+
+**Fix (`HL to_thread` offload)** — `exchange.order()`와 `exchange.cancel()`을
+`asyncio.to_thread()`로 wrap. 스레드 풀에서 sync SDK 호출 실행 → 이벤트 루프
+즉시 해방 → KIS coroutine이 aiohttp.post() 실제 RTT 동안만 대기.
+기대: KIS latency variance가 KIS 자체 RTT 분포로 좁혀짐 (현재 261ms가 최저
+케이스 = floor). HL latency는 to_thread 오버헤드 (수ms) 외 변동 없음.
+
+**Option B 백테스트 스크립트** (`scripts/backtest_signal_smoothing.py`) —
+signal smoothing 정책(`min_signal_ticks=2/3/5/10`) × `entry_threshold_bps`
+그리드로 historical basis_spread 시뮬. baseline(ticks=1, 20bp) 대비 WR/total
+PnL/Sharpe 비교 보고. production 코드 무수정 (별도 스크립트). EC2에서:
+```
+python3 scripts/backtest_signal_smoothing.py --hours 168
+```
 
 ### 2026-05-18 LIVE 첫 거래 분석 — spike latency 14bp 손실 → fix
 첫 LIVE 거래 (id=3260) 분석에서 **PAPER ↔ LIVE 사이 평균 12bp slippage 차이**
