@@ -204,6 +204,8 @@ class KISFuturesClient:
         self._running = False
         self._recv_task: Optional[asyncio.Task] = None
         self._reconnect_delay = 5
+        # 마지막 quote 메시지 수신 시각 — reconnect 후 verify에 사용
+        self._last_msg_ts: float = 0.0
 
     async def connect(self) -> bool:
         """인증 + WebSocket 연결."""
@@ -378,32 +380,79 @@ class KISFuturesClient:
             await asyncio.sleep(self._reconnect_delay)
             asyncio.create_task(self._reconnect())
 
-    async def _reconnect(self):
-        """WebSocket 재연결 (토큰 재발급 포함)."""
-        try:
-            if self._ws and not self._ws.closed:
-                await self._ws.close()
-            if self._session:
-                await self._session.close()
+    async def _reconnect(self, max_attempts: int = 3, verify_seconds: float = 15.0):
+        """WebSocket 재연결 + push 검증.
 
-            # 토큰 재발급 (만료됐을 수 있음)
-            await self.auth.get_access_token()
-            await self.auth.get_approval_key()
+        KIS WS의 알려진 quirk — 잦은 reconnect 후 subscribe ack는 주지만 실제
+        quote push 안 시작되는 경우 (5/18 07:02 사건). 그래서 reconnect 후
+        N초 wait + `_last_msg_ts` 확인 + push 안 오면 재시도.
 
-            self._session = aiohttp.ClientSession()
-            self._ws = await self._session.ws_connect(
-                self.ws_url, heartbeat=30,
-            )
-            logger.info("KIS WebSocket reconnected (tokens refreshed)")
+        Args:
+            max_attempts: 재시도 최대 횟수
+            verify_seconds: subscribe 후 push 기다리는 시간
+        """
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if self._ws and not self._ws.closed:
+                    await self._ws.close()
+                if self._session:
+                    await self._session.close()
 
-            # 기존 구독 복원
-            for symbol in self._callbacks:
-                await self._send_subscribe("HDFFF010", symbol)
-                await self._send_subscribe("HDFFF020", symbol)
-            logger.info(f"KIS subscriptions restored: {list(self._callbacks.keys())}")
+                # 토큰 재발급 — KIS rate limit (분당 1회) 회피 위해 첫 시도엔
+                # 캐시된 token 사용. 1차 fail 시 재시도에선 새 token (만료됐을 수 있음).
+                if attempt > 1:
+                    self.auth._access_token = ""    # cache clear
+                    self.auth._approval_key = ""
+                await self.auth.get_access_token()
+                await self.auth.get_approval_key()
 
-        except Exception as e:
-            logger.error(f"KIS reconnect failed: {e}")
+                self._session = aiohttp.ClientSession()
+                self._ws = await self._session.ws_connect(
+                    self.ws_url, heartbeat=30,
+                )
+                logger.info(
+                    f"KIS WebSocket reconnected (attempt {attempt}/{max_attempts}, "
+                    f"tokens refreshed)"
+                )
+
+                # 기존 구독 복원
+                ts_before_subscribe = time.time()
+                for symbol in self._callbacks:
+                    await self._send_subscribe("HDFFF010", symbol)
+                    await self._send_subscribe("HDFFF020", symbol)
+                logger.info(
+                    f"KIS subscriptions restored: {list(self._callbacks.keys())} "
+                    f"— verifying push for {verify_seconds:.0f}s..."
+                )
+
+                # Verify — N초 안 quote 들어오는지 (KIS server-side stale 검출)
+                deadline = time.time() + verify_seconds
+                while time.time() < deadline:
+                    await asyncio.sleep(1)
+                    if self._last_msg_ts > ts_before_subscribe:
+                        logger.info(
+                            f"KIS push verified (first msg at "
+                            f"+{self._last_msg_ts - ts_before_subscribe:.1f}s)"
+                        )
+                        return
+                # 검증 실패 — KIS subscribe ack 줬지만 push 안 옴
+                logger.error(
+                    f"KIS reconnect attempt {attempt}/{max_attempts} — "
+                    f"subscribed but NO quote in {verify_seconds:.0f}s, retrying..."
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"KIS reconnect attempt {attempt}/{max_attempts} failed: {e}"
+                )
+                # KIS rate limit 회피 위해 점진 backoff
+                await asyncio.sleep(min(60, 5 * attempt))
+
+        logger.error(
+            f"KIS reconnect FAILED after {max_attempts} attempts. "
+            "WS_WATCHDOG will catch stale → flatten + alert. "
+            "Manual `pm2 restart rwa-arb` 또는 PM2 cron이 회복할 때까지 quote stale."
+        )
 
     def _handle_message(self, raw: str):
         """WebSocket 메시지 파싱.
@@ -426,6 +475,9 @@ class KISFuturesClient:
                 return
             tr_id = parts[1]
             data_str = parts[3]
+
+            # 실 quote 수신 시각 기록 — reconnect verify 용
+            self._last_msg_ts = time.time()
 
             if tr_id == "HDFFF010":
                 self._parse_hoka(data_str)
