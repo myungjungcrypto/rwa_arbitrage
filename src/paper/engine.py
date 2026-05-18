@@ -888,11 +888,18 @@ class PaperTradingEngine:
                 if self._notifier is not None:
                     try:
                         self._notifier.send_sync(
-                            f"🚨 <b>KIS LICENSE SUSPECT</b>\n"
-                            f"futures feed stale {age_min:.1f}m (CME OPEN)\n\n"
-                            f"⚠️ NYMEX 실시간 시세 결제/연장 확인 필요:\n"
-                            f"https://apiportal.koreainvestment.com\n"
-                            f"또는 콜센터 1544-5000"
+                            f"🚨 <b>KIS 시세 STALE</b>\n"
+                            f"채널: KIS WS ws://ops.koreainvestment.com:21000\n"
+                            f"마지막 futures_prices: <b>{age_min:.1f}분 전</b> "
+                            f"(CME OPEN 상태)\n\n"
+                            f"의심 원인 우선순위:\n"
+                            f"1) NYMEX 실시간 시세 결제 만료\n"
+                            f"   → https://apiportal.koreainvestment.com\n"
+                            f"2) 같은 KIS app_key를 다른 봇이 동시 WS 사용\n"
+                            f"   → pm2 logs <봇> | grep -i kis\n"
+                            f"3) KIS 서버측 maintenance / break\n"
+                            f"4) 봇의 KIS WS reconnect 실패\n"
+                            f"   → pm2 logs rwa-arb | grep -i 'kis.*disconnect'"
                         )
                     except Exception as e:
                         logger.error(f"notifier kis-license error: {e}")
@@ -1015,11 +1022,18 @@ class PaperTradingEngine:
             still_stale = {(p, l) for p, l, _ in stale_legs}
             recovered = alerted - still_stale
             for r in recovered:
-                logger.info(f"[WS_WATCHDOG] recovered {r[0]}/{r[1]}")
+                rec_pair = self._registered_pairs.get(r[0])
+                rec_cfg = rec_pair.leg(r[1]) if rec_pair else None
+                rec_exch = rec_cfg.exchange if rec_cfg else "?"
+                rec_sym = rec_cfg.symbol if rec_cfg else "?"
+                logger.info(
+                    f"[WS_WATCHDOG] recovered {r[0]}/{r[1]} ({rec_exch}/{rec_sym})"
+                )
                 if self._notifier is not None:
                     try:
                         self._notifier.send_sync(
-                            f"✅ <b>WS RECOVERED</b> {r[0]} leg_{r[1]}"
+                            f"✅ <b>QUOTE RECOVERED [{r[0]}]</b>\n"
+                            f"leg_{r[1]}: {rec_exch}/{rec_sym}"
                         )
                     except Exception:
                         pass
@@ -1032,28 +1046,52 @@ class PaperTradingEngine:
                 ]
                 for pair_id, leg in new_alerts:
                     age = next(a for p, l, a in stale_legs if p == pair_id and l == leg)
+                    pair = self._registered_pairs.get(pair_id)
+                    # 어느 거래소/심볼인지 명시 (leg_a/leg_b 모호함 해소)
+                    leg_cfg = pair.leg(leg) if pair else None
+                    exch = leg_cfg.exchange if leg_cfg else "?"
+                    sym = leg_cfg.symbol if leg_cfg else "?"
+                    role = leg_cfg.role.value if leg_cfg else "?"
+                    # 마지막 fresh quote 시각 (절대) — KST 변환 포함
+                    last_ts = self._last_quote_ts.get((pair_id, leg))
+                    if last_ts:
+                        from datetime import datetime, timezone, timedelta
+                        last_kst = datetime.fromtimestamp(
+                            last_ts, tz=timezone(timedelta(hours=9))
+                        ).strftime("%H:%M:%S KST")
+                    else:
+                        last_kst = "never"
                     logger.error(
-                        f"[WS_WATCHDOG] STALE {pair_id}/{leg} age={age:.0f}s "
-                        f"> threshold={threshold:.0f}s"
+                        f"[WS_WATCHDOG] STALE {pair_id}/{leg} ({exch}/{sym}) "
+                        f"age={age:.0f}s last={last_kst} > threshold={threshold:.0f}s"
                     )
+                    # 데이터 채널 명시 — 시세 WS (주문 채널과 별개)
+                    channel_hint = ""
+                    if exch == "kis":
+                        channel_hint = " (KIS 시세 WS ws://ops.koreainvestment.com:21000)"
+                    elif exch == "hyperliquid":
+                        channel_hint = " (HL 시세 WS wss://api.hyperliquid.xyz/ws)"
+                    elif exch == "lighter":
+                        channel_hint = " (Lighter WS)"
                     # leg_b가 KIS dated_futures인 페어에서 stale이면 시세 라이센스
                     # 만료 의심 — 메시지에 명시.
-                    pair = self._registered_pairs.get(pair_id)
                     license_hint = ""
                     if (leg == "b" and pair is not None
                             and pair.leg_b.role == LegRole.DATED_FUTURES
                             and pair.leg_b.exchange == "kis"):
                         license_hint = (
-                            "\n\n⚠️ KIS 시세 라이센스 만료 의심 — "
-                            "apiportal.koreainvestment.com 에서 NYMEX 실시간 시세 "
-                            "결제/연장 확인. 또는 .venv/bin/python "
-                            "scripts/diagnose_kis_feed.py 로 즉시 검증."
+                            "\n\n⚠️ KIS 시세 라이센스 만료 가능성 — "
+                            "apiportal.koreainvestment.com 결제 확인. "
+                            "또는 .venv/bin/python scripts/diagnose_kis_feed.py 검증.\n"
+                            "(라이센스 OK면 다른 봇과 app_key 동시 WS 세션 충돌 의심)"
                         )
                     if self._notifier is not None:
                         try:
                             self._notifier.send_sync(
-                                f"🚨 <b>WS STALE</b> {pair_id} leg_{leg} "
-                                f"age={age:.0f}s\n"
+                                f"🚨 <b>QUOTE STALE [{pair_id}]</b>\n"
+                                f"leg_{leg}: <b>{exch}/{sym}</b> ({role}){channel_hint}\n"
+                                f"age={age:.0f}s (threshold {threshold:.0f}s)\n"
+                                f"last quote: {last_kst}\n"
                                 f"open_positions={len(pairs_with_open_pos)} "
                                 f"auto_flatten={auto_flatten}"
                                 f"{license_hint}"
