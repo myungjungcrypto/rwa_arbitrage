@@ -1846,11 +1846,17 @@ class PaperTradingEngine:
         leg_a_size = trade.perp_units
         leg_b_size = float(trade.size_contracts)
 
+        # EXIT는 반드시 reduce_only=True — 5/18 incident: retry 시 HL이
+        # reverse position 누적해서 978 배럴 의도치 않은 long 발생. 반드시 명시.
         async def _fill_a():
-            return await self._fill_pair_leg(pair, "a", leg_a_close_side, leg_a_size, leg_a)
+            return await self._fill_pair_leg(
+                pair, "a", leg_a_close_side, leg_a_size, leg_a, reduce_only=True,
+            )
 
         async def _fill_b():
-            return await self._fill_pair_leg(pair, "b", leg_b_close_side, leg_b_size, leg_b)
+            return await self._fill_pair_leg(
+                pair, "b", leg_b_close_side, leg_b_size, leg_b, reduce_only=True,
+            )
 
         (a_exit, _), (b_exit, b_exit_oid) = await asyncio.gather(_fill_a(), _fill_b())
         if a_exit <= 0 or b_exit <= 0:
@@ -1945,18 +1951,13 @@ class PaperTradingEngine:
         side: str,
         size: float,
         leg_quote: Quote,
+        reduce_only: bool = False,
     ) -> tuple[float, str]:
         """페어 leg에 fill 발생시킴. (filled_price, order_id) 반환.
 
-        모드 분기:
-          mode='PAPER' (기본):
-            - KIS leg: KiwoomMock 시뮬 fill
-            - 기타 perp leg: 캐시된 bid/ask로 시뮬 fill
-          mode='LIVE':
-            - 모든 leg: ExchangeRegistry 통해 실 어댑터 place_order 호출
-            - 실패/체결 미완 시 (0.0, "") 반환 → 호출자가 unwind 처리
-
-        실패 시 (0.0, "") 반환.
+        reduce_only — EXIT/unwind 경로에서 반드시 True. 5/18 incident에서
+        EXIT retry가 reduce_only=False로 발사되어 HL이 reverse position 누적
+        (978 배럴) → critical bug. ENTRY는 False (새 position 생성 의도).
         """
         leg_cfg = pair.leg(leg)
         is_live = (self.config.mode or "").upper() == "LIVE"
@@ -1967,7 +1968,7 @@ class PaperTradingEngine:
             try:
                 result = await self.dispatch_pair_order(
                     pair_id=pair.id, leg=leg, side=side, size=size,
-                    order_type="market",
+                    order_type="market", reduce_only=reduce_only,
                 )
             except Exception as e:
                 latency_ms = (time.time() - t0) * 1000
