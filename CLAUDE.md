@@ -250,6 +250,29 @@ rwa_arbitrage/
 (역순; 자세한 commit 메시지는 `git log` 참조)
 
 ### 2026-05-18
+- `d2bda96` — **KIS WS reconnect verify + 자동 재시도**. 5/18 07:02 silent-stale
+  사건 fix. KIS server-close 후 우리 봇이 reconnect + subscribe restore까지는
+  성공했지만 KIS 서버가 새 connection에 데이터 push를 시작 안 함 (KIS의
+  known quirk — subscribe ack는 주지만 server-side state stale).
+  `_reconnect()` 후 15s wait + `_last_msg_ts` 검증, push 안 오면 token + key
+  cache clear + 새로 발급 + 재구독 (최대 3회 시도). 12분 silent → 최대 45초
+  자동 복구.
+- `cc1a97a` — **WS STALE 알림 메시지 enrichment**. 기존
+  `🚨 WS STALE wti_cme_hl leg_a age=71s` → 어느 거래소/심볼인지 모름.
+  새 형식:
+  ```
+  🚨 QUOTE STALE [wti_cme_hl]
+  leg_a: hyperliquid/xyz:CL (perp) (HL 시세 WS wss://...)
+  age=71s (threshold 60s)
+  last quote: 14:08:35 KST
+  ```
+  + KIS_LICENSE 알림에 의심 원인 4가지 (라이센스 / 다른봇 충돌 / KIS
+  maintenance / reconnect fail) + 검증 명령 동봉.
+- `aab6d82` — **dashboard 진단 섹션 (testbed용)**. schema v5 additive —
+  positions에 `signal_basis_bps`, `exec_basis_bps`, `entry_latency_ms_a/b`,
+  `signal_ts` 5컬럼 추가. engine `_do_pair_entry`가 entry 시 측정 + 저장.
+  대시보드 "🧪 Entry diagnostics" 표에 signal/exec/slip/latency 한눈에.
+  LIVE 안정화 후 제거 가능.
 - `404d7cc` — **perf: HL entry latency 축소 (Exchange cache + ref_price hint + ms log)**.
   5/18 첫 LIVE 거래에서 signal mid -21.35bp → 실 fill -6.79bp (slippage 14bp,
   spike가 1.4s만 지속한 동안 latency 2.4s로 못 잡음). 3 layer fix:
@@ -460,6 +483,38 @@ python3 scripts/analyze_paper.py --db data/arbitrage.db
 ---
 
 ## 주요 발견 & 의사결정 기록
+
+### 2026-05-18 KIS WS server-close silent-stale 사건 → 자동 verify+retry
+하루 동안 KIS WS가 4번 끊김 (02:04, 03:13, 06:09, 07:02). 마지막 07:02
+케이스에서:
+1. KIS server가 connection을 unilateral close (`KIS WS closed by server`)
+2. 봇이 자동 reconnect 성공 (token+approval_key refresh, subscribe restore)
+3. **하지만 KIS server가 새 connection에 push 시작 안 함** — 12분 silent stale
+4. 60s 후 WS_WATCHDOG STALE → KIS_LICENSE SUSPECT 알림 → 사용자 수동 pm2 restart로 복구
+
+**Root cause — KIS WS server-side state stale (알려진 quirk)**:
+- KIS는 client가 PINGPONG echo-back으로 keep-alive 잘 보내도 일정 시간/조건 후
+  unilateral close (load balancer rotation, 또는 server internal policy)
+- reconnect 시 subscribe ack까지는 정상 응답하지만 일부 케이스에서 실제 push
+  pipeline 활성화 실패
+- 알려진 우회: 완전 재초기화 (token + approval_key + WS 처음부터) — 그래야 KIS
+  server-side state도 새로 잡힘
+
+**Fix (d2bda96)**:
+- `_reconnect()` 후 15s wait + `_last_msg_ts` 비교
+- push 없으면 → token/approval_key cache clear → 새로 발급 → 재구독 (최대 3회)
+- 3회 실패 시 WS_WATCHDOG (60s)가 잡아서 알림 + 안전장치 발동
+
+**알림 메시지 enrichment (cc1a97a)** — 끊김 발생 시 메시지만 봐도 어느 거래소/
+심볼/마지막 시각/채널/원인이 즉시 보이게. `🚨 WS STALE leg_a` → `🚨 QUOTE STALE
+[pair] leg_a: hyperliquid/xyz:CL (HL 시세 WS wss://...)`.
+
+**왜 KIS는 자주 끊나** (한국투자증권 WS 운영 특성):
+- KIS는 한국 증권시장 (09:00-15:30 KST) 외 시간엔 reliability 우선순위 낮음
+- WS 서버는 load balancer 뒤에 있고 정기적 rotation 발생 (시간당 1-수회)
+- 일부 maintenance window는 공지 없이 진행
+- 잦은 reconnect는 KIS rate limit 트리거 가능 (분당 1회 token 발급 제한)
+→ 봇이 자동 verify + retry로 자체 회복하는 게 표준 대응
 
 ### 2026-05-18 LIVE 첫 거래 분석 — spike latency 14bp 손실 → fix
 첫 LIVE 거래 (id=3260) 분석에서 **PAPER ↔ LIVE 사이 평균 12bp slippage 차이**
