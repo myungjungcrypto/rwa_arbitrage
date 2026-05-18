@@ -173,6 +173,10 @@ class HyperliquidClient:
         self.private_key = private_key
         self.perp_dex = perp_dex  # HIP-3 DEX 이름 ("xyz" for trade.xyz)
         self._session: aiohttp.ClientSession | None = None
+        # SDK Exchange 객체 캐시 — 매 주문마다 _build_exchange() 호출 시
+        # SDK가 metaAndAssetCtxs REST 호출 (perp_dexs 메타 로드, 200-500ms).
+        # 한 번 build 후 재사용 → entry latency 대폭 축소.
+        self._exchange_cached: Optional[Any] = None
         # 메타 캐시 (5초 TTL)
         self._meta_cache: tuple[list[dict], list[dict]] | None = None
         self._meta_cache_ts: float = 0
@@ -186,6 +190,7 @@ class HyperliquidClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        self._exchange_cached = None    # 다음 connect 시 재build
 
     async def _post(self, endpoint: str, payload: dict) -> Any:
         """POST 요청."""
@@ -464,7 +469,14 @@ class HyperliquidClient:
             return None
 
     def _build_exchange(self):
-        """HL SDK Exchange 인스턴스 + signer wallet."""
+        """HL SDK Exchange 인스턴스 + signer wallet.
+
+        Lazy + 캐싱 — 한 번 build 후 self._exchange_cached 재사용. SDK가
+        매 build마다 metaAndAssetCtxs 호출하므로 (200-500ms) 캐싱이 entry
+        latency 축소의 핵심.
+        """
+        if self._exchange_cached is not None:
+            return self._exchange_cached
         from hyperliquid.exchange import Exchange
         from hyperliquid.utils import constants
         signer = self._build_signer()
@@ -474,18 +486,16 @@ class HyperliquidClient:
             constants.TESTNET_API_URL if "testnet" in self.base_url
             else constants.MAINNET_API_URL
         )
-        # account_address가 wallet과 같으면 (단순 trading wallet) 자동 추론.
-        # agent wallet 사용 시 account_address는 메인 wallet 주소여야 함.
         account_address = self.wallet_address or signer.address
-        # perp_dexs: HIP-3 builder dex (예: trade.xyz의 'xyz') 인식.
-        # 이게 없으면 SDK의 name_to_coin map에 xyz:CL 등이 없어 KeyError 발생.
         perp_dexs = [self.perp_dex] if self.perp_dex else None
-        return Exchange(
+        self._exchange_cached = Exchange(
             wallet=signer,
             base_url=base_url,
             account_address=account_address,
             perp_dexs=perp_dexs,
         )
+        logger.info("HL Exchange object built and cached")
+        return self._exchange_cached
 
     async def place_order(
         self,
@@ -494,19 +504,19 @@ class HyperliquidClient:
         size: float,
         price: float | None = None,
         reduce_only: bool = False,
+        ref_price: float | None = None,
     ) -> OrderResult:
-        """HL HIP-3 perp 주문 (Phase 11b 실서명).
-
-        agent wallet 또는 trading wallet의 private_key가 secrets.yaml에
-        있어야 함. wallet_address는 메인 wallet (agent 사용 시) 또는
-        signer 자신 (단일 wallet 사용 시).
+        """HL HIP-3 perp 주문.
 
         Args:
             ticker: HIP-3 coin (예: "xyz:CL")
             side: BUY or SELL
-            size: 배럴 단위 수량 (HL은 base asset 단위)
+            size: 배럴 단위 수량
             price: 지정가 (None이면 IOC 시장가)
             reduce_only: 포지션 감소만 허용
+            ref_price: 시장가용 참조가격 hint. caller가 이미 갖고 있는 quote.
+                       mark_price를 넘겨주면 REST get_market_data 호출 생략 →
+                       entry latency 200-500ms 단축. None이면 REST 호출.
         """
         if not self.private_key:
             return OrderResult(success=False, error="HL private_key not set")
@@ -522,17 +532,18 @@ class HyperliquidClient:
             return OrderResult(success=False, error=f"build_exchange: {e}")
 
         is_buy = side == OrderSide.BUY
-        # 시장가 = IOC limit. HL은 limit_px=0을 invalid로 거절하므로
-        # 현재 mark price 조회 후 buy=mark*(1+slip), sell=mark*(1-slip)로
-        # cross 보장.
+        # 시장가 = IOC limit. caller가 ref_price 주면 REST 호출 생략 (latency 절감).
         if price is None:
-            slip = 0.05    # 5% slippage 버퍼 — 시장가 의도이므로 충분히 넓게
-            try:
-                md = await self.get_market_data(ticker)
-                ref = md.mark_price if md and md.mark_price > 0 else 0.0
-            except Exception as e:
-                logger.warning(f"HL market_data fetch failed for {ticker}: {e}")
-                ref = 0.0
+            slip = 0.05
+            ref = ref_price if (ref_price and ref_price > 0) else 0.0
+            if ref <= 0:
+                # fallback — caller가 hint 안 줬으면 REST 조회
+                try:
+                    md = await self.get_market_data(ticker)
+                    ref = md.mark_price if md and md.mark_price > 0 else 0.0
+                except Exception as e:
+                    logger.warning(f"HL market_data fetch failed for {ticker}: {e}")
+                    ref = 0.0
             if ref <= 0:
                 return OrderResult(
                     success=False,
@@ -834,12 +845,20 @@ class HyperliquidExchange:
     ) -> _base.OrderResult:
         rest_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
         price_arg = limit_price if order_type == "limit" else None
+        # 시장가일 때 in-memory meta 캐시의 mark_price를 ref_price로 전달 →
+        # REST get_market_data 호출 생략 (200-500ms latency 절감).
+        ref_price = None
+        if price_arg is None:
+            meta = self._latest_meta.get(symbol)
+            if meta and meta.mark_price > 0:
+                ref_price = meta.mark_price
         result = await self._rest.place_order(
             ticker=symbol,
             side=rest_side,
             size=size,
             price=price_arg,
             reduce_only=reduce_only,
+            ref_price=ref_price,
         )
         return _base.OrderResult(
             success=result.success,

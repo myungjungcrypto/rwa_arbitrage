@@ -1858,17 +1858,24 @@ class PaperTradingEngine:
 
         # ── LIVE 모드: 실 어댑터 dispatch ──
         if is_live:
+            t0 = time.time()
             try:
                 result = await self.dispatch_pair_order(
                     pair_id=pair.id, leg=leg, side=side, size=size,
                     order_type="market",
                 )
             except Exception as e:
-                logger.error(f"[{pair.id}/{leg}] LIVE dispatch raised: {e}")
+                latency_ms = (time.time() - t0) * 1000
+                logger.error(
+                    f"[{pair.id}/{leg}] LIVE dispatch raised: {e} "
+                    f"latency={latency_ms:.0f}ms"
+                )
                 return 0.0, ""
             if not result.success:
+                latency_ms = (time.time() - t0) * 1000
                 logger.error(
-                    f"[{pair.id}/{leg}] LIVE order FAILED on {leg_cfg.exchange}: {result.error}"
+                    f"[{pair.id}/{leg}] LIVE order FAILED on {leg_cfg.exchange}: "
+                    f"{result.error} latency={latency_ms:.0f}ms"
                 )
                 return 0.0, ""
             # filled_price가 0이면(미체결 resting / KIS 시장가 응답 누락) leg_quote 추정 사용
@@ -1878,9 +1885,11 @@ class PaperTradingEngine:
                     filled_price = leg_quote.ask or leg_quote.mid_price
                 else:
                     filled_price = leg_quote.bid or leg_quote.mid_price
+            latency_ms = (time.time() - t0) * 1000
             logger.warning(
                 f"[{pair.id}/{leg}] LIVE FILL {leg_cfg.exchange}/{leg_cfg.symbol} "
-                f"{side} {size} @ {filled_price:.4f} order_id={result.order_id}"
+                f"{side} {size} @ {filled_price:.4f} order_id={result.order_id} "
+                f"latency={latency_ms:.0f}ms"
             )
             return filled_price, result.order_id
 
