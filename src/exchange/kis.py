@@ -96,6 +96,32 @@ class KISAuth:
         self._access_token: str = ""
         self._token_expires: float = 0.0
         self._approval_key: str = ""
+        # 5/18 latency 분석: KIS REST 218ms ~ 3253ms variance — 매 호출 새
+        # ClientSession 만들어서 TCP+TLS handshake 매번. persistent session +
+        # DNS cache + keepalive로 안정화 (target 200-300ms).
+        self._rest_session: Optional[aiohttp.ClientSession] = None
+
+    def get_rest_session(self) -> aiohttp.ClientSession:
+        """공유 aiohttp ClientSession. 호출 시 lazy create + keepalive.
+
+        모든 KIS REST 호출 (token/approval_key/order/balance/positions)이
+        이 session 통해 진행 → connection reuse, DNS cache, TLS resumption.
+        """
+        if self._rest_session is None or self._rest_session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=20,
+                ttl_dns_cache=300,         # DNS 5분 캐시 (매 호출 lookup 안 함)
+                keepalive_timeout=60,      # 60초 keep-alive
+                force_close=False,
+                enable_cleanup_closed=True,
+            )
+            self._rest_session = aiohttp.ClientSession(connector=connector)
+        return self._rest_session
+
+    async def close_rest_session(self):
+        if self._rest_session and not self._rest_session.closed:
+            await self._rest_session.close()
+            self._rest_session = None
 
     @property
     def account_cano_prdt(self) -> tuple[str, str]:
@@ -122,16 +148,16 @@ class KISAuth:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body) as resp:
-                data = await resp.json()
-                if "access_token" not in data:
-                    raise RuntimeError(f"KIS token error: {data}")
-                self._access_token = data["access_token"]
-                # 23시간 후 갱신 (실제 유효: 24시간)
-                self._token_expires = time.time() + 23 * 3600
-                logger.info("KIS access_token issued (expires in 23h)")
-                return self._access_token
+        session = self.get_rest_session()
+        async with session.post(url, json=body) as resp:
+            data = await resp.json()
+            if "access_token" not in data:
+                raise RuntimeError(f"KIS token error: {data}")
+            self._access_token = data["access_token"]
+            # 23시간 후 갱신 (실제 유효: 24시간)
+            self._token_expires = time.time() + 23 * 3600
+            logger.info("KIS access_token issued (expires in 23h)")
+            return self._access_token
 
     async def get_approval_key(self) -> str:
         """WebSocket 접속용 approval_key 발급."""
@@ -141,14 +167,14 @@ class KISAuth:
             "appkey": self.app_key,
             "secretkey": self.app_secret,
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body) as resp:
-                data = await resp.json()
-                if "approval_key" not in data:
-                    raise RuntimeError(f"KIS approval_key error: {data}")
-                self._approval_key = data["approval_key"]
-                logger.info("KIS approval_key issued")
-                return self._approval_key
+        session = self.get_rest_session()
+        async with session.post(url, json=body) as resp:
+            data = await resp.json()
+            if "approval_key" not in data:
+                raise RuntimeError(f"KIS approval_key error: {data}")
+            self._approval_key = data["approval_key"]
+            logger.info("KIS approval_key issued")
+            return self._approval_key
 
     def get_rest_headers(self, tr_id: str) -> dict:
         """REST API 호출용 헤더.
@@ -617,9 +643,9 @@ class KISFuturesClient:
             headers = self.auth.get_rest_headers("HHDFC86000000")
             params = {"SRS_CD": symbol}
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params) as resp:
-                    data = await resp.json()
+            session = self.auth.get_rest_session()
+            async with session.get(url, headers=headers, params=params) as resp:
+                data = await resp.json()
 
             output = data.get("output1", {})
             if not output:
@@ -842,9 +868,9 @@ class KISExchange:
             await auth.get_access_token()
             headers = auth.get_rest_headers(tr_id)
             url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/order"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=body) as resp:
-                    data = await resp.json()
+            session = auth.get_rest_session()
+            async with session.post(url, headers=headers, json=body) as resp:
+                data = await resp.json()
         except Exception as e:
             logger.error(f"[KIS] place_order network error: {e}")
             return _base.OrderResult(
@@ -911,9 +937,9 @@ class KISExchange:
             await auth.get_access_token()
             headers = auth.get_rest_headers(tr_id)
             url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/order-rvsecncl"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=body) as resp:
-                    data = await resp.json()
+            session = auth.get_rest_session()
+            async with session.post(url, headers=headers, json=body) as resp:
+                data = await resp.json()
         except Exception as e:
             logger.error(f"[KIS] cancel_order network error: {e}")
             return False
@@ -950,9 +976,9 @@ class KISExchange:
             await auth.get_access_token()
             headers = auth.get_rest_headers(tr_id)
             url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/inquire-unpd"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=body) as resp:
-                    data = await resp.json()
+            session = auth.get_rest_session()
+            async with session.post(url, headers=headers, json=body) as resp:
+                data = await resp.json()
         except Exception as e:
             logger.error(f"[KIS] get_positions error: {e}")
             return []
@@ -1016,9 +1042,9 @@ class KISExchange:
             "INQR_DT": inqr_dt,
         }
         url = f"{auth.base_url}/uapi/overseas-futureoption/v1/trading/inquire-deposit"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params) as r:
-                data = await r.json()
+        session = auth.get_rest_session()
+        async with session.get(url, headers=headers, params=params) as r:
+            data = await r.json()
         if data.get("rt_cd") != "0":
             raise RuntimeError(
                 f"rt_cd={data.get('rt_cd')} msg={data.get('msg1','').strip()[:80]}"

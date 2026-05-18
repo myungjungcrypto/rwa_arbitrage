@@ -559,8 +559,10 @@ class HyperliquidClient:
         # 항상 6+ sig 결과라 round 필수.
         limit_px = _hl_round_price_sig_figs(limit_px, sig=5)
 
+        # 단계별 latency 측정 — SDK order() 호출 시간 instrumentation
         try:
             # SDK v0.23+: param renamed coin → name
+            t_order_start = time.time()
             result = exchange.order(
                 name=ticker,
                 is_buy=is_buy,
@@ -569,6 +571,8 @@ class HyperliquidClient:
                 order_type=order_type,
                 reduce_only=reduce_only,
             )
+            order_ms = (time.time() - t_order_start) * 1000
+            logger.debug(f"HL exchange.order() took {order_ms:.0f}ms")
         except Exception as e:
             logger.error(f"HL place_order error: {e}")
             return OrderResult(success=False, error=str(e))

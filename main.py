@@ -338,6 +338,7 @@ async def run_collector(config_path: str = "config/settings.yaml"):
     await collector.stop()
     if kis_client:
         await kis_client.disconnect()
+        await kis_client.auth.close_rest_session()
     kiwoom.disconnect()
     storage.close()
     logger.info("Shutdown complete")
@@ -842,6 +843,7 @@ async def run_paper(config_path: str = "config/settings.yaml"):
     await collector.stop()
     if kis_client:
         await kis_client.disconnect()
+        await kis_client.auth.close_rest_session()
     kiwoom.disconnect()
 
     # 최종 요약
