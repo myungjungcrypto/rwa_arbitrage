@@ -131,6 +131,17 @@ class StrategyConfig:
     # 0 = 비활성화 (backward compat).
     min_abs_entry_bps: float = 0.0
 
+    # 5/18 spike-chasing 손실 방지 가드.
+    # signal mid_basis와 exec basis 차이가 이 값 초과면 진입 skip
+    # (latency가 spike profit 이미 잡아먹었다는 의미). 부호 반대 (signal +,
+    # exec -)도 자동 차단됨 (slip이 매우 큼).
+    # 5/18 5건 손실 분석: 모두 slip 15-56bp → 10bp cap이면 전건 차단.
+    max_entry_slip_bps: float = 10.0
+
+    # 진입 후 최소 hold 시간 (초). 즉시 청산 방지 — entry exec가 작아도
+    # 즉시 수렴 도달하면 손실만 발생. 0이면 비활성.
+    min_hold_seconds: int = 60
+
     # CME 장 시간 가드 — 폐장 중 진입 차단 + 장기 휴장 전 flatten
     cme_closed_skip_entry: bool = True
     pre_close_flatten_minutes: int = 30     # 마감 몇 분 전부터 진입 차단 + 청산 시작

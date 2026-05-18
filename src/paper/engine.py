@@ -1647,6 +1647,20 @@ class PaperTradingEngine:
             )
             return
 
+        # 5/18 spike-chasing 가드 — signal vs exec slip cap.
+        # latency가 spike를 잡아먹어 exec가 의도와 다르면 진입 skip.
+        # signal +25 vs exec -30 같은 부호 반대 케이스는 |slip|이 매우 커서 자동 차단.
+        max_slip = self.config.strategy.max_entry_slip_bps
+        slip_bps = signal.basis_bps - exec_basis
+        if max_slip > 0 and abs(slip_bps) > max_slip:
+            self._state.entry_exec_filter_skip += 1
+            logger.warning(
+                f"[{pair_id}] ENTRY_SKIP slip cap: |slip|={abs(slip_bps):.1f}bp "
+                f"> {max_slip:.1f}bp (signal={signal.basis_bps:+.1f}, exec={exec_basis:+.1f}) "
+                f"— spike 사라진 후 fill 시도, 진입 무의미"
+            )
+            return
+
         # 사이징 — leg_b 기준 notional × max_position_usd cap
         leg_b_price = leg_b.mid_price or (leg_b.bid + leg_b.ask) / 2
         contracts = self._calculate_pair_contracts(pair, leg_b_price)
@@ -1839,6 +1853,19 @@ class PaperTradingEngine:
         self, pair_id: str, signal: Signal, leg_a: Quote, leg_b: Quote, trade,
     ) -> None:
         """실제 청산 로직 — lock 안에서 호출."""
+        # 5/18 spike-chasing 가드 — min_hold_seconds 미만이면 즉시 exit 차단.
+        # 진입 후 즉시 청산되면 수수료만 손실 (5/18 hold 0초 거래 5건 모두 손실).
+        # 단 EMERGENCY_CLOSE 같은 안전 청산은 별도 path (이 함수 통과 X).
+        min_hold = self.config.strategy.min_hold_seconds
+        if min_hold > 0:
+            elapsed = time.time() - trade.entry_time
+            if elapsed < min_hold:
+                logger.debug(
+                    f"[{pair_id}] EXIT skip: hold={elapsed:.0f}s < min_hold={min_hold}s "
+                    f"(spike-chasing 방지)"
+                )
+                return
+
         pair = self._registered_pairs[pair_id]
         leg_a_close_side = "buy" if trade.perp_side == "short" else "sell"
         leg_b_close_side = "sell" if trade.futures_side == "long" else "buy"

@@ -54,6 +54,12 @@ strategy:
   min_abs_entry_bps: 10         # 절대값 floor: |exec_basis| 이 값 미만이면 진입 차단 (통계신호와 무관)
                                 # (post-rollover 30건 분석: <10bp는 14% WR -$202, 10bp+는 94% WR +$199)
 
+  # 5/18 spike-chasing 손실 방지 가드 (LIVE 5건 연속 손실 후 추가)
+  max_entry_slip_bps: 10        # signal mid_basis와 exec basis 차이 > 10bp면 진입 skip
+                                # (latency가 spike 잡아먹은 케이스 차단; 부호 반대도 자동)
+  min_hold_seconds: 60          # 진입 후 60초 이내 정상 exit 차단 (즉시 청산 손실 방지)
+                                # emergency unwind / WS_STALE flatten 같은 안전청산은 별도 path
+
   # 청산 — 스프레드 수렴 기반
   convergence_target_bps: 3     # spread ≤ 3bp면 수렴 완료 → 청산
   max_hold_hours: 48            # 수렴 대기 + 펀딩 수취 (최대 48시간)
