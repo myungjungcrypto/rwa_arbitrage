@@ -251,11 +251,19 @@ rwa_arbitrage/
 - Phase D (Lighter), E (Binance), F (Bybit), G (OKX) 모두 scaffolding ready
 - 각 페어 `enabled: false` shadow 상태
 
-### 다음
-1. LIVE 다음 entry 모니터 — EXIT lock + reduce_only 정상 작동 검증
-2. 손실 정리 (5/18 incident 추정 $100-300, HL/KIS 직접 확인)
-3. fault injection 회귀 테스트 추가 (EXIT fail retry storm 시뮬)
-4. Phase H — 5-pair concurrent + per-pair risk caps + analyze_paper 멀티 페어
+### 다음 (현재 진행 중)
+1. **다음 LIVE entry 모니터 — latency 측정 + spike-chasing 가드 효과 검증**
+   - KIS persistent session (475c041) 효과 — KIS leg 200-500ms target
+   - max_entry_slip_bps 10 가드 — 5/18 5건 같은 손실 패턴 차단 확인
+   - 결과로 HL signing offload 작업 여부 결정
+2. **레이턴시 추가 fix** (앞으로 모든 latency 작업은 CLAUDE.md 'Latency 작업
+   추적' 표에 기록 — '주요 발견 & 의사결정 기록' 섹션):
+   - HL eth_account signing offload (ProcessPoolExecutor) — 100-200ms 추정
+   - HL Info object cache (universe lookup) — 측정 후 결정
+   - 목표 양 leg 500ms 이내
+3. 5/18 incident 손실 정리 (추정 $100-300, HL/KIS 직접 확인)
+4. fault injection 회귀 테스트 (EXIT fail retry storm 시뮬)
+5. Phase H — 5-pair concurrent + per-pair risk caps + analyze_paper 멀티 페어
 
 ---
 
@@ -264,6 +272,21 @@ rwa_arbitrage/
 (역순; 자세한 commit 메시지는 `git log` 참조)
 
 ### 2026-05-18
+- `475c041` — **perf: KIS persistent aiohttp session (latency 1500ms→300ms 목표)**.
+  5/18 LIVE 5건 거래 분석에서 KIS latency 218ms ~ 3253ms variance 극심
+  (avg ~1500ms). 218ms 케이스 = OS가 우연히 TCP connection 재사용한 경우,
+  3253ms = 매번 새 ClientSession 만들어서 TCP+TLS+DNS handshake 매번 발생.
+  KISAuth에 persistent `aiohttp.ClientSession` (TTL DNS cache 5분 +
+  keepalive 60s) 추가, 모든 KIS REST 호출 (token/approval/order/cancel/
+  positions/balance/orderbook) 공유. 기대: 안정적 200-500ms.
+- `e2dba04` — **fix: spike-chasing 차단 (slip cap + min_hold_seconds)**.
+  5/18 LIVE 5건 연속 손실 (-$95 누적) 분석: 모두 signal mid ±23bp인데
+  latency 1-7초 동안 spike 사라져 exec basis 거의 0으로 들어감. 3261/3263은
+  부호까지 반전 (signal +25 exec -30). 방어적 가드 2종:
+  ① `max_entry_slip_bps: 10` — signal-exec gap 10bp 초과 시 entry skip
+     (부호 반대 자동 차단). 5/18 5건 모두 slip ≥15bp → 전건 차단 가능.
+  ② `min_hold_seconds: 60` — 진입 후 60초 hold 강제 (hold 0초 즉시 청산
+     손실 패턴 방지). emergency unwind 등 안전청산은 별도 path 통과.
 - `1e17fbb` — **KIS reduce_only pre-check 완화 (settlement delay 인식)**.
   157d9f5의 strict pre-check (positions empty → reject)가 정상 EXIT까지
   reject. KIS `inquire-unpd` (positions) endpoint는 일일 정산 단위라 당일
@@ -594,6 +617,61 @@ cooldown + reduce_only + KIS settlement-aware pre-check 모두 작동.
 - 일부 maintenance window는 공지 없이 진행
 - 잦은 reconnect는 KIS rate limit 트리거 가능 (분당 1회 token 발급 제한)
 → 봇이 자동 verify + retry로 자체 회복하는 게 표준 대응
+
+### 2026-05-18 5건 spike-chasing 손실 + latency 진단 → KIS persistent session
+
+5/18 LIVE 5건 연속 손실 (-$94.61 누적). entry diagnostics 분석:
+
+| Trade | signal | exec | slip | latency_a (HL) | latency_b (KIS) | PnL    |
+|-------|--------|------|------|----------------|------------------|--------|
+| 3261  | +22.1  | -10.8 | +33  | 7491ms (cold)  | 2633ms          | -15.83 |
+| 3262  | -23.3  | -1.0  | -22  | 2235ms         | 1992ms          | -12.85 |
+| 3263  | +25.8  | -30.7 | +56  | 3254ms         | 1927ms          | -43.71 |
+| 3264  | -23.4  | -8.0  | -15  | 1078ms         | 950ms           | -6.81  |
+| 3265  | -23.9  | -4.4  | -19  | 1157ms         | 637ms           | -15.41 |
+
+**Root cause 2층**:
+1. **mid-기준 signal**: signal.basis_bps는 mid 기준이지만 fill은 bid/ask
+   → 양 거래소 bid-ask spread 14bp 자동 cost로 자동 잠식.
+   mid -20bp 진입해도 실 edge ~5bp 미만.
+2. **Latency 1000-7000ms**: spike 1-2초 지속 동안 못 잡음.
+   3261/3263은 spike가 반대로 튀어 의도와 정반대 방향 진입 (slip 33-56bp).
+
+**Latency 분석**:
+- HL: cache fix(404d7cc) 후 첫 거래 2235ms → 후속 865-1157ms (cache 작동
+  but SDK signing/order RTT 1초+ 한계)
+- KIS: 218ms ~ 3253ms variance 극심
+  → 매 호출 새 `aiohttp.ClientSession`이 매번 TCP+TLS+DNS handshake.
+  218ms 케이스는 OS connection 우연 재사용.
+
+**Fix**:
+- `475c041` KIS persistent session — 200-500ms target
+- `e2dba04` spike-chasing 가드 (slip cap + min_hold) — latency 자체는 fix X
+  but spike-chasing entry 차단해서 손실 누적 방지
+
+**Spike origin 분석** (사용자 질문 답):
+A) 진짜 mispricing — 양 호가창에 실제 cross 가능한 가격차 (잡을 수 있는 edge)
+B) HL oracle lag — KIS 가격 jump 후 HL oracle 0.5-1초 뒤 따라옴 (시차 artifact)
+C) KIS WS push delay — KIS 일시 stale 후 push 재개 시 spike처럼 보임 (artifact)
+
+봇이 A/B/C 모두 trigger → false positive 많음. 진짜 edge 잡으려면:
+- entry_threshold 35bp+ (현재 20bp는 B/C까지 잡음)
+- signal smoothing (1 tick spike → 3 tick 연속 유지)
+- exec_basis 기반 trigger (bid/ask cost 자동 반영)
+
+다음 entry signal에서 latency 측정 + slip 분포 확인 후 추가 fix 결정.
+
+### Latency 작업 추적 (앞으로 모든 latency fix 여기 기록)
+
+| Commit | 효과 | leg | 단축 |
+|---|---|---|---|
+| `404d7cc` | HL `_build_exchange` cache + `ref_price` hint | HL | first cold 7491ms → warm 865-1157ms |
+| `475c041` | KIS persistent aiohttp session + DNS cache | KIS | 218-3253ms variance → 200-500ms 목표 |
+| TBD | HL eth_account signing offload (ProcessPoolExecutor) | HL | 100-200ms 절감 추정 |
+| TBD | HL Info object cache (universe lookup) | HL | 추가 측정 후 결정 |
+
+**목표 latency**: 양 leg 500ms 이내. 현재 HL 1000ms + KIS persistent session 후
+200-500ms 예상 → 다음 entry로 검증.
 
 ### 2026-05-18 LIVE 첫 거래 분석 — spike latency 14bp 손실 → fix
 첫 LIVE 거래 (id=3260) 분석에서 **PAPER ↔ LIVE 사이 평균 12bp slippage 차이**
