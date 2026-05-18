@@ -160,6 +160,11 @@ class PaperTradingEngine:
         # 거래 한도) 위반. 락으로 직렬화 + 락 안에서 _open_trades_by_pair 체크해
         # 중복 진입 차단.
         self._pair_entry_locks: dict[str, asyncio.Lock] = {}
+        # pair별 EXIT 락 — entry와 동일 이유 (1초 안 다중 EXIT 호출 → KIS rate
+        # limit + 이미 청산된 포지션에 또 sell). 5/18 07:58 incident fix.
+        self._pair_exit_locks: dict[str, asyncio.Lock] = {}
+        # 마지막 EXIT 시도 시각 (성공/실패 무관) — 5s cooldown으로 KIS 보호.
+        self._last_exit_attempt_ts: dict[str, float] = {}
 
         # 최소 워밍업 데이터 수 (이 이하면 거래 안 함)
         self.MIN_WARMUP_POINTS = 3600  # 약 1시간 분량
@@ -1430,6 +1435,8 @@ class PaperTradingEngine:
         # 페어별 entry 락 lazy-create
         if pair.id not in self._pair_entry_locks:
             self._pair_entry_locks[pair.id] = asyncio.Lock()
+        if pair.id not in self._pair_exit_locks:
+            self._pair_exit_locks[pair.id] = asyncio.Lock()
         logger.info(
             f"[ENGINE] pair registered: {pair.id} "
             f"({pair.leg_a.exchange}/{pair.leg_a.symbol} ↔ "
@@ -1798,12 +1805,40 @@ class PaperTradingEngine:
     async def _handle_pair_exit(
         self, pair_id: str, signal: Signal, leg_a: Quote, leg_b: Quote
     ) -> None:
-        """청산 처리 (pair-keyed)."""
+        """청산 처리 (pair-keyed).
+
+        Lock + cooldown — 5/18 07:58 incident에서 EXIT fail 후 매 quote tick
+        마다 EXIT 재시도 → 1초 안 수십 번 KIS sell 호출 → 이미 청산된 포지션에
+        '주문가능금액 부족' reject 폭주. Lock으로 동시 호출 차단 + 마지막 시도
+        후 5s 이내 재시도 skip (KIS rate limit + busy-loop 방지).
+        """
         trade = self._open_trades_by_pair.get(pair_id)
         if not trade:
-            logger.warning(f"[{pair_id}] EXIT signal but no open trade")
+            return   # 이미 청산됨 (race) — silent
+
+        # Lock 잡혀있으면 silent skip (logger debug만, no notify spam)
+        lock = self._pair_exit_locks.get(pair_id)
+        if lock is None or lock.locked():
             return
 
+        # Cooldown — 5초 안에 EXIT 시도 있었으면 skip (KIS rate limit 회피)
+        now = time.time()
+        last = self._last_exit_attempt_ts.get(pair_id, 0)
+        if now - last < 5.0:
+            return
+
+        async with lock:
+            self._last_exit_attempt_ts[pair_id] = time.time()
+            # lock 획득 후 다시 trade 체크 (await 사이 다른 호출이 끝났을 수 있음)
+            trade = self._open_trades_by_pair.get(pair_id)
+            if not trade:
+                return
+            await self._do_pair_exit(pair_id, signal, leg_a, leg_b, trade)
+
+    async def _do_pair_exit(
+        self, pair_id: str, signal: Signal, leg_a: Quote, leg_b: Quote, trade,
+    ) -> None:
+        """실제 청산 로직 — lock 안에서 호출."""
         pair = self._registered_pairs[pair_id]
         leg_a_close_side = "buy" if trade.perp_side == "short" else "sell"
         leg_b_close_side = "sell" if trade.futures_side == "long" else "buy"
@@ -1821,8 +1856,19 @@ class PaperTradingEngine:
         if a_exit <= 0 or b_exit <= 0:
             self._state.failed_orders += 1
             logger.error(
-                f"[{pair_id}] EXIT fill failed (a={a_exit}, b={b_exit}); will retry"
+                f"[{pair_id}] EXIT fill failed (a={a_exit}, b={b_exit}); "
+                f"retry in 5s cooldown"
             )
+            # KIS가 '주문가능금액 부족' reject → 이미 청산됐을 가능성. notifier 알림.
+            if self._notifier is not None:
+                try:
+                    self._notifier.send_sync(
+                        f"⚠️ <b>EXIT FAIL [{pair_id}]</b>\n"
+                        f"leg_a={a_exit:.2f} leg_b={b_exit:.2f}\n"
+                        f"5초 cooldown 후 재시도 — KIS HTS에서 실제 포지션 직접 확인 권장"
+                    )
+                except Exception:
+                    pass
             return
 
         # 동시 청산 race 방어 — gather 동안 다른 coroutine이 이미 청산했는지 atomic pop
