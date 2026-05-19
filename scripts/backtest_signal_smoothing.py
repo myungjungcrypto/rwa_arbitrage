@@ -306,6 +306,14 @@ def main():
                         help="downsample 비율 (1=no sample, 6=30s 간격)")
     parser.add_argument("--detail", action="store_true",
                         help="best 정책의 trade-by-trade 출력")
+    parser.add_argument("--clip-bp", type=float, default=100.0,
+                        help="이 절대값 초과 basis는 제외 — contract mismatch/"
+                             "stale data 필터. 0이면 클립 안 함 (default 100bp).")
+    parser.add_argument("--since-ts", type=float, default=None,
+                        help="이 unix timestamp 이후 데이터만 사용 (rollover-"
+                             "contaminated 이전 데이터 제외용).")
+    parser.add_argument("--since-date", type=str, default=None,
+                        help="이 YYYY-MM-DD 이후 데이터만 사용 (KST 기준).")
     args = parser.parse_args()
 
     storage = Storage(args.db)
@@ -321,17 +329,79 @@ def main():
         storage.close()
         return
 
-    basis = [r["basis_bps"] for r in rows]
-    timestamps = [r["ts"] for r in rows]
+    basis_all = [r["basis_bps"] for r in rows]
+    ts_all = [r["ts"] for r in rows]
+    n_raw = len(basis_all)
+
+    # since-date / since-ts
+    since_ts = args.since_ts
+    if args.since_date and since_ts is None:
+        from datetime import datetime, timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        dt = datetime.strptime(args.since_date, "%Y-%m-%d").replace(tzinfo=kst)
+        since_ts = dt.timestamp()
+    if since_ts:
+        filt = [(b, t) for b, t in zip(basis_all, ts_all) if t >= since_ts]
+        basis_all = [b for b, _ in filt]
+        ts_all = [t for _, t in filt]
+
+    # ── 진단: 분포 + 이상치 비율 ──
+    if not basis_all:
+        print("No data after since-filter.")
+        storage.close()
+        return
+
+    p_arr = sorted(basis_all)
+    p1 = _percentile(p_arr, 1)
+    p5 = _percentile(p_arr, 5)
+    p50 = _percentile(p_arr, 50)
+    p95 = _percentile(p_arr, 95)
+    p99 = _percentile(p_arr, 99)
+    mn = min(basis_all)
+    mx = max(basis_all)
+    avg = sum(basis_all) / len(basis_all)
+
+    n_extreme = sum(1 for b in basis_all if abs(b) > 100)
+    n_extreme_pct = n_extreme / len(basis_all) * 100
+
+    print("=== Data quality ===")
+    print(f"  rows raw={n_raw}, after since-filter={len(basis_all)}")
+    print(f"  basis percentiles (bp):")
+    print(f"    min={mn:.1f}  p1={p1:.1f}  p5={p5:.1f}  p50={p50:.1f}  "
+          f"p95={p95:.1f}  p99={p99:.1f}  max={mx:.1f}")
+    print(f"  mean={avg:.1f}bp")
+    print(f"  |basis|>100bp: {n_extreme:,} rows ({n_extreme_pct:.1f}%)  "
+          f"← contract mismatch/stale 의심")
+    print()
+
+    # ── Clipping: 비현실적 이상치 제거 ──
+    if args.clip_bp > 0:
+        clipped = [(b, t) for b, t in zip(basis_all, ts_all)
+                   if abs(b) <= args.clip_bp]
+        n_clipped = len(basis_all) - len(clipped)
+        print(f"=== Clip filter (|basis| > {args.clip_bp:.0f}bp 제외) ===")
+        print(f"  제외 {n_clipped:,} rows ({n_clipped/len(basis_all)*100:.1f}%) → "
+              f"남은 {len(clipped):,} rows")
+        basis = [b for b, _ in clipped]
+        timestamps = [t for _, t in clipped]
+        print()
+    else:
+        basis = basis_all
+        timestamps = ts_all
 
     if args.sample > 1:
         basis = basis[::args.sample]
         timestamps = timestamps[::args.sample]
 
+    if len(basis) < 100:
+        print(f"Not enough data after filters ({len(basis)} rows). 필터 완화 필요.")
+        storage.close()
+        return
+
     n = len(basis)
     span_h = (timestamps[-1] - timestamps[0]) / 3600.0
     interval_s = span_h * 3600 / max(1, n - 1)
-    print(f"=== Data ===")
+    print(f"=== Data (filtered) ===")
     print(f"  product={args.product} rows={n} span={span_h:.1f}h "
           f"interval~{interval_s:.1f}s")
     print(f"  basis range=[{min(basis):.1f}, {max(basis):.1f}]bp")
