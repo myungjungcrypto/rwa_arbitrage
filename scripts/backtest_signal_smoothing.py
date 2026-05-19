@@ -100,13 +100,44 @@ def _percentile(arr: list[float], p: float) -> float:
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
-def _running_stats(window: deque) -> tuple[float, float]:
-    n = len(window)
-    if n == 0:
-        return 0.0, 0.0
-    m = sum(window) / n
-    v = sum((x - m) ** 2 for x in window) / n
-    return m, math.sqrt(max(0.0, v))
+class RollingStats:
+    """O(1) incremental rolling mean + variance — Welford 풍 sum/sum_sq.
+
+    원래 `_running_stats(deque)`는 매 tick마다 window 전체를 re-sum하여
+    O(window_n)이었고 302k row × 21k window = 6.3 billion ops/sim 으로
+    실용 불가. 이 클래스는 점 추가/만료만 누적 sum, sum_sq에 반영해
+    매 tick O(1) → 전체 백테스트 sub-second.
+    """
+    __slots__ = ("maxlen", "_buf", "_sum", "_sum_sq")
+
+    def __init__(self, maxlen: int):
+        self.maxlen = max(1, int(maxlen))
+        self._buf: deque[float] = deque(maxlen=self.maxlen)
+        self._sum = 0.0
+        self._sum_sq = 0.0
+
+    def add(self, x: float):
+        if len(self._buf) >= self.maxlen:
+            old = self._buf[0]
+            self._sum -= old
+            self._sum_sq -= old * old
+        self._buf.append(x)
+        self._sum += x
+        self._sum_sq += x * x
+
+    def __len__(self):
+        return len(self._buf)
+
+    def stats(self) -> tuple[float, float]:
+        n = len(self._buf)
+        if n == 0:
+            return 0.0, 0.0
+        mean = self._sum / n
+        # 부동소수 누적오차로 음수가 될 수 있음 (예: 동일값 반복 시)
+        var = self._sum_sq / n - mean * mean
+        if var < 0:
+            var = 0.0
+        return mean, math.sqrt(var)
 
 
 def simulate(
@@ -121,7 +152,7 @@ def simulate(
         (timestamps[-1] - timestamps[0]) / max(1, len(timestamps) - 1)
     ) if len(timestamps) >= 2 else 5.0
     window_n = max(20, int(p.window_hours * 3600 / interval_s))
-    hist = deque(maxlen=window_n)
+    stats = RollingStats(maxlen=window_n)
 
     # signal smoothing state
     consec_above = 0    # 연속 long_basis 신호 카운트
@@ -134,12 +165,12 @@ def simulate(
 
     trades: list[Trade] = []
 
-    for i, (b, ts) in enumerate(zip(basis, timestamps)):
-        hist.append(b)
-        if len(hist) < 20:
+    for b, ts in zip(basis, timestamps):
+        stats.add(b)
+        if len(stats) < 20:
             continue
 
-        mean, std = _running_stats(hist)
+        mean, std = stats.stats()
         if std < 1.0:
             consec_above = consec_below = 0
             continue
@@ -311,22 +342,27 @@ def main():
     # ── Scenario A: signal_ticks 비교 (entry 20bp 고정) ──
     print(f"=== Scenario A: min_signal_ticks 변화 (entry={20.0}bp) ===")
     print(f"  (interval~{interval_s:.0f}s → ticks: 1≈즉시, 3≈{3*interval_s:.0f}s, 5≈{5*interval_s:.0f}s, 10≈{10*interval_s:.0f}s)")
+    t0 = time.time()
     for ticks in (1, 2, 3, 5, 7, 10):
         p = Params(min_signal_ticks=ticks, entry_threshold_bps=20.0)
         r = simulate(basis, timestamps, p)
         print_result(f"ticks={ticks}", r)
+    print(f"  (Scenario A: {time.time()-t0:.1f}s)")
     print()
 
     # ── Scenario B: entry_threshold 변화 (ticks=3 고정) ──
     print(f"=== Scenario B: entry_threshold 변화 (ticks=3) ===")
+    t0 = time.time()
     for thr in (15.0, 20.0, 25.0, 30.0, 35.0, 40.0):
         p = Params(min_signal_ticks=3, entry_threshold_bps=thr)
         r = simulate(basis, timestamps, p)
         print_result(f"thr={thr:.0f}bp", r)
+    print(f"  (Scenario B: {time.time()-t0:.1f}s)")
     print()
 
     # ── Scenario C: 그리드 (ticks × threshold) — best Sharpe ──
     print(f"=== Scenario C: 그리드 서치 best (Sharpe 기준) ===")
+    t0 = time.time()
     grid_results: list[tuple[Params, Result]] = []
     for ticks in (1, 2, 3, 5, 7, 10):
         for thr in (15.0, 20.0, 25.0, 30.0, 35.0):
@@ -336,6 +372,7 @@ def main():
                 grid_results.append((p, r))
 
     grid_results.sort(key=lambda x: x[1].sharpe, reverse=True)
+    print(f"  (Scenario C: {time.time()-t0:.1f}s, {len(grid_results)} valid combos)")
     print(f"  {'#':>2} {'ticks':>5} {'thr':>5} {'trades':>6} {'WR':>5} {'total':>8} "
           f"{'avg':>6} {'sharpe':>6} {'hold_m':>6}")
     for i, (p, r) in enumerate(grid_results[:10]):
