@@ -40,14 +40,11 @@ from src.exchange.kis import KISAuth
 from src.utils.config import load_config
 
 
-def _build_hl_info(base_url: str):
+def _build_hl_info(use_testnet: bool):
     """HL SDK Info object — universe + asset ctx 캐시용."""
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
-    url = (
-        constants.TESTNET_API_URL if "testnet" in base_url
-        else constants.MAINNET_API_URL
-    )
+    url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
     return Info(base_url=url, skip_ws=True)
 
 
@@ -110,7 +107,7 @@ async def run(args):
 
     # HL Info object — universe lazy load (첫 호출이 cold)
     hl_cfg = config.hyperliquid
-    info = _build_hl_info(hl_cfg.base_url)
+    info = _build_hl_info(hl_cfg.use_testnet)
 
     # KIS Auth — persistent session 공유 (실 주문 path 동일)
     kis_cfg = config.kis
